@@ -39,7 +39,7 @@ const FORBIDDEN = [
   new RegExp('39' + '82'), new RegExp('al' + 'una'), new RegExp('124' + '6277257'),
   new RegExp('prompt' + '_dsh'), new RegExp('feiyu' + '-mood'),
   new RegExp('/home' + '/hy', 'i'), new RegExp('ai-' + 'router', 'i'),
-  // 人设/对话归属 C 包：A 只认 role_id/workspace，出现这些词即越界
+  // 角色/对话归属独立插件：A 只认 role_id/workspace，出现这些词即越界
   new RegExp('person' + 'a', 'i'), new RegExp('大' + '肥鱼'), new RegExp('阿罗' + '娜'),
   new RegExp('一' + '叶'), new RegExp('dsh-' + 'chat'), new RegExp('/api/v1/' + 'chat'),
   new RegExp('prompt' + '_'),

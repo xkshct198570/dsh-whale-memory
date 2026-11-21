@@ -2,7 +2,7 @@
  * 记忆召回注入（fail-open）。
  *
  * 时序（别改回 section）：pre-step 写缓存 → systemPrompt.context 在 step() 的
- * refreshContext 阶段再求值 → 本轮请求就能带上召回文本；人设由独立插件用 section 注入，
+ * refreshContext 阶段再求值 → 本轮请求就能带上召回文本；角色展示由独立插件用 section 注入，
  * 记忆用 context（本包），两者职责不混。
  *
  * 生命周期硬线（P-4）：整个安装包在 ctx.effect 内；每次请求带 AbortController；
