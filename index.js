@@ -30,7 +30,7 @@ export function apply(ctx, config) {
     clearIdentityHint() { identityHint = null },
   })
 
-  const handler = createRoutes({ config, backend, getIdentityCfg, log })
+  const handler = createRoutes({ config, backend, getIdentityCfg, ctx, log })
 
   ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: PREFIX, handler }), 'whale-memory: routes')
 

@@ -64,7 +64,44 @@ test('export → import 幂等；nodes/stats', async () => {
   } finally { src.dispose(); dst.dispose() }
 })
 
-test('写库：超长/空文本拒绝', async () => {
+test('异步导入：>50 行返回 jobId，后台分批完成', async () => {
+  const b = fresh()
+  try {
+    const jsonl = Array.from({ length: 120 }, (_, i) => JSON.stringify({ text: `批量规则 ${i}`, user_id: 'u1' })).join('\n')
+    const started = await b.startImport({ jsonl, identity: ident })
+    assert.equal(started.async, true)
+    assert.equal(started.total, 120)
+    let st
+    for (let i = 0; i < 50; i += 1) {
+      st = await b.importStatus(started.jobId)
+      if (st.job?.state === 'done') break
+      await new Promise((r) => setTimeout(r, 20))
+    }
+    assert.equal(st.job.state, 'done')
+    assert.equal(st.job.added, 120)
+    const page = await b.nodes({ limit: 1, offset: 0 })
+    assert.equal(page.total, 120)
+  } finally { b.dispose() }
+})
+
+test('节点详情/编辑/审计列表', async () => {
+  const b = fresh()
+  try {
+    const w = await b.write({ text: '可编辑规则', identity: ident })
+    const got = await b.getNode(w.id)
+    assert.equal(got.node.text, '可编辑规则')
+    const upd = await b.updateNode(w.id, { text: '已归档规则', status: 'archived' })
+    assert.equal(upd.ok, true)
+    const after = await b.getNode(w.id)
+    assert.equal(after.node.status, 'archived')
+    await b.write({ text: '审计召回规则', identity: ident })
+    await b.recall({ query: '审计召回', maxHits: 3, identity: ident })
+    const rec = await b.recalls(5)
+    assert.ok(rec.items.length >= 1)
+  } finally { b.dispose() }
+})
+
+test('写库：超长/空文本拒绝' , async () => {
   const b = fresh()
   try {
     assert.equal((await b.write({ text: '', identity: ident })).ok, false)

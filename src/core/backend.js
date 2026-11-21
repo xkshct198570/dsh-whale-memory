@@ -31,6 +31,8 @@ export class LocalBackend {
     this.dbPath = ''
     this.worker = null
     this.closed = false
+    /** @type {Map<string,{lines:string[],next:number,added:number,skipped:number,errors:number,total:number,identity:any}>} */
+    this._imports = new Map()
   }
 
   get ready() { return true }
@@ -221,6 +223,120 @@ export class LocalBackend {
     const total = Number(db.prepare('SELECT count(*) AS n FROM nodes').get()?.n || 0)
     const rows = db.prepare(`SELECT ${NODE_EXPORT_FIELDS.join(',')} FROM nodes ORDER BY created_at DESC LIMIT ? OFFSET ?`).all(limit, offset)
     return { items: rows, total }
+  }
+
+  /** 单节点详情：面板抽屉用。 */
+  async getNode(id) {
+    const db = this._db()
+    const row = db.prepare(`SELECT ${NODE_EXPORT_FIELDS.join(',')} FROM nodes WHERE id=?`).get(String(id || ''))
+    return row ? { ok: true, node: row } : { ok: false, error: 'node_not_found' }
+  }
+
+  /** 面板编辑/归档：只改白名单字段，重算 hash/bigrams。 */
+  async updateNode(id, patch = {}) {
+    const db = this._db()
+    const row = db.prepare('SELECT * FROM nodes WHERE id=?').get(String(id || ''))
+    if (!row) return { ok: false, error: 'node_not_found' }
+    const text = patch.text === undefined ? row.text : normalize(String(patch.text))
+    if (!text || text.length > 500) return { ok: false, error: 'invalid_text' }
+    const status = patch.status === undefined ? row.status : String(patch.status)
+    if (!['active', 'archived', 'stale', 'superseded'].includes(status)) return { ok: false, error: 'invalid_status' }
+    const level = patch.level === undefined ? row.level : String(patch.level)
+    if (!['core', 'important', 'normal'].includes(level)) return { ok: false, error: 'invalid_level' }
+    const tags = patch.tags === undefined ? row.tags : JSON.stringify(Array.isArray(patch.tags) ? patch.tags : [])
+    const hash = contentHash(text)
+    db.prepare('UPDATE nodes SET text=?,text_hash=?,text_bigrams=?,status=?,level=?,tags=?,updated_at=? WHERE id=?')
+      .run(text, hash, bigrams(text), status, level, tags, now(), String(id))
+    return { ok: true, id: String(id) }
+  }
+
+  /** 最近写入审计（只读）。 */
+  async writes(limit = 20) {
+    const db = this._db()
+    const rows = db.prepare('SELECT id,ts,trace_id,action,node_id,reason,mode,user_id,role_id,workspace FROM writes ORDER BY ts DESC LIMIT ?')
+      .all(Math.max(1, Math.min(100, Number(limit) || 20)))
+    return { items: rows }
+  }
+
+  /** 最近召回审计（只读）。 */
+  async recalls(limit = 20) {
+    const db = this._db()
+    const rows = db.prepare('SELECT id,ts,trace_id,query,hit_ids,chars,injected,used,elapsed_ms,source FROM recalls ORDER BY ts DESC LIMIT ?')
+      .all(Math.max(1, Math.min(100, Number(limit) || 20)))
+    return { items: rows.map((r) => ({ ...r, hits: (JSON.parse(r.hit_ids || '[]')).length })) }
+  }
+
+  /**
+   * 异步分片导入：>50 行返回 202 + jobId；每批 50 条、用 setImmediate 让出事件循环。
+   * @param {{ jsonl:string, identity:Identity }} q
+   */
+  async startImport(q) {
+    const db = this._db()
+    const lines = String(q?.jsonl || '').split('\n').map((s) => s.trim()).filter(Boolean)
+    const ts = now()
+    const created = db.prepare('INSERT INTO jobs (kind,state,attempts,payload,created_at,updated_at) VALUES (?,?,?,?,?,?)')
+      .run('import', 'queued', 0, JSON.stringify({ total: lines.length, added: 0, skipped: 0, errors: 0 }), ts, ts)
+    const jobId = String(created.lastInsertRowid)
+    this._imports.set(jobId, { lines, next: 0, added: 0, skipped: 0, errors: 0, total: lines.length, identity: q?.identity || {} })
+    this._runImport(jobId)
+    return { ok: true, async: true, jobId, total: lines.length }
+  }
+
+  _runImport(jobId) {
+    const job = this._imports.get(jobId)
+    if (!job || this.closed) return
+    const db = this._db()
+    db.prepare("UPDATE jobs SET state='running', updated_at=? WHERE id=?").run(now(), Number(jobId))
+    const ident = job.identity || {}
+    const insert = db.prepare(`INSERT INTO nodes
+      (id,text,text_hash,text_bigrams,level,memory_type,source,status,role_id,user_id,workspace,tags,
+       context_note,weight,hits,vector_state,origin,trace_id,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,'active',?,?,?,?,?,1,0,'none',?,?,?,?)`)
+    const exists = db.prepare("SELECT 1 FROM nodes WHERE text_hash=? AND user_id=? AND role_id=? AND workspace=? AND status='active' LIMIT 1")
+    const batch = job.lines.slice(job.next, job.next + 50)
+    job.next += batch.length
+    try {
+      db.exec('BEGIN IMMEDIATE')
+      for (const line of batch) {
+        let row
+        try { row = JSON.parse(line) } catch { job.errors += 1; continue }
+        const text = normalize(String(row?.text || ''))
+        if (!text || text.length > 500) { job.errors += 1; continue }
+        const hash = contentHash(text)
+        const u = String(row?.user_id ?? ident.userId ?? '')
+        const r = String(row?.role_id ?? ident.roleId ?? '')
+        const w = String(row?.workspace ?? ident.workspace ?? '')
+        if (exists.get(hash, u, r, w)) { job.skipped += 1; continue }
+        insert.run(
+          String(row?.id || '') || `n${Date.now()}_${hash.slice(0, 10)}_${job.added}`,
+          text, hash, bigrams(text), row?.level || 'normal', row?.memory_type || 'semantic', row?.source || 'import',
+          r, u, w, JSON.stringify(Array.isArray(row?.tags) ? row.tags : []), '',
+          String(row?.origin || 'import'), String(row?.trace_id || ''),
+          Number(row?.created_at) || now(), Number(row?.updated_at) || now(),
+        )
+        job.added += 1
+      }
+      db.exec('COMMIT')
+    } catch (err) {
+      try { db.exec('ROLLBACK') } catch { /* noop */ }
+      job.errors += batch.length
+      this.log(`[whale-memory] import batch fail: ${err?.message || err}`)
+    }
+    const payload = JSON.stringify({ total: job.total, added: job.added, skipped: job.skipped, errors: job.errors })
+    const done = job.next >= job.total
+    db.prepare('UPDATE jobs SET state=?, payload=?, last_error=?, updated_at=? WHERE id=?')
+      .run(done ? 'done' : 'running', payload, job.errors ? 'partial_errors' : null, now(), Number(jobId))
+    if (done) { this._imports.delete(jobId); return }
+    setImmediate(() => this._runImport(jobId))
+  }
+
+  async importStatus(jobId) {
+    const db = this._db()
+    const row = db.prepare('SELECT id,kind,state,payload,last_error,created_at,updated_at FROM jobs WHERE id=?').get(Number(jobId))
+    if (!row) return { ok: false, error: 'job_not_found' }
+    let payload = {}
+    try { payload = JSON.parse(row.payload || '{}') } catch { payload = {} }
+    return { ok: true, job: { id: row.id, kind: row.kind, state: row.state, ...payload, last_error: row.last_error, updated_at: row.updated_at } }
   }
 
   dispose() {

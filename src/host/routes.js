@@ -36,7 +36,7 @@ function sendMethodNotAllowed(res, allow) {
 }
 
 /** @param {{ config: any, backend: any, log?: (s:string)=>void }} deps */
-export function createRoutes({ config, backend, getIdentityCfg = () => config?.identity, log = () => {} }) {
+export function createRoutes({ config, backend, getIdentityCfg = () => config?.identity, ctx, log = () => {} }) {
   const allowRemote = Boolean(config?.panel?.allowRemote)
 
   return async function handle(req, res) {
@@ -162,6 +162,21 @@ export function createRoutes({ config, backend, getIdentityCfg = () => config?.i
         return sendJson(res, 413, { ok: false, error: 'payload_too_large' })
       }
       const dryRun = body.value?.dryRun === true
+      const lineCount = jsonl.split('\n').filter((s) => s.trim()).length
+
+      // 大导入不占主线程：>50 行走 202 + jobId，后台每批 50 条。
+      if (!dryRun && lineCount > 50 && typeof backend.startImport === 'function') {
+        try {
+          const started = await backend.startImport({ jsonl, identity })
+          res.statusCode = 202
+          res.setHeader('content-type', 'application/json; charset=utf-8')
+          res.setHeader('cache-control', 'no-store')
+          return res.end(JSON.stringify({ ok: true, async: true, jobId: started.jobId, total: started.total }))
+        } catch (err) {
+          log(`[whale-memory] import start fail: ${err?.message || 'error'}`)
+          return sendJson(res, 502, { ok: false, error: 'backend_error' })
+        }
+      }
 
       if (typeof backend.importJsonl !== 'function') {
         return sendJson(res, 502, { ok: false, error: 'backend_unavailable' })
@@ -225,6 +240,68 @@ export function createRoutes({ config, backend, getIdentityCfg = () => config?.i
       const items = Array.isArray(data.items) ? data.items : []
       const total = Number(data.total)
       return sendJson(res, 200, { ok: true, items, total: Number.isFinite(total) ? total : items.length })
+    }
+
+    // 导入进度：202 后 UI 轮询这里。
+    if (path === `${PREFIX}/import/status`) {
+      if (req.method !== 'GET') return sendMethodNotAllowed(res, 'GET')
+      const id = new URL(req.url, 'http://127.0.0.1').searchParams.get('id') || ''
+      if (!id || typeof backend.importStatus !== 'function') return sendJson(res, 400, { ok: false, error: 'invalid_job_id' })
+      const st = await backend.importStatus(id)
+      return sendJson(res, st?.ok === false ? 404 : 200, st?.ok === false ? st : { ok: true, ...st.job })
+    }
+
+    // 单节点详情 / 编辑归档
+    if (path.startsWith(`${PREFIX}/nodes/`)) {
+      const id = decodeURIComponent(path.slice(`${PREFIX}/nodes/`.length))
+      if (req.method === 'GET') {
+        if (typeof backend.getNode !== 'function') return sendJson(res, 502, { ok: false, error: 'backend_unavailable' })
+        const got = await backend.getNode(id)
+        return sendJson(res, got?.ok === false ? 404 : 200, got?.ok === false ? got : { ok: true, node: got.node })
+      }
+      if (req.method === 'PATCH') {
+        if (typeof backend.updateNode !== 'function') return sendJson(res, 502, { ok: false, error: 'backend_unavailable' })
+        const body = await readJson(req)
+        if (!body.ok) return sendJson(res, body.status, { ok: false, error: body.error })
+        const got = await backend.updateNode(id, body.value?.patch || body.value || {})
+        return sendJson(res, got?.ok === false ? 400 : 200, got)
+      }
+      return sendMethodNotAllowed(res, 'GET, PATCH')
+    }
+
+    if (path === `${PREFIX}/writes` && req.method === 'GET') {
+      if (typeof backend.writes !== 'function') return sendJson(res, 502, { ok: false, error: 'backend_unavailable' })
+      const limit = clamp(new URL(req.url, 'http://127.0.0.1').searchParams.get('limit'), 1, 100, 20)
+      const data = await backend.writes(limit)
+      return sendJson(res, 200, { ok: true, items: data.items || [] })
+    }
+
+    if (path === `${PREFIX}/recalls` && req.method === 'GET') {
+      if (typeof backend.recalls !== 'function') return sendJson(res, 502, { ok: false, error: 'backend_unavailable' })
+      const limit = clamp(new URL(req.url, 'http://127.0.0.1').searchParams.get('limit'), 1, 100, 20)
+      const data = await backend.recalls(limit)
+      return sendJson(res, 200, { ok: true, items: data.items || [] })
+    }
+
+    if (path === `${PREFIX}/config` && req.method === 'POST') {
+      const body = await readJson(req)
+      if (!body.ok) return sendJson(res, body.status, { ok: false, error: body.error })
+      const next = body.value?.config
+      if (!next || typeof next !== 'object') return sendJson(res, 400, { ok: false, error: 'invalid_config' })
+      try {
+        const editor = ctx?.get?.('configEditor')
+        if (!editor || typeof editor.edit !== 'function' || !ctx?.fiber?.entry) {
+          return sendJson(res, 501, { ok: false, error: 'config_save_unavailable' })
+        }
+        await editor.edit(ctx.fiber.entry, (current) => ({ ...(current || {}), ...next }))
+        for (const key of ['backend', 'identity', 'recall', 'write', 'panel', 'advanced']) {
+          if (next[key] && typeof next[key] === 'object') config[key] = { ...(config[key] || {}), ...next[key] }
+        }
+        return sendJson(res, 200, { ok: true })
+      } catch (err) {
+        log(`[whale-memory] config save fail: ${err?.message || err}`)
+        return sendJson(res, 501, { ok: false, error: 'config_save_failed' })
+      }
     }
 
     if (path === `${PREFIX}/config` && req.method === 'GET') {
