@@ -6,6 +6,7 @@
  * - 调度：installReflectScheduler 在空闲 ≥idleMinutes 时跑，OOM/忙时跳过；手动可触发。
  */
 import { num } from '../host/config-values.js'
+import { memoryPressure } from '../host/memory-guard.js'
 
 const MAX_MATERIAL = 6000
 const MAX_ITEM_CHARS = 500
@@ -60,7 +61,7 @@ export async function runReflect({ backend, llm, selection, config, log = () => 
   try {
     if (!llm || typeof llm.stream !== 'function') return { ok: false, reason: 'llm_unavailable' }
     if (!selection?.provider || (!selection?.model && !config?.reflect?.model)) return { ok: false, reason: 'no_model' }
-    if (process.memoryUsage().rss > 600 * 1024 * 1024) return { ok: false, reason: 'rss_high' }
+    if (memoryPressure().stress) return { ok: false, reason: 'memory_pressure' }
     const items = await backend.listEpisodic(20)
     if (!items || items.length === 0) return { ok: true, added: 0, reason: 'no_material' }
     const maxItems = num(config?.reflect?.maxItems, 8)

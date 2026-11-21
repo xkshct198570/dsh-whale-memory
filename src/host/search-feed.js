@@ -7,10 +7,10 @@
  */
 import { bool, num } from './config-values.js'
 import { resolveIdentity } from './identity.js'
+import { memoryPressure } from './memory-guard.js'
 
 const SEARCH_TOOL_RE = /(^|_)(web_search|websearch|free_search|search_web)$/i
 const MAX_CHARS = 200
-const RSS_GUARD = 600 * 1024 * 1024
 
 function queryOf(exec) {
   const args = exec?.arguments
@@ -44,7 +44,7 @@ export function installSearchFeed(ctx, { backend, config, log = () => {} }) {
       if (!bool(config?.write?.enabled, true) || !bool(config?.write?.searchFeed, false)) return
       const name = String(exec?.name || '')
       if (!SEARCH_TOOL_RE.test(name)) return
-      if (process.memoryUsage().rss > RSS_GUARD) { log('[whale-memory] searchFeed skip: rss high'); return }
+      if (memoryPressure().stress) { log('[whale-memory] searchFeed skip: memory pressure'); return }
       const query = queryOf(exec)
       const summary = summaryOf(result?.value)
       if (!query || !summary) return
