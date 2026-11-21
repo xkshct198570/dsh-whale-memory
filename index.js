@@ -16,7 +16,11 @@ export const inject = ['webServer', 'systemPrompt']
 const log = (line) => { try { console.log(line) } catch { /* log 永远不是故障点 */ } }
 
 export function apply(ctx, config) {
-  const backend = createBackend(config?.backend, { log })
+  const backend = createBackend(config?.backend, {
+    log,
+    dataDir: config?.dataDir || '',
+    useWorker: config?.advanced?.worker !== false,
+  })
 
   // 外部角色插件可选的"身份提示"：A 只存 role_id/workspace/user_id，不理解角色语义。
   let identityHint = null
@@ -29,6 +33,9 @@ export function apply(ctx, config) {
   const handler = createRoutes({ config, backend, getIdentityCfg, log })
 
   ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: PREFIX, handler }), 'whale-memory: routes')
+
+  // backend 生命周期：worker 线程与 SQLite 连接随插件 dispose 收尾。
+  ctx.effect(() => () => backend.dispose?.(), 'whale-memory: backend')
 
   let hook = null
   ctx.effect(() => {

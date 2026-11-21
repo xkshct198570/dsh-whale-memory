@@ -45,5 +45,6 @@ export const Config = z.object({
   advanced: z.object({
     traceId: z.string().default('').volatile(),
     logLevel: z.union(['error', 'warn', 'info', 'debug']).default('warn').volatile(),
+    worker: z.boolean().default(true).volatile(),
   }).default({}),
 })

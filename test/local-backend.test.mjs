@@ -1,0 +1,73 @@
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { mkdtempSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
+import { LocalBackend } from '../src/core/backend.js'
+
+const ident = { userId: 'u1', roleId: '', workspace: 'web' }
+
+function fresh(opts = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'whale-'))
+  return new LocalBackend({ dataDir: dir, useWorker: false, ...opts })
+}
+
+test('write → search → recall 闭环；同 hash 去重', async () => {
+  const b = fresh()
+  try {
+    const w = await b.write({ text: '网关端口 3982 是回调端口', level: 'core', memory_type: 'procedural', tags: ['端口'], identity: ident })
+    assert.equal(w.ok, true)
+    const dup = await b.write({ text: '网关端口 3982 是回调端口', identity: ident })
+    assert.equal(dup.duplicate, true)
+    const hits = await b.search({ query: '网关端口', limit: 5, identity: ident })
+    assert.ok(hits.hits.length >= 1)
+    assert.equal(hits.hits[0].text.includes('3982'), true)
+    const r = await b.recall({ query: '网关端口', maxHits: 3, identity: ident })
+    assert.match(r.prefix, /旧事/)
+    assert.ok(r.chars > 0)
+  } finally { b.dispose() }
+})
+
+test('身份隔离：web 节点不被共享查询意外串入 aluna', async () => {
+  const b = fresh()
+  try {
+    await b.write({ text: '网页专属规则', identity: { userId: 'u1', roleId: '', workspace: 'web' } })
+    await b.write({ text: '共享规则', identity: { userId: 'u1', roleId: '', workspace: '' } })
+    const web = await b.search({ query: '规则', limit: 5, identity: { userId: 'u1', roleId: 'aluna', workspace: 'web' } })
+    assert.ok(web.hits.some((h) => h.text === '网页专属规则'))
+    assert.ok(web.hits.some((h) => h.text === '共享规则'))
+    const other = await b.search({ query: '网页专属', limit: 5, identity: { userId: 'u1', roleId: 'aluna', workspace: 'qq' } })
+    assert.equal(other.hits.some((h) => h.text === '网页专属规则'), false)
+  } finally { b.dispose() }
+})
+
+test('export → import 幂等；nodes/stats', async () => {
+  const src = fresh(); const dst = fresh()
+  try {
+    await src.write({ text: '迁移规则一', identity: ident })
+    await src.write({ text: '迁移规则二', identity: ident })
+    const jsonl = await src.exportJsonl({ identity: ident })
+    assert.equal(jsonl.trim().split('\n').length, 2)
+    const dry = await dst.importJsonl({ jsonl, identity: ident, dryRun: true })
+    assert.equal(dry.added, 2)
+    assert.equal(dry.dryRun, true)
+    const real = await dst.importJsonl({ jsonl, identity: ident })
+    assert.equal(real.added, 2)
+    const again = await dst.importJsonl({ jsonl, identity: ident })
+    assert.equal(again.added, 0)
+    assert.equal(again.skipped, 2)
+    const page = await dst.nodes({ limit: 1, offset: 0 })
+    assert.equal(page.items.length, 1)
+    assert.equal(page.total, 2)
+    const st = await dst.stats()
+    assert.equal(st.totals.nodes_total, 2)
+  } finally { src.dispose(); dst.dispose() }
+})
+
+test('写库：超长/空文本拒绝', async () => {
+  const b = fresh()
+  try {
+    assert.equal((await b.write({ text: '', identity: ident })).ok, false)
+    assert.equal((await b.write({ text: 'x'.repeat(501), identity: ident })).ok, false)
+  } finally { b.dispose() }
+})
