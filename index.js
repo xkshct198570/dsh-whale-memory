@@ -9,6 +9,8 @@ import { createRoutes, PREFIX } from './src/host/routes.js'
 import { installHook } from './src/host/hook.js'
 import { createBackend } from './src/core/backend.js'
 import { Config } from './src/host/config.js'
+import { installSearchFeed } from './src/host/search-feed.js'
+import { installReflectScheduler } from './src/core/reflect.js'
 import { bool } from './src/host/config-values.js'
 
 export { Config }
@@ -31,12 +33,21 @@ export function apply(ctx, config) {
     clearIdentityHint() { identityHint = null },
   })
 
-  const handler = createRoutes({ config, backend, getIdentityCfg, ctx, log })
+  const reflect = installReflectScheduler(ctx, {
+    backend, config,
+    getLlm: () => ctx.get('llm'),
+    getSelection: () => ctx.get('agentDefaultModel')?.currentSelection?.(),
+    log,
+  })
+
+  installSearchFeed(ctx, { backend, config, log })
+
+  const handler = createRoutes({ config, backend, getIdentityCfg, ctx, reflect, log })
 
   ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: PREFIX, handler }), 'whale-memory: routes')
 
   // backend 生命周期：worker 线程与 SQLite 连接随插件 dispose 收尾。
-  ctx.effect(() => () => backend.dispose?.(), 'whale-memory: backend')
+  ctx.effect(() => () => { reflect.dispose(); backend.dispose?.() }, 'whale-memory: backend')
 
   let hook = null
   ctx.effect(() => {

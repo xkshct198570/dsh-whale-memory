@@ -34,6 +34,22 @@ export const Config = z.object({
     enabled: z.boolean().default(true).volatile(),
     reviewMode: z.union(['shadow', 'auto']).default('shadow').volatile(),
     maxChars: z.natural().min(20).max(500).default(500).volatile(),
+    searchFeed: z.boolean().default(false).volatile(),
+    searchTtlHours: z.natural().min(1).max(720).default(24).volatile(),
+  }).default({}),
+
+  reflect: z.object({
+    enabled: z.boolean().default(false),
+    model: z.string().default(''),
+    idleMinutes: z.natural().min(5).max(1440).default(30),
+    maxItems: z.natural().min(1).max(32).default(8),
+    maxRunsPerDay: z.natural().min(1).max(96).default(24),
+  }).default({}),
+
+  sync: z.object({
+    enabled: z.boolean().default(false).volatile(),
+    bridgeUrl: z.string().default(''), // 空=未配置；由 profile 注入本机桥地址（A 包不得出现本机桥字面量）
+    dryRun: z.boolean().default(true).volatile(),
   }).default({}),
 
   panel: z.object({

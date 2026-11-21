@@ -137,7 +137,7 @@ export class LocalBackend {
     return { ok: true, prefix, chars: prefix.length, hits: hits.length }
   }
 
-  /** @param {{ text:string, level?:string, memory_type?:string, tags?:string[], identity:Identity }} q */
+  /** @param {{ text:string, level?:string, memory_type?:string, source?:string, tags?:string[], expired_at?:number, origin?:string, traceId?:string, identity:Identity }} q */
   async write(q) {
     const text = normalize(String(q?.text || ''))
     if (!text) return { ok: false, error: 'invalid_text' }
@@ -157,10 +157,21 @@ export class LocalBackend {
        context_note,weight,hits,vector_state,origin,trace_id,created_at,updated_at)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
       id, text, hash, bigrams(text), q.level || 'normal', q.memory_type || 'semantic',
-      'owner', 'active', String(ident.roleId || ''), String(ident.userId || ''), String(ident.workspace || ''),
-      JSON.stringify(tags), '', 1, 0, 'none', 'panel', String(q.traceId || ''), ts, ts,
+      q.source || 'owner', 'active', String(ident.roleId || ''), String(ident.userId || ''), String(ident.workspace || ''),
+      JSON.stringify(tags), '', 1, 0, 'none', q.origin || 'panel', String(q.traceId || ''), ts, ts,
     )
+    if (Number.isFinite(Number(q.expired_at))) {
+      db.prepare('UPDATE nodes SET expired_at=?, valid_at=? WHERE id=?').run(Number(q.expired_at), ts, id)
+    }
     return { ok: true, id }
+  }
+
+  /** 反思素材：最近 episodic（只读）。 */
+  async listEpisodic(limit = 20) {
+    const db = this._db()
+    const rows = db.prepare("SELECT id,text,created_at,tags FROM nodes WHERE status='active' AND memory_type='episodic' ORDER BY created_at DESC LIMIT ?")
+      .all(Math.max(1, Math.min(50, Number(limit) || 20)))
+    return rows
   }
 
   /** @param {{ jsonl:string, identity:Identity, dryRun?:boolean }} q */

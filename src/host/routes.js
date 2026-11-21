@@ -10,6 +10,7 @@ import { Buffer } from 'node:buffer'
 import { clamp, isLoopback, readJson, sendJson } from './http-kit.js'
 import { resolveIdentity } from './identity.js'
 import { bool, num, value } from './config-values.js'
+import { HttpSyncTransport, pullFromGateway, pushToGateway } from '../core/sync.js'
 
 const PREFIX = '/whale-memory/api'
 
@@ -37,7 +38,7 @@ function sendMethodNotAllowed(res, allow) {
 }
 
 /** @param {{ config: any, backend: any, log?: (s:string)=>void }} deps */
-export function createRoutes({ config, backend, getIdentityCfg = () => config?.identity, ctx, log = () => {} }) {
+export function createRoutes({ config, backend, getIdentityCfg = () => config?.identity, ctx, reflect, log = () => {} }) {
   const allowRemote = bool(config?.panel?.allowRemote, false)
 
   return async function handle(req, res) {
@@ -241,6 +242,37 @@ export function createRoutes({ config, backend, getIdentityCfg = () => config?.i
       const items = Array.isArray(data.items) ? data.items : []
       const total = Number(data.total)
       return sendJson(res, 200, { ok: true, items, total: Number.isFinite(total) ? total : items.length })
+    }
+
+    // 双轨同步（S4）：dryRun 预演差异；真跑必须 confirm=true。bridge 不在→502。
+    if (path === `${PREFIX}/sync`) {
+      if (req.method !== 'POST') return sendMethodNotAllowed(res, 'POST')
+      const body = await readJson(req)
+      if (!body.ok) return sendJson(res, body.status, { ok: false, error: body.error })
+      if (!bool(config?.sync?.enabled, false)) return sendJson(res, 501, { ok: false, error: 'sync_disabled' })
+      const direction = String(body.value?.direction || 'pull')
+      if (!['pull', 'push', 'both'].includes(direction)) return sendJson(res, 400, { ok: false, error: 'invalid_direction' })
+      const dryRun = body.value?.dryRun !== false
+      if (!dryRun && body.value?.confirm !== true) return sendJson(res, 400, { ok: false, error: 'confirm_required' })
+      const transport = new HttpSyncTransport({ baseUrl: value(config?.sync?.bridgeUrl, ''), log })
+      if (!transport.baseUrl) return sendJson(res, 501, { ok: false, error: 'sync_bridge_unset' })
+      const ident = resolveIdentity(getIdentityCfg())
+      if (!ident.ok) return sendJson(res, 400, { ok: false, error: ident.error })
+      const out = {}
+      if (direction === 'pull' || direction === 'both') out.pull = await pullFromGateway({ backend, transport, identity: ident.identity, dryRun })
+      if (direction === 'push' || direction === 'both') out.push = await pushToGateway({ backend, transport, identity: ident.identity, dryRun })
+      return sendJson(res, 200, { ok: true, dryRun, ...out })
+    }
+
+    // 手动反思（S4）：不阻塞；返回 started，结果由 stats/日志观察。
+    if (path === `${PREFIX}/reflect`) {
+      if (req.method !== 'POST') return sendMethodNotAllowed(res, 'POST')
+      if (!reflect || typeof reflect.trigger !== 'function') {
+        return sendJson(res, 501, { ok: false, error: 'reflect_unavailable' })
+      }
+      const result = await reflect.trigger()
+      if (result?.ok === false && result.reason === 'busy') return sendJson(res, 409, { ok: false, error: 'busy' })
+      return sendJson(res, 200, { ok: true, started: true, result })
     }
 
     // 导入进度：202 后 UI 轮询这里。
