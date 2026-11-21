@@ -87,13 +87,31 @@ export async function runReflect({ backend, llm, selection, config, log = () => 
 
 /**
  * 空闲调度：pre-step 刷新 lastActivity；每 60s 检查一次，空闲 ≥idleMinutes 才跑。
- * 反 OOM：RSS >600MB 或已有 run 进行中 → 跳过。
+ * 反 OOM：RSS/可用内存告急、已有 run 进行中 → 跳过。
+ *
+ * 接入 keeper 后（生产路径），反思与巩固/向量共用「全局并发 1」：这里只负责
+ * 「何时该反思」→ 入队；真正执行由 keeper 的 reflect handler 串行跑（OOM 盲区之四）。
+ * 未传 keeper 时保留原来的直跑路径（单测/诊断用）。
  */
-export function installReflectScheduler(ctx, { backend, config, getLlm, getSelection, log = () => {} }) {
+export function installReflectScheduler(ctx, { backend, config, getLlm, getSelection, log = () => {}, keeper = null }) {
   let lastActivity = Date.now()
   let running = false
   let lastRunDay = ''
   let runsToday = 0
+  const run = () => runReflect({ backend, llm: getLlm?.(), selection: getSelection?.(), config, log })
+
+  if (keeper && typeof keeper.register === 'function') {
+    try { keeper.register('reflect', () => run()) } catch (err) {
+      log(`[whale-memory] reflect handler not registered: ${err?.message || err}`)
+    }
+  }
+
+  /** 队列里已有 reflect（queued/running）时不再叠加，防压力期堆一堆重复 job。 */
+  const queuedReflect = () => {
+    if (!keeper || typeof keeper.status !== 'function') return running
+    return keeper.status().jobs.some((job) => job.kind === 'reflect' && (job.state === 'queued' || job.state === 'running'))
+  }
+
   // 必须 waterfall 形式返回 next()：裸 listener 返回 undefined 会让 agent loop 读 decision.kind 崩
   const off = ctx.on('agent/pre-step', async (payload, next) => {
     lastActivity = Date.now()
@@ -102,14 +120,21 @@ export function installReflectScheduler(ctx, { backend, config, getLlm, getSelec
 
   const tick = async () => {
     try {
-      if (running || !config?.reflect?.enabled) return
+      if (!config?.reflect?.enabled) return
       const idleMs = num(config?.reflect?.idleMinutes, 30) * 60_000
       if (Date.now() - lastActivity < idleMs) return
       const day = new Date().toISOString().slice(0, 10)
       if (day !== lastRunDay) { lastRunDay = day; runsToday = 0 }
       if (runsToday >= num(config?.reflect?.maxRunsPerDay, 24)) return
+      if (queuedReflect()) return
+      if (keeper && typeof keeper.enqueue === 'function') {
+        runsToday += 1
+        lastActivity = Date.now()
+        keeper.enqueue('reflect', {})
+        return
+      }
       running = true; runsToday += 1; lastActivity = Date.now()
-      await runReflect({ backend, llm: getLlm?.(), selection: getSelection?.(), config, log })
+      await run()
     } catch (err) {
       log(`[whale-memory] reflect scheduler fail-open: ${err?.message || err}`)
     } finally { running = false }
@@ -118,5 +143,20 @@ export function installReflectScheduler(ctx, { backend, config, getLlm, getSelec
   const timer = setInterval(() => { void tick() }, 60_000)
   if (typeof timer.unref === 'function') timer.unref()
   const dispose = () => { clearInterval(timer); off?.() }
-  return { tick, dispose, trigger: async () => { if (running) return { ok: false, reason: 'busy' }; running = true; try { return await runReflect({ backend, llm: getLlm?.(), selection: getSelection?.(), config, log }) } finally { running = false } } }
+
+  const trigger = async () => {
+    if (keeper && typeof keeper.runNow === 'function') {
+      if (queuedReflect()) return { ok: false, reason: 'busy' }
+      const got = await keeper.runNow('reflect', {})
+      if (got?.skipped === 'busy') return { ok: false, reason: 'busy' }
+      if (got?.deferred) return { ok: false, reason: 'deferred', deferred: got.deferred }
+      if (got?.state === 'failed') return { ok: false, reason: 'reflect_error', error: got.last_error || '' }
+      return got?.result && typeof got.result === 'object' ? got.result : { ok: got?.state === 'done' }
+    }
+    if (running) return { ok: false, reason: 'busy' }
+    running = true
+    try { return await run() } finally { running = false }
+  }
+
+  return { tick, dispose, trigger }
 }

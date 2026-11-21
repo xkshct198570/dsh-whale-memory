@@ -1,0 +1,261 @@
+{
+  "version": 1,
+  "source": "v2 黄金评测集移植",
+  "cases": [
+    {
+      "id": "q01",
+      "kind": "cjk",
+      "query": "群主转让 冻结期",
+      "must_hit_keywords": [
+        "冻结期"
+      ]
+    },
+    {
+      "id": "q02",
+      "kind": "cjk",
+      "query": "微信 单聊通道 边界",
+      "must_hit_keywords": [
+        "ClawBot"
+      ]
+    },
+    {
+      "id": "q03",
+      "kind": "cjk",
+      "query": "机械硬盘 工作目录 性能",
+      "must_hit_keywords": [
+        "机械硬盘"
+      ]
+    },
+    {
+      "id": "q04",
+      "kind": "cjk",
+      "query": "记忆中枢 升级架构书",
+      "must_hit_keywords": [
+        "架构书"
+      ]
+    },
+    {
+      "id": "q05",
+      "kind": "cjk",
+      "query": "协议端 防风控 判据",
+      "must_hit_keywords": [
+        "协议端"
+      ]
+    },
+    {
+      "id": "q06",
+      "kind": "cjk",
+      "query": "熔断 Phase2 待批",
+      "must_hit_keywords": [
+        "熔断"
+      ]
+    },
+    {
+      "id": "q07",
+      "kind": "cjk",
+      "query": "灾备 备份包 上传",
+      "must_hit_keywords": [
+        "灾备"
+      ]
+    },
+    {
+      "id": "q08",
+      "kind": "cjk",
+      "query": "审计 TTL 清理",
+      "must_hit_keywords": [
+        "审计"
+      ]
+    },
+    {
+      "id": "q09",
+      "kind": "cjk",
+      "query": "表情包 图库 收集",
+      "must_hit_keywords": [
+        "表情包"
+      ]
+    },
+    {
+      "id": "q10",
+      "kind": "cjk",
+      "query": "收尾四件套 交接",
+      "must_hit_keywords": [
+        "收尾四件套"
+      ]
+    },
+    {
+      "id": "q11",
+      "kind": "mixed",
+      "query": "WSL 断网 resolv.conf 8.8.8.8",
+      "must_hit_keywords": [
+        "resolv.conf",
+        "8.8.8.8"
+      ]
+    },
+    {
+      "id": "q12",
+      "kind": "mixed",
+      "query": "DSH 权限 danger-full-access 沙箱",
+      "must_hit_keywords": [
+        "danger-full-access"
+      ]
+    },
+    {
+      "id": "q13",
+      "kind": "mixed",
+      "query": "ComfyUI --listen 8188 防火墙",
+      "must_hit_keywords": [
+        "--listen"
+      ]
+    },
+    {
+      "id": "q14",
+      "kind": "mixed",
+      "query": "网关 3002 Webhook 回调",
+      "must_hit_keywords": [
+        "3002"
+      ]
+    },
+    {
+      "id": "q15",
+      "kind": "mixed",
+      "query": "whale.db 备份 VACUUM",
+      "must_hit_keywords": [
+        "VACUUM"
+      ]
+    },
+    {
+      "id": "q16",
+      "kind": "mixed",
+      "query": "gateway.py 重启 脚本",
+      "must_hit_keywords": [
+        "gateway.py"
+      ]
+    },
+    {
+      "id": "q17",
+      "kind": "mixed",
+      "query": "NapCat 退役 不得复活",
+      "must_hit_keywords": [
+        "退役"
+      ]
+    },
+    {
+      "id": "q18",
+      "kind": "mixed",
+      "query": "stageForSend 跨端发文件",
+      "must_hit_keywords": [
+        "stageForSend"
+      ]
+    },
+    {
+      "id": "q19",
+      "kind": "mixed",
+      "query": "QQ 机器人 审批 120 秒",
+      "must_hit_keywords": [
+        "审批"
+      ]
+    },
+    {
+      "id": "q20",
+      "kind": "mixed",
+      "query": "ComfyUI 409 同名冲突",
+      "must_hit_keywords": [
+        "409"
+      ]
+    },
+    {
+      "id": "q21",
+      "kind": "ident",
+      "query": "rdclientax",
+      "must_hit_keywords": [
+        "rdclientax"
+      ]
+    },
+    {
+      "id": "q22",
+      "kind": "ident",
+      "query": "8.8.8.8",
+      "must_hit_keywords": [
+        "8.8.8.8"
+      ]
+    },
+    {
+      "id": "q23",
+      "kind": "ident",
+      "query": "whale.db",
+      "must_hit_keywords": [
+        "whale.db"
+      ]
+    },
+    {
+      "id": "q24",
+      "kind": "ident",
+      "query": "stageForSend",
+      "must_hit_keywords": [
+        "stageForSend"
+      ]
+    },
+    {
+      "id": "q25",
+      "kind": "ident",
+      "query": "VACUUM INTO",
+      "must_hit_keywords": [
+        "VACUUM"
+      ]
+    },
+    {
+      "id": "q26",
+      "kind": "ident",
+      "query": "3010",
+      "must_hit_keywords": [
+        "3010"
+      ]
+    },
+    {
+      "id": "q27",
+      "kind": "twochar",
+      "query": "熔断",
+      "must_hit_keywords": [
+        "熔断"
+      ]
+    },
+    {
+      "id": "q28",
+      "kind": "twochar",
+      "query": "灾备",
+      "must_hit_keywords": [
+        "灾备"
+      ]
+    },
+    {
+      "id": "q29",
+      "kind": "twochar",
+      "query": "审批",
+      "must_hit_keywords": [
+        "审批"
+      ]
+    },
+    {
+      "id": "q30",
+      "kind": "twochar",
+      "query": "备份",
+      "must_hit_keywords": [
+        "备份"
+      ]
+    },
+    {
+      "id": "q31",
+      "kind": "empty",
+      "query": "火星殖民计划预算",
+      "must_hit_keywords": [],
+      "expect_empty": true
+    },
+    {
+      "id": "q32",
+      "kind": "empty",
+      "query": "交响乐谱排版",
+      "must_hit_keywords": [],
+      "expect_empty": true
+    }
+  ]
+}

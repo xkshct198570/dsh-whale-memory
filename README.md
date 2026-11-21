@@ -2,7 +2,7 @@
 
 本地长期记忆中枢（DeepSeek Harness 插件）。
 
-**状态：S2 记忆核心底座（0.3.0，未发布）** —— schema v1、QueryPlan/两段式打分、worker 隔离、本地 backend、write/import/export 已就位；巩固/反思/面板写操作按 S3–S4 落地。
+**状态：S4 机制二期（0.4.2，未发布）** —— schema v1、QueryPlan/两段式打分、worker 隔离、本地 backend、写入决策流水线、后台 jobs、关系扩散、意图预算、五页签面板与设置开关已就位；发布封板（S5）待做。
 
 ## 安装（开发期）
 

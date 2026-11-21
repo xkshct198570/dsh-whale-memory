@@ -19,6 +19,7 @@
 import { buildPlan } from './queryplan.js'
 import { normalize } from './tokenize.js'
 import { now } from './db.js'
+import { HOP_FACTOR, expandOneHop } from './relations.js'
 
 const FTS_LIMIT = 50
 const MAX_CANDIDATES = 150
@@ -85,10 +86,10 @@ function identityFilter(identity) {
 function collectFts(db, table, match, filter, candidates) {
   if (!match || candidates.size >= MAX_CANDIDATES) return
   const sql =
-    `SELECT n.id, n.text, n.level, n.memory_type, n.source, n.created_at, n.last_hit_at ` +
+    `SELECT n.id, n.text, n.level, n.memory_type, n.source, n.created_at, n.last_hit_at, n.context_note ` +
     `FROM ${table} JOIN nodes n ON n.rowid = ${table}.rowid ` +
     `WHERE ${table} MATCH ? AND n.status = 'active'${filter.sql} ` +
-    `LIMIT ${FTS_LIMIT}`
+    `ORDER BY rank LIMIT ${FTS_LIMIT}`
   let rows
   try {
     rows = db.prepare(sql).all(match, ...filter.params)
@@ -188,7 +189,9 @@ export function search(db, opts = {}) {
     const type = TYPE[row.memory_type] ?? 1
     const ageDays = Math.max(0, (nowSec - Number(row.created_at || 0)) / 86400)
     const decay = Math.pow(0.5, ageDays / 90)
-    const effWeight = level * source * type * decay
+    // context_note 只做检索加权（+5%），永不进注入正文（架构书 §7.2）。
+    const noteBoost = String(row.context_note || '') ? 1.05 : 1
+    const effWeight = level * source * type * decay * noteBoost
     const gain = 0.5 + (0.5 * Math.log2(1 + Math.min(effWeight, 12))) / LOG2_13
     const mult = plan.intent && plan.intent === row.memory_type ? 1.5 : 1
     const score = rel * mult * gain
@@ -205,6 +208,44 @@ export function search(db, opts = {}) {
       // 排序辅助，不返回
       _lastHitAt: Number(row.last_hit_at ?? 0),
     })
+  }
+
+  // 1 跳扩散（架构书 §7.1）：只从 top-3 种子沿 topic/reference 边扩，每跳跃 ×0.6；
+  // mutex/supersede 不参与（passDiffusion 已在 expandOneHop 的 SQL 里按 etype 过滤）。
+  const seen = new Set(hits.map((h) => h.id))
+  const relBySeed = new Map(hits.slice(0, 3).map((h) => [h.id, h.rel]))
+  if (opts.diffusion !== false && hits.length > 0) {
+    for (const row of expandOneHop(db, {
+      seeds: hits.slice(0, 3),
+      identity: opts.identity,
+      minConf: opts.minConf,
+      cap: 20,
+    })) {
+      if (seen.has(row.id)) continue
+      seen.add(row.id)
+      const seedRel = relBySeed.get(String(row.from_id)) ?? relBySeed.get(String(row.to_id)) ?? 0
+      const rel = Math.min(1, seedRel * HOP_FACTOR)
+      if (rel < minRel) { below += 1; continue }
+      const level = levelRank(row.level)
+      const source = SOURCE[row.source] ?? 0.5
+      const type = TYPE[row.memory_type] ?? 1
+      const ageDays = Math.max(0, (nowSec - Number(row.created_at || 0)) / 86400)
+      const decay = Math.pow(0.5, ageDays / 90)
+      const effWeight = level * source * type * decay
+      const gain = 0.5 + (0.5 * Math.log2(1 + Math.min(effWeight, 12))) / LOG2_13
+      const mult = plan.intent && plan.intent === row.memory_type ? 1.5 : 1
+      hits.push({
+        id: row.id,
+        text: row.text,
+        level: row.level,
+        type: row.memory_type,
+        source: row.source,
+        score: rel * mult * gain,
+        rel,
+        components: { rel, mult, gain, effWeight, vec: 0, path: 'diffusion', hops: 1, via: String(row.from_id) },
+        _lastHitAt: Number(row.last_hit_at ?? 0),
+      })
+    }
   }
 
   hits.sort(

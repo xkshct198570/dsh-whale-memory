@@ -8,6 +8,9 @@
 import { closeDb, getMeta, now, openDb, setMeta } from './db.js'
 import { bigrams, contentHash, normalize } from './tokenize.js'
 import { search as searchDb } from './search.js'
+import { planBudget, trimHits } from './budget.js'
+import { applyNeighborNotes, relationStats } from './relations.js'
+import { createWriteQueue } from './writer.js'
 import { DbWorkerClient } from './workers/client.js'
 
 /** @typedef {{ userId: string, roleId: string, workspace: string }} Identity */
@@ -22,7 +25,7 @@ export class LocalBackend {
   /**
    * @param {{ dataDir?: string, useWorker?: boolean, log?: (s:string)=>void, timeoutMs?: number }} [opts]
    */
-  constructor({ dataDir = '', useWorker = true, log = () => {}, timeoutMs = 1200 } = {}) {
+  constructor({ dataDir = '', useWorker = true, log = () => {}, timeoutMs = 1200, config = null } = {}) {
     this.dataDir = dataDir
     this.log = log
     this.useWorker = useWorker !== false
@@ -31,6 +34,12 @@ export class LocalBackend {
     this.dbPath = ''
     this.worker = null
     this.closed = false
+    // 写入决策要读实时配置（shadow/auto 面板可改），因此持 getter 而不是快照。
+    // 无配置（单测/直连）默认 auto：旧行为不变；生产由 index.js 注入实时配置（默认 shadow）。
+    this._config = config
+      ? (typeof config === 'function' ? config : () => config)
+      : () => ({ write: { reviewMode: 'auto' } })
+    this.writeQueue = null
     /** @type {Map<string,{lines:string[],next:number,added:number,skipped:number,errors:number,total:number,identity:any}>} */
     this._imports = new Map()
   }
@@ -60,6 +69,41 @@ export class LocalBackend {
       }
     }
     return this.worker
+  }
+
+  /**
+   * S4 内部闸口：在同一写连接上跑同步片段（writer/keeper 的调度与审计用）。
+   * 不给外部 HTTP 层使用；不做缓存、不建新连接，保持单写者语义。
+   * @template T
+   * @param {(db: import('node:sqlite').DatabaseSync) => T} fn
+   * @returns {T}
+   */
+  withDb(fn) {
+    if (typeof fn !== 'function') throw new TypeError('withDb: fn required')
+    return fn(this._db())
+  }
+
+  /** 库文件绝对路径（诊断/日报用；未打开时为空）。 */
+  get dbFile() {
+    return this.dbPath
+  }
+
+  _writer() {
+    if (this.closed) throw new Error('backend_disposed')
+    if (!this.writeQueue) {
+      this.writeQueue = createWriteQueue({ store: this, config: this._config, log: this.log })
+    }
+    return this.writeQueue
+  }
+
+  /** 续跑遗留的写队列 job（keeper 的 write handler / 启动补偿用）。 */
+  async drainWrites() {
+    return this._writer().drain()
+  }
+
+  /** shadow 候选审核（面板「写入」页）。 */
+  reviewWrite(id, decision, reason) {
+    return this._writer().review(id, decision, reason)
   }
 
   async stats() {
@@ -95,6 +139,7 @@ export class LocalBackend {
     const opts = {
       query: String(q?.query || ''), limit: q?.limit ?? 5,
       identity: q?.identity, minRel: q?.minRel,
+      diffusion: q?.diffusion, minConf: q?.minConf,
     }
     const worker = this._worker()
     if (worker) {
@@ -113,8 +158,21 @@ export class LocalBackend {
    */
   async recall(q, signal) {
     const started = Date.now()
-    const result = await this.search({ query: q?.query, limit: q?.maxHits ?? 5, identity: q?.identity, minRel: q?.minRel }, signal)
-    const hits = (result?.hits || []).slice(0, Math.max(0, Number(q?.maxHits ?? 5)))
+    // 意图预算（架构书 §5.4）：闲聊/排障/回忆分档；画图链路 0 注入。
+    const budget = planBudget(q?.query, {
+      intentBudget: q?.intentBudget,
+      maxHits: q?.maxHits ?? 5,
+      charBudget: q?.charBudget,
+    })
+    if (budget.maxHits <= 0 || budget.charBudget <= 0) {
+      return { ok: true, prefix: '', chars: 0, hits: 0, intent: budget.intent }
+    }
+    const result = await this.search({
+      query: q?.query, limit: budget.maxHits, identity: q?.identity, minRel: q?.minRel,
+      diffusion: q?.diffusion, minConf: q?.minConf,
+    }, signal)
+    const trimmed = trimHits(result?.hits || [], budget)
+    const hits = trimmed.hits
     const prefix = hits.length
       ? '【你想到的旧事】\n' + hits.map((h) => `- ${String(h.text || '').trim()}`).join('\n')
       : ''
@@ -134,36 +192,57 @@ export class LocalBackend {
         this.log(`[whale-memory] recall audit fail-open: ${err?.message || err}`)
       }
     }
-    return { ok: true, prefix, chars: prefix.length, hits: hits.length }
+    return {
+      ok: true, prefix, chars: prefix.length, hits: hits.length,
+      intent: budget.intent, dropped: trimmed.dropped, clipped: trimmed.clipped,
+    }
   }
 
-  /** @param {{ text:string, level?:string, memory_type?:string, source?:string, tags?:string[], expired_at?:number, origin?:string, traceId?:string, identity:Identity }} q */
+  /**
+   * 写入入口（S4 决策流水线）：校验 → 落 jobs 队列 → decideWrite → processEvent。
+   * shadow 模式只留 writes CANDIDATE，不落 nodes；auto 模式才写记忆库。
+   * @param {{ text:string, level?:string, memory_type?:string, source?:string, tags?:string[], expired_at?:number, origin?:string, traceId?:string, identity:Identity }} q
+   */
   async write(q) {
     const text = normalize(String(q?.text || ''))
     if (!text) return { ok: false, error: 'invalid_text' }
     if (text.length > 500) return { ok: false, error: 'text_too_long' }
-    const db = this._db()
-    const hash = contentHash(text)
+    const writeCfg = this._config()?.write || {}
+    if (writeCfg.enabled === false) return { ok: false, error: 'write_disabled' }
     const ident = q?.identity || {}
-    const dup = db.prepare(
-      "SELECT id FROM nodes WHERE text_hash=? AND user_id=? AND role_id=? AND workspace=? AND status='active' LIMIT 1",
-    ).get(hash, String(ident.userId || ''), String(ident.roleId || ''), String(ident.workspace || ''))
-    if (dup) return { ok: true, id: String(dup.id), duplicate: true }
-    const ts = now()
-    const id = `n${Date.now()}_${hash.slice(0, 10)}`
     const tags = Array.isArray(q.tags) ? q.tags.filter((x) => typeof x === 'string').slice(0, 32) : []
-    db.prepare(`INSERT INTO nodes
-      (id,text,text_hash,text_bigrams,level,memory_type,source,status,role_id,user_id,workspace,tags,
-       context_note,weight,hits,vector_state,origin,trace_id,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
-      id, text, hash, bigrams(text), q.level || 'normal', q.memory_type || 'semantic',
-      q.source || 'owner', 'active', String(ident.roleId || ''), String(ident.userId || ''), String(ident.workspace || ''),
-      JSON.stringify(tags), '', 1, 0, 'none', q.origin || 'panel', String(q.traceId || ''), ts, ts,
-    )
-    if (Number.isFinite(Number(q.expired_at))) {
-      db.prepare('UPDATE nodes SET expired_at=?, valid_at=? WHERE id=?').run(Number(q.expired_at), ts, id)
+    const event = {
+      traceId: String(q?.traceId || ''),
+      source: String(q?.source || 'manual'),
+      identity: { userId: String(ident.userId || ''), roleId: String(ident.roleId || ''), workspace: String(ident.workspace || '') },
+      text,
+      tags,
+      at: Date.now(),
+      candidateType: q?.memory_type || null,
+      origin: String(q?.origin || 'panel'),
+      level: q?.level || 'normal',
+      memory_type: q?.memory_type || 'semantic',
+      expired_at: Number.isFinite(Number(q?.expired_at)) ? Number(q.expired_at) : undefined,
     }
-    return { ok: true, id }
+    const res = await this._writer().enqueue(event)
+    if (!res || res.ok === false) {
+      return { ok: false, error: String(res?.reason || 'write_rejected'), action: res?.action }
+    }
+    if (res.id) {
+      // 演化注记只追加 context_note（≤200），不改正文/tags；失败不阻断写入结果。
+      try {
+        this.withDb((db) => applyNeighborNotes(db, { id: res.id, tags, identity: event.identity }, { traceId: event.traceId }))
+      } catch (err) {
+        this.log(`[whale-memory] neighbor notes fail-open: ${err?.message || err}`)
+      }
+    }
+    return {
+      ok: true,
+      id: res.id,
+      action: res.action,
+      duplicate: Boolean(res.duplicate),
+      candidate: res.action === 'CANDIDATE',
+    }
   }
 
   /** 反思素材：最近 episodic（只读）。 */
@@ -261,12 +340,31 @@ export class LocalBackend {
     return { ok: true, id: String(id) }
   }
 
-  /** 最近写入审计（只读）。 */
-  async writes(limit = 20) {
+  /** 最近写入审计（只读）；action 过滤用于面板只看 shadow 候选。 */
+  async writes(limit = 20, action = '') {
     const db = this._db()
-    const rows = db.prepare('SELECT id,ts,trace_id,action,node_id,reason,mode,user_id,role_id,workspace FROM writes ORDER BY ts DESC LIMIT ?')
-      .all(Math.max(1, Math.min(100, Number(limit) || 20)))
+    const lim = Math.max(1, Math.min(100, Number(limit) || 20))
+    const rows = action
+      ? db.prepare('SELECT id,ts,trace_id,action,node_id,reason,before_text,after_text,mode,user_id,role_id,workspace FROM writes WHERE action=? ORDER BY ts DESC LIMIT ?').all(String(action), lim)
+      : db.prepare('SELECT id,ts,trace_id,action,node_id,reason,before_text,after_text,mode,user_id,role_id,workspace FROM writes ORDER BY ts DESC LIMIT ?').all(lim)
     return { items: rows }
+  }
+
+  /** 关系统计 + 最近边（面板 /edges）。 */
+  async edges(limit = 50) {
+    const db = this._db()
+    const stat = relationStats(db)
+    const items = db.prepare('SELECT id,from_id,to_id,etype,source,conf,weight,created_at FROM edges ORDER BY id DESC LIMIT ?')
+      .all(Math.max(1, Math.min(100, Number(limit) || 50)))
+    return { ok: true, ...stat, items }
+  }
+
+  /** 演化审计（面板 /evolution）。 */
+  async evolution(limit = 50) {
+    const db = this._db()
+    const lim = Math.max(1, Math.min(100, Number(limit) || 50))
+    const items = db.prepare('SELECT id,ts,from_id,to_id,field,old_value,new_value,trace_id FROM evolution ORDER BY id DESC LIMIT ?').all(lim)
+    return { ok: true, items }
   }
 
   /** 最近召回审计（只读）。 */
@@ -352,6 +450,8 @@ export class LocalBackend {
 
   dispose() {
     this.closed = true
+    try { this.writeQueue?.dispose() } catch { /* noop */ }
+    this.writeQueue = null
     try { this.worker?.dispose() } catch { /* noop */ }
     this.worker = null
     closeDb(this.db)
@@ -410,5 +510,6 @@ export function createBackend(cfg, extra = {}) {
     useWorker: extra.useWorker !== false,
     timeoutMs: cfg?.timeoutMs || 1200,
     log: extra.log,
+    config: extra.config,
   })
 }

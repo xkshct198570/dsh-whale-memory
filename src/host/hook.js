@@ -85,7 +85,11 @@ export function installHook(ctx, { backend, config, getIdentityCfg = () => confi
         const result = await backend.recall({
           query,
           maxHits: num(config?.recall?.maxHits, 5),
+          charBudget: num(config?.recall?.charBudget, 1500),
+          intentBudget: bool(config?.recall?.intentBudget, true),
           minRel: num(config?.recall?.minRel, 0.34),
+          diffusion: bool(config?.edges?.diffusion, true),
+          minConf: num(config?.edges?.minConf, 0.6),
           identity: ident.identity,
         }, ac.signal)
         if (result && typeof result.prefix === 'string' && result.prefix) {

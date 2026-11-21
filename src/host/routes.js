@@ -29,6 +29,9 @@ const WRITE_ERROR_CODES = new Set([
   'identity_required',
   'write_disabled',
   'duplicate',
+  'text_too_long',
+  'privacy',
+  'daily_cap',
 ])
 
 /** @param {import('node:http').ServerResponse} res @param {string} allow */
@@ -149,7 +152,12 @@ export function createRoutes({ config, backend, getIdentityCfg = () => config?.i
           error: whitelisted ? result.error : 'backend_error',
         })
       }
-      if (result.id === undefined || result.id === null) return sendJson(res, 502, { ok: false, error: 'backend_error' })
+      if (result.id === undefined || result.id === null) {
+        if (result.candidate || result.action === 'CANDIDATE') {
+          return sendJson(res, 200, { ok: true, id: null, candidate: true })
+        }
+        return sendJson(res, 502, { ok: false, error: 'backend_error' })
+      }
       return sendJson(res, 200, { ok: true, id: String(result.id) })
     }
 
@@ -304,8 +312,10 @@ export function createRoutes({ config, backend, getIdentityCfg = () => config?.i
 
     if (path === `${PREFIX}/writes` && req.method === 'GET') {
       if (typeof backend.writes !== 'function') return sendJson(res, 502, { ok: false, error: 'backend_unavailable' })
-      const limit = clamp(new URL(req.url, 'http://127.0.0.1').searchParams.get('limit'), 1, 100, 20)
-      const data = await backend.writes(limit)
+      const params = new URL(req.url, 'http://127.0.0.1').searchParams
+      const limit = clamp(params.get('limit'), 1, 100, 20)
+      const action = String(params.get('action') || '').trim().slice(0, 32)
+      const data = await backend.writes(limit, action)
       return sendJson(res, 200, { ok: true, items: data.items || [] })
     }
 
@@ -314,6 +324,35 @@ export function createRoutes({ config, backend, getIdentityCfg = () => config?.i
       const limit = clamp(new URL(req.url, 'http://127.0.0.1').searchParams.get('limit'), 1, 100, 20)
       const data = await backend.recalls(limit)
       return sendJson(res, 200, { ok: true, items: data.items || [] })
+    }
+
+    if (path === `${PREFIX}/edges` && req.method === 'GET') {
+      if (typeof backend.edges !== 'function') return sendJson(res, 502, { ok: false, error: 'backend_unavailable' })
+      const limit = clamp(new URL(req.url, 'http://127.0.0.1').searchParams.get('limit'), 1, 100, 50)
+      const data = await backend.edges(limit)
+      return sendJson(res, 200, { ok: true, ...data })
+    }
+
+    if (path === `${PREFIX}/evolution` && req.method === 'GET') {
+      if (typeof backend.evolution !== 'function') return sendJson(res, 502, { ok: false, error: 'backend_unavailable' })
+      const limit = clamp(new URL(req.url, 'http://127.0.0.1').searchParams.get('limit'), 1, 100, 50)
+      const data = await backend.evolution(limit)
+      return sendJson(res, 200, { ok: true, items: data.items || [] })
+    }
+
+    // shadow 候选审核：accept → 落节点；reject → 留理由（架构书 §6.2）。
+    if (path === `${PREFIX}/write/review` && req.method === 'POST') {
+      const body = await readJson(req)
+      if (!body.ok) return sendJson(res, body.status, { ok: false, error: body.error })
+      const id = Number(body.value?.id)
+      const decision = String(body.value?.decision || '')
+      if (!Number.isFinite(id) || !['accept', 'reject'].includes(decision)) {
+        return sendJson(res, 400, { ok: false, error: 'invalid_review' })
+      }
+      if (typeof backend.reviewWrite !== 'function') return sendJson(res, 502, { ok: false, error: 'backend_unavailable' })
+      const got = await backend.reviewWrite(id, decision, String(body.value?.reason || '').slice(0, 200))
+      if (!got?.ok) return sendJson(res, got?.error === 'candidate_not_found' ? 404 : 400, got)
+      return sendJson(res, 200, got)
     }
 
     if (path === `${PREFIX}/config` && req.method === 'POST') {
@@ -327,7 +366,7 @@ export function createRoutes({ config, backend, getIdentityCfg = () => config?.i
           return sendJson(res, 501, { ok: false, error: 'config_save_unavailable' })
         }
         await editor.edit(ctx.fiber.entry, (current) => ({ ...(current || {}), ...next }))
-        for (const key of ['backend', 'identity', 'recall', 'write', 'panel', 'advanced']) {
+        for (const key of ['backend', 'identity', 'recall', 'write', 'reflect', 'sync', 'edges', 'panel', 'advanced']) {
           if (next[key] && typeof next[key] === 'object') config[key] = { ...(config[key] || {}), ...next[key] }
         }
         return sendJson(res, 200, { ok: true })
@@ -355,10 +394,18 @@ function redact(config) {
       enabled: bool(config?.recall?.enabled, true),
       maxHits: num(config?.recall?.maxHits, 5),
       charBudget: num(config?.recall?.charBudget, 1500),
+      intentBudget: bool(config?.recall?.intentBudget, true),
       minRel: num(config?.recall?.minRel, 0.34),
       timeoutMs: num(config?.recall?.timeoutMs, 2000),
     },
-    write: { enabled: bool(config?.write?.enabled, true), reviewMode: value(config?.write?.reviewMode, 'shadow') },
+    write: {
+      enabled: bool(config?.write?.enabled, true),
+      reviewMode: value(config?.write?.reviewMode, 'shadow'),
+      maxChars: num(config?.write?.maxChars, 500),
+      searchFeed: bool(config?.write?.searchFeed, false),
+    },
+    reflect: { enabled: bool(config?.reflect?.enabled, false) },
+    sync: { enabled: bool(config?.sync?.enabled, false) },
     panel: { allowRemote: bool(config?.panel?.allowRemote, false), pollMs: num(config?.panel?.pollMs, 60000) },
     advanced: { logLevel: value(config?.advanced?.logLevel, 'warn'), worker: bool(config?.advanced?.worker, true) },
   }
