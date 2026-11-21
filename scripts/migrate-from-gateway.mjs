@@ -15,7 +15,7 @@
  * 4. text > 500 只告警不阻断（历史记忆长度不可控，挡住等于永远导不完）。
  */
 import { execFile } from 'node:child_process'
-import { existsSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -25,6 +25,7 @@ const DEFAULTS = {
   user: '1246277257',
   gatewayDir: '/home/hy/ai-router-microservice',
   dryRun: false,
+  includeOwner: true,
   timeoutMs: 120_000,
 }
 
@@ -71,14 +72,19 @@ export function validateJsonl(text) {
 
 /** `--key=value` 与 `--key value` 两种写法都认；未知参数直接报错，避免静默跑错库。 */
 export function parseArgs(argv) {
-  const known = new Set(['out', 'role', 'user', 'gateway-dir', 'dry-run'])
+  const known = new Set(['out', 'role', 'user', 'gateway-dir', 'dry-run', 'no-owner'])
   const opts = { ...DEFAULTS }
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]
     if (!arg.startsWith('--')) throw new Error(`无法识别的参数：${arg}`)
     const eq = arg.indexOf('=')
     const key = eq === -1 ? arg.slice(2) : arg.slice(2, eq)
-    if (!known.has(key)) throw new Error(`未知参数：--${key}（支持 --out/--role/--user/--gateway-dir/--dry-run）`)
+    if (!known.has(key)) throw new Error(`未知参数：--${key}（支持 --out/--role/--user/--gateway-dir/--dry-run/--no-owner）`)
+    if (key === 'no-owner') {
+      if (eq !== -1) throw new Error('--no-owner 不带值')
+      opts.includeOwner = false
+      continue
+    }
     if (key === 'dry-run') {
       if (eq !== -1) throw new Error('--dry-run 不带值')
       opts.dryRun = true
@@ -146,6 +152,26 @@ function runExport(opts) {
   })
 }
 
+/**
+ * 把 `user_id='owner'` 的活跃节点映射为共享（`user_id=''`）并拼接。
+ *
+ * 为什么：现网有 10 条 owner 规则的 `user_id` 存的是字面量 "owner"，不是 QQ 号；
+ * 直接按 QQ 号导出会静默漏掉它们。A 的身份过滤是 `(列='' OR 列=值)`，
+ * 所以把它们映射为共享才能在网页端召回，且不冒充任何用户。
+ */
+export function normalizeOwnerLines(text) {
+  const out = []
+  let mapped = 0
+  for (const line of String(text ?? '').split('\n')) {
+    if (!line.trim()) continue
+    let row
+    try { row = JSON.parse(line) } catch { continue }
+    if (row && row.user_id === 'owner') { row.user_id = ''; mapped += 1 }
+    out.push(JSON.stringify(row))
+  }
+  return { text: out.join('\n') + (out.length ? '\n' : ''), mapped, lines: out.length }
+}
+
 function printSummary(payload) {
   // 固定五个键，方便迁移手册 diff 与 CI 摘取；问题行细节走 stderr。
   console.log(
@@ -155,6 +181,7 @@ function printSummary(payload) {
       bytes: payload.bytes,
       valid: payload.valid,
       tooLong: payload.tooLong,
+      ownerMerged: payload.ownerMerged ?? 0,
     }),
   )
 }
@@ -195,9 +222,29 @@ async function main(argv) {
     console.error(`[migrate] 导出结束但没有产物文件：${opts.out}`)
     return 1
   }
+
+  // 合并 owner 共享节点：第二遍导出 --user=owner，映射 user_id='' 后追加。
+  let ownerMerged = 0
+  if (opts.includeOwner && opts.user !== 'owner') {
+    const ownerOut = `${opts.out}.owner`
+    try {
+      await runExport({ ...opts, user: 'owner', out: ownerOut })
+      if (existsSync(ownerOut)) {
+        const merged = normalizeOwnerLines(readFileSync(ownerOut, 'utf8'))
+        ownerMerged = merged.mapped
+        if (merged.lines) {
+          const mainText = readFileSync(opts.out, 'utf8')
+          writeFileSync(opts.out, mainText.replace(/\n?$/, '\n') + merged.text, 'utf8')
+        }
+      }
+    } catch (err) {
+      console.error(`[migrate] 告警：owner 共享节点合并失败（${err.message}）；主文件仍可用`)
+    }
+  }
+
   const bytes = statSync(opts.out).size
   const report = validateJsonl(readFileSync(opts.out, 'utf8'))
-  printSummary({ file: opts.out, lines: report.lines, bytes, valid: report.valid, tooLong: report.tooLong })
+  printSummary({ file: opts.out, lines: report.lines, bytes, valid: report.valid, tooLong: report.tooLong, ownerMerged })
 
   for (const e of report.errors) console.error(`[migrate] 问题行 ${e.line} ${e.reason} … ${e.sample}`)
   if (report.tooLong > 0) console.error(`[migrate] 告警：${report.tooLong} 行 text > ${TEXT_LIMIT} 字（不阻断；导入时 A 侧对 >500 单规则会拒绝并计 errors，不做静默截断）`)
