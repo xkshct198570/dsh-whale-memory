@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { pullFromGateway, pushToGateway } from '../src/core/sync.js'
+import { pullFromGateway, pushToGateway, normalizeOwnerJsonl } from '../src/core/sync.js'
 
 const identity = { userId: 'u1', roleId: '', workspace: 'web' }
 
@@ -37,4 +37,14 @@ test('transport 失败返回 ok:false 不抛', async () => {
   const out = await pullFromGateway({ backend: {}, transport: t, identity, dryRun: true })
   assert.equal(out.ok, false)
   assert.match(out.error, /ECONNREFUSED/)
+})
+
+
+test('pull 前把 user_id=owner 归一为共享', async () => {
+  assert.equal(normalizeOwnerJsonl('{"text":"a","user_id":"owner"}\n'), '{"text":"a","user_id":""}\n')
+  let got = ''
+  const backend = { async importJsonl(q) { got = q.jsonl; return { added: 1 } } }
+  const transport = { async pull() { return '{"text":"a","user_id":"owner"}\n' } }
+  await pullFromGateway({ backend, transport, identity, dryRun: true })
+  assert.equal(got.includes('"owner"'), false)
 })

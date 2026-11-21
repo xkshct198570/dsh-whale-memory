@@ -9,6 +9,20 @@
  */
 const DEFAULT_TIMEOUT = 30_000
 
+/** 网关 owner 规则 → 共享（''）；A 侧导入前归一，避免同一规则在两种 user_id 下重复。 */
+export function normalizeOwnerJsonl(text) {
+  const out = []
+  for (const line of String(text || '').split('\n')) {
+    if (!line.trim()) continue
+    try {
+      const row = JSON.parse(line)
+      if (row && row.user_id === 'owner') row.user_id = ''
+      out.push(JSON.stringify(row))
+    } catch { out.push(line) }
+  }
+  return out.join('\n') + (out.length ? '\n' : '')
+}
+
 export class HttpSyncTransport {
   /** @param {{ baseUrl:string, timeoutMs?:number, log?:Function }} opts */
   constructor({ baseUrl, timeoutMs = DEFAULT_TIMEOUT, log = () => {} }) {
@@ -40,7 +54,7 @@ export class HttpSyncTransport {
  */
 export async function pullFromGateway({ backend, transport, identity, dryRun = true, signal }) {
   try {
-    const jsonl = await transport.pull(signal)
+    const jsonl = normalizeOwnerJsonl(await transport.pull(signal))
     if (!jsonl || !jsonl.trim()) return { ok: true, direction: 'pull', lines: 0, added: 0, skipped: 0, errors: 0 }
     if (dryRun) {
       const stat = await backend.importJsonl({ jsonl, identity, dryRun: true })

@@ -58,4 +58,12 @@ for (const rel of scanRoots) {
   }
 }
 
+// 静态闸：agent/pre-step 是 waterfall，裸 listener（不接收 next）会让 decision.kind 崩。
+for (const file of walk(join(root, 'src'))) {
+  const text = readFileSync(file, 'utf8')
+  if (/ctx\.on\(\s*['"]agent\/pre-step['"]\s*,\s*\(\s*\)\s*=>/.test(text)) {
+    fail(`agent/pre-step waterfall 监听缺少 next() -> ${file.slice(root.length + 1)}`)
+  }
+}
+
 if (!process.exitCode) console.log(`[check] OK ${pkg.name}@${pkg.version}（manifest/exports/files/禁区 全通过）`)
