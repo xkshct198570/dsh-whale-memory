@@ -6,7 +6,7 @@
  *
  * 协议（父线程 → 本线程）：{ id, op, ... }
  *   op='probe'  { sleepMs }                       → { id, ok:true, op:'probe', sleptMs }
- *   op='search' { dbPath, query, limit, identity, minRel }
+ *   op='search' { dbPath, query, limit, identity, minRel, diffusion, minConf }
  *                                                 → { id, ok:true, op:'search', result }
  *   op='stats'  { dbPath }                        → { id, ok:true, op:'stats', result:{ nodes, active } }
  * 任何失败：{ id, ok:false, error:{ code, message } }；本线程绝不因单个请求退出。
@@ -139,6 +139,9 @@ async function opSearch(msg) {
       limit: clampLimit(msg?.limit),
       identity: msg?.identity,
       minRel: msg?.minRel,
+      // 与 client.search 成对：漏一个就会让 advanced.worker 下的扩散开关哑掉。
+      diffusion: msg?.diffusion,
+      minConf: msg?.minConf,
     }
     const result = await run(db, opts)
     return { op: 'search', result }

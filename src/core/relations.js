@@ -20,7 +20,13 @@ export const DIFFUSION_ETYPES = new Set(['topic', 'reference'])
 const EDGE_ETYPES = new Set(['similar', 'topic', 'supersede', 'mutex', 'reference'])
 const EDGE_SOURCES = new Set(['tag', 'reflect', 'manual', 'decision'])
 
-function clamp01(value, fallback = 0.5) {
+/**
+ * 把任意输入夹到 [0,1]；非有限值回退到 fallback（读路径绝不因脏 conf 抛错）。
+ * @param {unknown} value
+ * @param {number} [fallback]
+ * @returns {number}
+ */
+export function clamp01(value, fallback = 0.5) {
   const n = Number(value)
   return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : fallback
 }

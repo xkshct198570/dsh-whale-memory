@@ -37,14 +37,18 @@ function fresh({ config = {}, pressure, log, intervalMs = 600_000 } = {}) {
 }
 
 let seq = 0
-function node(db, { text, tags = [], status = 'active', expiredAt = null, updatedAt = now() }) {
+function node(db, {
+  text, tags = [], status = 'active', expiredAt = null, updatedAt = now(),
+  source = 'owner', userId = '', roleId = '', workspace = '',
+}) {
   seq += 1
   const id = `k${Date.now()}_${seq}`
   db.prepare(`INSERT INTO nodes
-    (id,text,text_hash,text_bigrams,level,memory_type,source,status,tags,context_note,weight,hits,
-     vector_state,origin,trace_id,expired_at,created_at,updated_at)
-    VALUES (?,?,?,?,'normal','semantic','owner',?,?, '',1,0,'none','test','',?,?,?)`).run(
-    id, text, contentHash(text), bigrams(text), status, JSON.stringify(tags), expiredAt, updatedAt, updatedAt,
+    (id,text,text_hash,text_bigrams,level,memory_type,source,status,role_id,user_id,workspace,tags,
+     context_note,weight,hits,vector_state,origin,trace_id,expired_at,created_at,updated_at)
+    VALUES (?,?,?,?,'normal','semantic',?,?,?,?,?,?, '',1,0,'none','test','',?,?,?)`).run(
+    id, text, contentHash(text), bigrams(text), source, status, roleId, userId, workspace,
+    JSON.stringify(tags), expiredAt, updatedAt, updatedAt,
   )
   return id
 }
@@ -309,6 +313,86 @@ test('consolidate 默认 handler：真建 tag 边 + TTL 把 expired 节点置 st
     assert.equal(f.db.prepare('SELECT status FROM nodes WHERE id=?').get(expired).status, 'stale')
     assert.equal(f.db.prepare('SELECT status FROM nodes WHERE id=?').get(alive).status, 'active')
     assert.equal(f.db.prepare('SELECT status FROM nodes WHERE id=?').get(a).status, 'active')
+  } finally { f.close() }
+})
+
+test('consolidate：同身份同 tag 小群体生成 topic 边（conf 0.6），跨 workspace 不连', async () => {
+  const f = fresh()
+  try {
+    const a = node(f.db, { text: '主题甲：端口规则', tags: ['端口'] })
+    const b = node(f.db, { text: '主题乙：端口变更', tags: ['端口'] })
+    const other = node(f.db, { text: 'QQ端主题：端口规则', tags: ['端口'], workspace: 'qq' })
+
+    const res = await f.keeper.runNow('consolidate', {})
+    assert.equal(res.state, 'done')
+    assert.ok(res.result.topic_edges >= 1, `topic_edges=${res.result.topic_edges}`)
+
+    const same = f.db.prepare(`SELECT conf FROM edges WHERE etype='topic'
+      AND ((from_id=? AND to_id=?) OR (from_id=? AND to_id=?))`).get(a, b, b, a)
+    assert.ok(same, '同身份同 tag 的节点之间必须有 topic 边')
+    assert.equal(Number(same.conf), 0.6)
+    assert.equal(f.db.prepare('SELECT source FROM edges WHERE etype=? AND ((from_id=? AND to_id=?) OR (from_id=? AND to_id=?))')
+      .get('topic', a, b, b, a).source, 'reflect')
+
+    // 跨隔离面：rebuild 的 similar 边可以存在，但 topic 边绝不能连过去（扩散会串记忆）。
+    const cross = f.db.prepare(`SELECT 1 FROM edges WHERE etype='topic'
+      AND ((from_id=? AND to_id=?) OR (from_id=? AND to_id=?))`).get(a, other, other, a)
+    assert.equal(cross, undefined)
+  } finally { f.close() }
+})
+
+test('consolidate：共享 ≥2 个 tag → topic conf 0.8', async () => {
+  const f = fresh()
+  try {
+    const a = node(f.db, { text: '双标签甲：端口 网关', tags: ['端口', '网关'] })
+    const b = node(f.db, { text: '双标签乙：端口 网关', tags: ['端口', '网关'] })
+    const res = await f.keeper.runNow('consolidate', {})
+    assert.equal(res.state, 'done')
+    const edge = f.db.prepare(`SELECT conf FROM edges WHERE etype='topic'
+      AND ((from_id=? AND to_id=?) OR (from_id=? AND to_id=?))`).get(a, b, b, a)
+    assert.ok(edge)
+    assert.equal(Number(edge.conf), 0.8)
+  } finally { f.close() }
+})
+
+test('consolidate：同身份 text_hash 重复收敛（保 owner，其余 archived + 审计）', async () => {
+  const f = fresh()
+  try {
+    const text = '同文重复：网关端口 3982'
+    const web = node(f.db, { text, source: 'web' })
+    const owner = node(f.db, { text, source: 'owner' })
+    const selfNode = node(f.db, { text, source: 'self' })
+
+    const res = await f.keeper.runNow('consolidate', {})
+    assert.equal(res.state, 'done')
+    assert.equal(res.result.merged, 2, '3 条同文收敛掉 2 条')
+
+    const active = f.db.prepare(`SELECT id, source FROM nodes WHERE status='active' AND text_hash=?
+      ORDER BY id`).all(contentHash(text))
+    assert.equal(active.length, 1)
+    assert.equal(active[0].id, owner, '必须保留来源等级最高的 owner')
+    assert.equal(active[0].source, 'owner')
+
+    const archived = f.db.prepare(`SELECT id FROM nodes WHERE status='archived' AND text_hash=? ORDER BY id`)
+      .all(contentHash(text))
+    assert.deepEqual(archived.map((r) => r.id).sort(), [web, selfNode].sort())
+
+    const audit = f.db.prepare("SELECT node_id FROM writes WHERE action='CONSOLIDATE' AND reason='dedupe_hash'").all()
+    assert.equal(audit.length, 2, '每条被归档节点都要留审计')
+    assert.deepEqual(audit.map((r) => r.node_id).sort(), [web, selfNode].sort())
+  } finally { f.close() }
+})
+
+test('consolidate：跨身份同文不收敛（分区隔离优先于去重）', async () => {
+  const f = fresh()
+  try {
+    const mine = node(f.db, { text: '同文但不同人：端口规则', userId: 'u1' })
+    const other = node(f.db, { text: '同文但不同人：端口规则', userId: 'u2' })
+    const res = await f.keeper.runNow('consolidate', {})
+    assert.equal(res.state, 'done')
+    assert.equal(res.result.merged, 0)
+    assert.equal(f.db.prepare('SELECT status FROM nodes WHERE id=?').get(mine).status, 'active')
+    assert.equal(f.db.prepare('SELECT status FROM nodes WHERE id=?').get(other).status, 'active')
   } finally { f.close() }
 })
 

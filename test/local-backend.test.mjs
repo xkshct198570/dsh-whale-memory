@@ -4,6 +4,7 @@ import { mkdtempSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { LocalBackend } from '../src/core/backend.js'
+import { Config } from '../src/host/config.js'
 
 const ident = { userId: 'u1', roleId: '', workspace: 'web' }
 
@@ -107,4 +108,41 @@ test('写库：超长/空文本拒绝' , async () => {
     assert.equal((await b.write({ text: '', identity: ident })).ok, false)
     assert.equal((await b.write({ text: 'x'.repeat(501), identity: ident })).ok, false)
   } finally { b.dispose() }
+})
+
+// ---------------------------------------------------------------------------
+// 审计缺陷回归（P0）：真实 Config（schemastery Ref）喂 backend，开关必须生效
+// ---------------------------------------------------------------------------
+
+test('真实 Config：write.enabled=false 拦写入；reviewMode=auto 落库；maxChars 生效', async () => {
+  const off = fresh({ config: new Config({ write: { enabled: false } }) })
+  try {
+    const r = await off.write({ text: '关写开关下不该落库', identity: ident })
+    assert.equal(r.ok, false)
+    assert.equal(r.error, 'write_disabled')
+    assert.equal((await off.stats()).totals.nodes_total, 0)
+    // 关写时连 jobs 队列都不应入队（没有可处理的写事件）
+    assert.equal(off.withDb((db) => Number(db.prepare("SELECT count(*) AS n FROM jobs WHERE kind='write'").get().n)), 0)
+  } finally { off.dispose() }
+
+  const live = fresh({ config: new Config({ write: { reviewMode: 'auto', maxChars: 20 } }) })
+  try {
+    const ok = await live.write({ text: 'a'.repeat(20), identity: ident })
+    assert.equal(ok.ok, true)
+    assert.equal(ok.action, 'ADD', 'auto 模式必须真落库（Ref 未解包会退化成 CANDIDATE）')
+    assert.equal(ok.candidate, false)
+    const long = await live.write({ text: 'b'.repeat(21), identity: ident })
+    assert.equal(long.ok, false)
+    assert.equal(long.error, 'text_too_long')
+    assert.equal((await live.stats()).totals.nodes_total, 1)
+  } finally { live.dispose() }
+
+  const shadow = fresh({ config: new Config({}) })
+  try {
+    const cand = await shadow.write({ text: '默认配置下的影子候选', identity: ident })
+    assert.equal(cand.ok, true)
+    assert.equal(cand.action, 'CANDIDATE')
+    assert.equal(cand.candidate, true)
+    assert.equal((await shadow.stats()).totals.nodes_total, 0)
+  } finally { shadow.dispose() }
 })

@@ -1,8 +1,12 @@
 /**
- * schema v1（数据层唯一真源）：DDL 全量、幂等。
+ * schema v2（数据层唯一真源）：DDL 全量、幂等。
  *
  * 设计约束（与架构书 §4.1/§4.2 一致）：
  * - 加法演进：v1 之后只允许 ALTER TABLE ADD COLUMN / 新建表，禁改既有列语义。
+ * - v2 只做一件事：writes 增加 payload TEXT，保存影子候选的决策载荷（等级/类型/tags/来源/双时态/
+ *   shadowOf/targetId）。为什么必须落库：影子模式下 nodes 一行不写，审核 accept 时若只能拿到
+ *   after_text，就只能硬编码 normal/semantic/self，等于把"当时为什么这样判"丢掉了。
+ * - 旧库（v1）由 ensureSchema 幂等迁移：PRAGMA table_info(writes) 无 payload 才 ALTER；高版本仍拒绝。
  * - 双时态：valid_at/invalid_at（事实时间）+ created_at/expired_at（系统时间）。
  * - 软删：只改 status（archived/superseded/stale），除配置到期归档外不物理删。
  * - 隔离：user_id/role_id/workspace，'' 表示共享。
@@ -15,7 +19,12 @@
  * 任何写路径都不得绕过触发器直接改 FTS。
  */
 
-export const SCHEMA_VERSION = 1
+export const SCHEMA_VERSION = 2
+
+/** v2 对既有表的加法列：[表, 列, 类型]。迁移与 DDL 必须保持一致。 */
+const ADDITIVE_COLUMNS = [
+  ['writes', 'payload', 'TEXT'],
+]
 
 export const DDL = `
 PRAGMA journal_mode = WAL;
@@ -124,12 +133,13 @@ CREATE TABLE IF NOT EXISTS writes (
   id        INTEGER PRIMARY KEY AUTOINCREMENT,
   ts        REAL NOT NULL,
   trace_id  TEXT NOT NULL DEFAULT '',
-  action    TEXT NOT NULL,                           -- ADD/NOOP/MERGE/SUPERSEDE/REJECT
+  action    TEXT NOT NULL,                           -- ADD/NOOP/MERGE/SUPERSEDE/REVIEW/REJECT/CANDIDATE/SPLIT
   node_id   TEXT,
   reason    TEXT NOT NULL DEFAULT '',
   before_text TEXT,
   after_text  TEXT,
   mode      TEXT NOT NULL DEFAULT 'shadow',           -- shadow/auto
+  payload   TEXT,                                     -- v2：候选决策载荷 JSON
   user_id   TEXT NOT NULL DEFAULT '',
   role_id   TEXT NOT NULL DEFAULT '',
   workspace TEXT NOT NULL DEFAULT ''
@@ -192,6 +202,21 @@ CREATE TABLE IF NOT EXISTS metrics (
 const UPSERT_META = 'INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
 
 /**
+ * 幂等迁移 v1 → v2：只做 ALTER TABLE ADD COLUMN。
+ *
+ * 为什么用 PRAGMA table_info 而不是只看版本号：列在不在是唯一可靠事实
+ * （旧库可能手工补过列、也可能版本号被改过）；按列判断可重复执行、不会二次 ALTER 报错。
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ */
+function migrateAdditiveColumns(db) {
+  for (const [table, column, type] of ADDITIVE_COLUMNS) {
+    const columns = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => String(c.name)))
+    if (!columns.has(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`)
+  }
+}
+
+/**
  * 执行完整 DDL 并写入 meta.schema_version。
  * 幂等：重复调用不报错；若库内版本高于本代码版本 → schema_incompatible（只增不减）。
  * @param {import('node:sqlite').DatabaseSync} db
@@ -206,6 +231,7 @@ export function ensureSchema(db) {
   if (Number.isFinite(current) && current > SCHEMA_VERSION) {
     throw new Error(`schema_incompatible: db version ${current} > code version ${SCHEMA_VERSION}`)
   }
+  migrateAdditiveColumns(db)
   db.prepare(UPSERT_META).run('schema_version', String(SCHEMA_VERSION))
   return { version: SCHEMA_VERSION }
 }

@@ -57,3 +57,20 @@ test('hook：subagent 不召回', async () => {
   }, async () => ({ kind: 'enter' }))
   assert.equal(called, 0)
 })
+
+test('hook：recall 传入非空 traceId 且含 session id', async () => {
+  const { ctx, state } = fakeCtx()
+  const seen = []
+  installHook(ctx, {
+    backend: { async recall(args) { seen.push(args); return { prefix: 'P', hits: 1 } } },
+    config,
+  })
+  await state.pre({
+    agent: { session: { id: 'session-42' } },
+    messages: [{ source: { kind: 'user' }, content: [{ type: 'text', text: '问' }] }],
+  }, async () => ({ kind: 'enter' }))
+  assert.equal(seen.length, 1)
+  assert.equal(typeof seen[0].traceId, 'string')
+  assert.ok(seen[0].traceId.length > 0)
+  assert.ok(seen[0].traceId.includes('session-42'), 'traceId 必须带 session id 前缀')
+})

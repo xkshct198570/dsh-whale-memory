@@ -3,14 +3,48 @@
  *
  * 入口是 DSH 公共事件 `tools/result`（exec.name + result.value），不是任何私有搜索实现。
  * 开关：Config.write.searchFeed；TTL：searchTtlHours（过期只 stale，不物理删）。
+ * 去重：origin = tool:web_search#sha256(查询+本地日期)[0..16]，同 key 重复事件交给 backend 按 origin 复用。
  * 失败/超时/内存告急一律跳过，不阻断工具结果。
  */
+import { createHash } from 'node:crypto'
 import { bool, num } from './config-values.js'
 import { resolveIdentity } from './identity.js'
 import { memoryPressure } from './memory-guard.js'
 
-const SEARCH_TOOL_RE = /(^|_)(web_search|websearch|free_search|search_web)$/i
+// 工具名白名单覆盖 DSH 常见检索工具；只认"词边界在开头/下划线"且整体收尾的写法。
+const SEARCH_TOOL_RE = /(^|_)(web_search|websearch|free_search|search_web|advanced_search|multi_search|platform_search|domain_search|video_search|research)$/i
 const MAX_CHARS = 200
+/** 摘要单条上限（answer 一条、每个 source 一条）：超长摘要只截本条，不挤掉其它条。 */
+const PART_MAX = 80
+
+/**
+ * 单条摘要截断：硬顶 80 字（含省略号），避免一条长 answer 吃掉全部预算。
+ * @param {unknown} value
+ * @param {number} [max]
+ * @returns {string}
+ */
+function clipPart(value, max = PART_MAX) {
+  const s = String(value ?? '').trim()
+  return s.length <= max ? s : `${s.slice(0, max - 1)}…`
+}
+
+/** 本地日期 YYYY-MM-DD（去重 key 只按"同一天"收敛，跨天允许重新落库）。 */
+function localDay(ts = Date.now()) {
+  const d = new Date(ts)
+  const p = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
+
+/**
+ * 查询去重键：sha256(归一化查询 + 本地日期) 前 16 位。
+ * @param {string} query
+ * @param {number} [ts]
+ * @returns {string}
+ */
+function originKeyOf(query, ts = Date.now()) {
+  const normalized = String(query || '').trim().toLowerCase().replace(/\s+/g, ' ')
+  return createHash('sha256').update(`${normalized}|${localDay(ts)}`, 'utf8').digest('hex').slice(0, 16)
+}
 
 function queryOf(exec) {
   const args = exec?.arguments
@@ -19,17 +53,22 @@ function queryOf(exec) {
   return typeof q === 'string' ? q.trim().slice(0, 120) : ''
 }
 
+/**
+ * 摘要拼装：answer 一条 + 最多两条 source（title：snippet）；每条都按 PART_MAX 截断。
+ * @param {{ answer?: unknown, sources?: unknown, items?: unknown } | null | undefined} value
+ * @returns {string}
+ */
 function summaryOf(value) {
   if (!value || typeof value !== 'object') return ''
   const parts = []
   const answer = typeof value.answer === 'string' ? value.answer.trim() : ''
-  if (answer) parts.push(answer)
+  if (answer) parts.push(clipPart(answer))
   const sources = Array.isArray(value.sources) ? value.sources : Array.isArray(value.items) ? value.items : []
   for (const s of sources.slice(0, 2)) {
     if (!s || typeof s !== 'object') continue
     const t = String(s.title || '').trim()
     const sn = String(s.snippet || s.summary || '').trim()
-    if (t || sn) parts.push(`${t}${t && sn ? '：' : ''}${sn}`)
+    if (t || sn) parts.push(clipPart(`${t}${t && sn ? '：' : ''}${sn}`))
   }
   return parts.join('；')
 }
@@ -53,9 +92,13 @@ export function installSearchFeed(ctx, { backend, config, log = () => {} }) {
       const ttl = num(config?.write?.searchTtlHours, 24)
       const ident = resolveIdentity(config?.identity)
       if (!ident.ok) return
+      // 同查询 + 本地日期 → 同一个带 #key 的 origin（跨进程稳定）。
+      // 去重依赖后端契约（backend/writer 侧，不在本文件）：同身份已有相同 origin 的 active 节点时
+      // 走 MERGE 更新摘要，而不是新增一条记忆。本文件只保证 key 稳定、重复事件撞同一个 origin。
+      const origin = `tool:web_search#${originKeyOf(query)}`
       backend.write({
         text, level: 'normal', memory_type: 'episodic', source: 'web',
-        tags: ['web_search', query], origin: 'tool:web_search',
+        tags: ['web_search', query], origin,
         expired_at: Date.now() / 1000 + ttl * 3600,
         traceId: String(exec?.callId || ''), identity: ident.identity,
       }).then((r) => {

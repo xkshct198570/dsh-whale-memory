@@ -17,7 +17,7 @@
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { memoryPressure } from '../host/memory-guard.js'
-import { rebuildTagEdges } from './relations.js'
+import { parseTags, rebuildTagEdges, upsertEdge } from './relations.js'
 
 /** 允许的作业类型（enqueue/register 校验用；与 schema jobs.kind 语义一致）。 */
 export const JOB_KINDS = ['consolidate', 'reflect', 'write', 'vector', 'archive', 'report']
@@ -37,6 +37,11 @@ const MAX_ATTEMPTS = 3
 const VECTOR_BATCH = 32
 /** claim 时一次最多看多少候选（同 kind 被占用时继续找别的）。 */
 const CANDIDATE_LIMIT = 20
+
+/** text_hash 重复收敛每批最多归档条数（审计行同批上限，写连接保持短事务）。 */
+const DEDUPE_BATCH = 200
+/** 来源等级：owner > self > group > web/tool > import（writer SOURCE_MAP 的语义优先级）。 */
+const SOURCE_RANK = { owner: 5, self: 4, group: 3, web: 2, tool: 2, import: 1 }
 
 const toSeconds = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0)
 const clampText = (value, max = 500) => String(value ?? '').slice(0, max)
@@ -338,18 +343,157 @@ export function createKeeper({
   return keeper
 }
 
+/**
+ * 同身份 text_hash 重复 active 节点收敛（架构书 §8.2）。
+ *
+ * 为什么必须收敛：去重只在写入决策时拦"新事件"，重复历史（导入/多来源同步）仍会堆出
+ * 同身份同文多行，检索会把同一事实算多次、面板也难以人工清理。
+ * 保留来源等级最高者（owner>self>group>web/tool>import），其余置 archived 并逐条留审计。
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {{ batch?: number, maxNodes?: number, nowSec?: number }} [opts]
+ * @returns {{ merged: number }} merged = 本批归档条数（≤ batch）
+ */
+export function convergeDuplicateHashes(db, { batch = DEDUPE_BATCH, maxNodes = 5000, nowSec = Date.now() / 1000 } = {}) {
+  const limit = Math.max(1, Math.floor(Number(batch) || DEDUPE_BATCH))
+  const rows = db.prepare(`SELECT id, text_hash, source, created_at, user_id, role_id, workspace
+    FROM nodes WHERE status='active' ORDER BY created_at, id LIMIT ?`).all(Math.max(1, Number(maxNodes) || 5000))
+  const groups = new Map()
+  for (const row of rows) {
+    const hash = String(row.text_hash || '')
+    if (!hash) continue
+    // 身份分区必须完全相同（共享 '' 也是同一分区）；跨人/跨端同文不是重复。
+    const key = [row.user_id ?? '', row.role_id ?? '', row.workspace ?? '', hash].join('\u0000')
+    let list = groups.get(key)
+    if (!list) { list = []; groups.set(key, list) }
+    list.push(row)
+  }
+
+  const doomed = []
+  for (const list of groups.values()) {
+    if (list.length < 2) continue
+    list.sort((a, b) =>
+      (SOURCE_RANK[String(b.source)] ?? 0) - (SOURCE_RANK[String(a.source)] ?? 0) ||
+      Number(a.created_at || 0) - Number(b.created_at || 0) ||
+      (String(a.id) < String(b.id) ? -1 : 1))
+    for (const row of list.slice(1)) {
+      doomed.push(row)
+      if (doomed.length >= limit) break
+    }
+    if (doomed.length >= limit) break
+  }
+  if (doomed.length === 0) return { merged: 0 }
+
+  const ts = Number(nowSec) || Date.now() / 1000
+  db.exec('BEGIN IMMEDIATE')
+  let merged = 0
+  try {
+    const archive = db.prepare("UPDATE nodes SET status='archived', updated_at=? WHERE id=? AND status='active'")
+    const audit = db.prepare(`INSERT INTO writes (ts,trace_id,action,node_id,reason,mode,user_id,role_id,workspace)
+      VALUES (?,?,'CONSOLIDATE',?,'dedupe_hash','auto',?,?,?)`)
+    for (const row of doomed) {
+      const info = archive.run(ts, String(row.id))
+      if (Number(info?.changes || 0) === 0) continue
+      audit.run(ts, '', String(row.id), String(row.user_id ?? ''), String(row.role_id ?? ''), String(row.workspace ?? ''))
+      merged += 1
+    }
+    db.exec('COMMIT')
+  } catch (err) {
+    try { db.exec('ROLLBACK') } catch { /* noop */ }
+    throw err
+  }
+  return { merged }
+}
+
+/**
+ * 主题边生成（架构书 §7.1 的扩散链路入口）：同身份、同 tag 小群体内连 `topic` 边。
+ *
+ * 为什么放在巩固 job：边是整批重建的派生数据，写入路径只负责事实，不在每次写时现连。
+ * 主题边只连同身份分区（user_id/role_id/workspace 完全相同，共享 '' 同一分区），
+ * 跨人/跨端不连——否则扩散会把别人的记忆带进本会话。
+ * 置信口径：两节点共享 tag 数 ≥2 → 0.8，否则 0.6（同 tag 一对即 0.6）。
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {{ dfMax?: number, maxNodes?: number, maxPairs?: number }} [opts]
+ * @returns {{ edges: number, tags: number }} edges=新建/升级的 pair 数，tags=参与的分区-tag 组数
+ */
+export function buildTopicEdges(db, { dfMax = 12, maxNodes = 5000, maxPairs = 5000 } = {}) {
+  const rows = db.prepare('SELECT id, tags, user_id, role_id, workspace FROM nodes WHERE status=? ORDER BY id LIMIT ?')
+    .all('active', Math.max(1, Number(maxNodes) || 5000))
+  /** @type {Map<string, { ids: string[], tagSets: Map<string, Set<string>> }>} */
+  const groups = new Map()
+  for (const row of rows) {
+    const partition = [row.user_id ?? '', row.role_id ?? '', row.workspace ?? ''].join('\u0000')
+    const tagSet = new Set(parseTags(row.tags).map((t) => t.toLowerCase()))
+    if (tagSet.size === 0) continue
+    const id = String(row.id)
+    for (const tag of tagSet) {
+      const key = `${partition}\u0000${tag}`
+      let group = groups.get(key)
+      if (!group) { group = { ids: [], tagSets: new Map() }; groups.set(key, group) }
+      group.ids.push(id)
+      group.tagSets.set(id, tagSet)
+    }
+  }
+
+  const max = Math.max(1, Math.floor(Number(maxPairs) || 5000))
+  const seenPairs = new Set()
+  let pairs = 0
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    for (const group of groups.values()) {
+      const ids = group.ids
+      if (ids.length < 2 || ids.length > Math.max(2, Number(dfMax) || 12)) continue
+      for (let i = 0; i < ids.length && pairs < max; i += 1) {
+        for (let j = i + 1; j < ids.length && pairs < max; j += 1) {
+          const a = ids[i] < ids[j] ? ids[i] : ids[j]
+          const b = ids[i] < ids[j] ? ids[j] : ids[i]
+          const pairKey = `${a}\u0000${b}`
+          if (seenPairs.has(pairKey)) continue
+          const tagA = group.tagSets.get(a)
+          const tagB = group.tagSets.get(b)
+          if (!tagA || !tagB) continue
+          let shared = 0
+          for (const tag of tagA) if (tagB.has(tag)) shared += 1
+          if (shared === 0) continue
+          seenPairs.add(pairKey)
+          upsertEdge(db, {
+            fromId: a, toId: b, etype: 'topic', source: 'reflect',
+            conf: shared >= 2 ? 0.8 : 0.6, weight: 0.6,
+          })
+          pairs += 1
+        }
+      }
+      if (pairs >= max) break
+    }
+    db.exec('COMMIT')
+  } catch (err) {
+    try { db.exec('ROLLBACK') } catch { /* noop */ }
+    throw err
+  }
+  return { edges: pairs, tags: groups.size }
+}
+
 /** 默认 handlers 安装（createKeeper 内调用；单独拆函数便于阅读）。 */
 function installDefaultHandlers(keeper, deps) {
   const { store, config = {}, log = () => {}, nowSec } = deps
 
   keeper.register('consolidate', async () => {
     return store.withDb((db) => {
+      // 顺序：先收敛同文重复（否则重复节点会参与建边），再重建 tag 相似边与主题边，最后跑 TTL。
+      // 主题边只由巩固 job 批量生成：写入路径不现连边，扩散才有一条稳定、可解释的链路。
+      const dedupe = convergeDuplicateHashes(db, { nowSec: nowSec() })
       const edges = rebuildTagEdges(db, {})
+      const topics = buildTopicEdges(db, {})
       const ts = nowSec()
       // TTL：过期的 active 节点降级 stale（不物理删，召回自然失效）。
       const info = db.prepare(`UPDATE nodes SET status='stale', updated_at=?
         WHERE status='active' AND expired_at IS NOT NULL AND expired_at < ?`).run(ts, ts)
-      return { edges: Number(edges?.edges || 0), tags: Number(edges?.tags || 0), stale: Number(info?.changes || 0) }
+      return {
+        edges: Number(edges?.edges || 0), tags: Number(edges?.tags || 0),
+        topic_edges: Number(topics?.edges || 0), merged: Number(dedupe?.merged || 0),
+        stale: Number(info?.changes || 0),
+      }
     })
   })
 

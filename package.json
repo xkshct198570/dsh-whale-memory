@@ -1,6 +1,6 @@
 {
   "name": "dsh-whale-memory",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "本地长期记忆中枢：记忆节点、召回注入、写入审计；默认本地 SQLite，可选外部记忆服务。",
   "type": "module",
   "license": "MIT",
@@ -39,7 +39,9 @@
   ],
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "check": "node scripts/check.mjs"
+    "check": "node scripts/check.mjs",
+    "i18n": "node scripts/i18n-check.mjs",
+    "eval": "node scripts/eval.mjs"
   },
   "dsh": {
     "manifestVersion": 1,

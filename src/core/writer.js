@@ -4,7 +4,8 @@
  * 为什么这样设计：
  * - 决策与落库分离：decideWrite 只读库、只产出 decision；processEvent 才动 nodes/edges/writes。
  *   一条规则能单独验，面板也能预演（拿到 decision 先给用户看，再决定是否落库）。
- * - 决策顺序即优先级：文本合法性 → 隐私 → 配额 → 去重 → 合并 → 冲突 → 影子 → 新增。
+ * - 决策顺序即优先级：文本合法性 → 隐私 → 配额 → 同 origin 复写 → 同文去重（含来源升级）→
+ *   相似合并 → 冲突 → 影子 → 新增。
  *   顺序不能换：先查冲突再脱敏，脱敏后的文本与库内文本就不可比；先去重再配额，重复消息会白吃额度。
  * - 冲突判定不调模型：否定词对 + 槽位（端口/路径/版本/日期）差异足够稳定，可离线复现、零成本。
  * - 事实时间与系统时间分开：invalid_at 用"新事实生效时间"，expired_at 用系统删除时间，回溯可解释。
@@ -12,6 +13,16 @@
  * - 影子模式把"会落库"的动作统一降级为 CANDIDATE：审核前 nodes 一行不写，只留 writes 审计；
  *   NOOP/REJECT 不是落库动作，照旧记审计。
  * - 本模块不做邻居注记（applyNeighborNotes 由集成层调用）：写入只负责自己的一致性，扩散注记属于关系层调度。
+ * - 配置可能来自 schemastery（`.volatile()` 字段是 Ref）：core 不得 import host，因此本文件自带
+ *   `plain()` 解包。不解包时 `Ref === 'auto'` 恒 false、`Number(Ref)` 恒 NaN，
+ *   auto 会静默退化成 shadow、maxChars/dailyCap 恒回默认值。
+ * - 去重要比较来源可信度（架构书 §6.3：owner > self > group > web/tool > import）：
+ *   同文但新来源更可信时升 source（MERGE/source_upgrade），否则才 NOOP；
+ *   否则 owner 事实会被低可信版本吞掉，并失去保护面。
+ * - MERGE 也必须尊重保护面（owner/core/procedural）：命中受保护目标改走 REVIEW（protected_merge），
+ *   新节点 + mutex，旧正文一行不动。
+ * - 影子候选的决策载荷落 writes.payload：审核 accept 按 shadowOf 还原字段并执行同构动作，
+ *   不能再用硬编码 normal/semantic/self（那样 SUPERSEDE/MERGE 候选会被静默当 ADD）。
  */
 import { now } from './db.js'
 import { bigrams, contentHash, normalize, similarity } from './tokenize.js'
@@ -31,6 +42,12 @@ const MERGE_GROWTH = 8
 const CONFLICT_SIM = 0.3
 /** 会真正落 nodes 的动作；影子模式下它们统一降级为 CANDIDATE。 */
 const LANDING = new Set(['ADD', 'MERGE', 'SUPERSEDE', 'REVIEW'])
+
+/** 来源可信度等级（架构书 §6.3）：owner > self > group > web/tool > import；未知来源最低。 */
+const SOURCE_RANK = { owner: 5, self: 4, group: 3, web: 2, tool: 2, import: 1 }
+
+/** 单条写入文本硬顶（与 nodes.text CHECK 同值）。 */
+const TEXT_LIMIT = 500
 
 const LEVELS = new Set(['core', 'important', 'normal'])
 const MEMORY_TYPES = new Set(['semantic', 'procedural', 'episodic', 'mixed'])
@@ -90,6 +107,29 @@ const NUMBER_RE = /\b\d{2,5}\b/g
 /** 空值（null/undefined/空串）不能走 Number()：Number(null)===0 会把"没有时间"当成"时间 0"。 */
 function isBlank(value) {
   return value === null || value === undefined || value === ''
+}
+
+/**
+ * 解包 schemastery 的 Ref（`.volatile()` 字段）：`get()` 才是值。
+ *
+ * 为什么在 core 里重复一份：分层约束禁止 core import host，而配置对象由 host 注入；
+ * Ref 直接参与比较会恒假/NaN（`Ref === 'auto'` 为 false、`Number(Ref)` 为 NaN），
+ * 结果就是开关"看起来配了但永远不生效"。
+ *
+ * @param {unknown} value 可能是 Ref 的配置值
+ * @returns {unknown} 解包后的原始值
+ */
+function plain(value) {
+  return value && typeof value.get === 'function' ? value.get() : value
+}
+
+/**
+ * 来源可信度（用于同文去重时的 source 升级判定）。
+ * @param {unknown} source nodes.source 值
+ * @returns {number} 等级（越大越可信）；未知来源 0
+ */
+function sourceRank(source) {
+  return SOURCE_RANK[String(source ?? '')] ?? 0
 }
 
 /** @param {unknown} value @param {number} fallback @returns {number} */
@@ -315,15 +355,18 @@ export function timeOverlap(oldRow, newValidAt) {
   return 'overlap'
 }
 
+/** 搜索反哺 origin 键的形状：`tool:<工具名>#<16 位 hex>`（search-feed 的固定格式）。 */
+const ORIGIN_KEY_RE = /^tool:[^#\s]+#[0-9a-f]{16}$/
+
 /** 决策参数归一：mode 缺省 shadow（保守），maxChars 不许突破 schema 的 500 硬顶。 */
 function resolveOptions(opts) {
-  const o = opts || {}
+  const o = plain(opts) || {}
   return {
-    mode: o.mode === 'auto' ? 'auto' : 'shadow',
-    maxChars: Math.max(1, Math.min(500, finite(o.maxChars, 500))),
-    dailyCap: Math.max(0, Math.floor(finite(o.dailyCap, 200))),
-    protect: o.protect !== false,
-    redact: o.redact !== false,
+    mode: plain(o.mode) === 'auto' ? 'auto' : 'shadow',
+    maxChars: Math.max(1, Math.min(TEXT_LIMIT, finite(plain(o.maxChars), TEXT_LIMIT))),
+    dailyCap: Math.max(0, Math.floor(finite(plain(o.dailyCap), 200))),
+    protect: plain(o.protect) !== false,
+    redact: plain(o.redact) !== false,
   }
 }
 
@@ -344,6 +387,21 @@ function settle(decision, opts, { text = '', redacted = false } = {}) {
     }
   }
   return base
+}
+
+/**
+ * 受保护目标（架构书 §6.2 保护面）：owner 来源 / core 等级 / procedural 类型。
+ * MERGE 与 SUPERSEDE 共用同一口径，protect=false 时整体关闭。
+ *
+ * @param {{ source?: unknown, level?: unknown, memory_type?: unknown } | null | undefined} row
+ * @param {{ protect?: boolean }} options
+ * @returns {boolean}
+ */
+function isProtectedTarget(row, options) {
+  if (!options?.protect) return false
+  return String(row?.source ?? '') === 'owner'
+    || String(row?.level ?? '') === 'core'
+    || String(row?.memory_type ?? '') === 'procedural'
 }
 
 /**
@@ -373,19 +431,65 @@ export function decideWrite(db, event, opts = {}) {
   if (!text) return { action: 'REJECT', reason: 'invalid_text', mode: options.mode }
   const redacted = privacy.reason === 'privacy_redacted'
 
-  // 3. 当日配额（NOOP/REJECT 不占额度：它们没有产生新事实）
+  // 3. 当日配额（NOOP/REJECT 不占额度：它们没有产生新事实；SPLIT 是导入迁移记账，不算当日新增）
   const since = startOfDay(now())
   const used = Number(db.prepare(
-    "SELECT count(*) AS n FROM writes WHERE ts>=? AND user_id=? AND role_id=? AND workspace=? AND action NOT IN ('NOOP','REJECT')",
+    "SELECT count(*) AS n FROM writes WHERE ts>=? AND user_id=? AND role_id=? AND workspace=? AND action NOT IN ('NOOP','REJECT','SPLIT')",
   ).get(since, ident.userId, ident.roleId, ident.workspace)?.n || 0)
   if (used >= options.dailyCap) return { action: 'REJECT', reason: 'daily_cap', mode: options.mode }
 
-  // 4. 同身份原文命中 → NOOP（记一次命中，不新增事实）
+  // 4. 同 origin 复写（搜索反哺：同查询同日同一个 origin 只更新既有节点，不新增、不被 NOOP 吞掉）
+  //    搜索摘要每次返回内容可能不同，但语义上是"同一查询的当天结果"；按 origin 定向 MERGE，
+  //    同时续 TTL（event.expired_at 提供时）。顺序必须在同 hash NOOP 之前。
+  //    只认 search-feed 的固定键形状：origin 在其它写入路径是粗粒度"证据出处"（panel/unit/...），
+  //    拿它当唯一键会把同来源的不同事实误合并。
+  const originKey = ORIGIN_KEY_RE.test(String(event?.origin ?? '')) ? String(event.origin) : ''
+  if (originKey) {
+    const sameOrigin = db.prepare(
+      "SELECT id,text,level,memory_type,source FROM nodes WHERE origin=? AND status='active' AND user_id=? AND role_id=? AND workspace=? ORDER BY created_at DESC LIMIT 1",
+    ).get(originKey, ident.userId, ident.roleId, ident.workspace)
+    if (sameOrigin) {
+      const targetId = String(sameOrigin.id)
+      const beforeText = String(sameOrigin.text ?? '')
+      // 保护面优先：受保护节点的正文不允许被来源复写改写（与相似 MERGE 同口径）。
+      if (isProtectedTarget(sameOrigin, options)) {
+        return settle({
+          action: 'REVIEW',
+          reason: 'protected_merge',
+          targetId,
+          beforeText,
+          afterText: text,
+        }, options, { text, redacted })
+      }
+      return settle({
+        action: 'MERGE',
+        reason: 'origin_merge',
+        targetId,
+        beforeText,
+        afterText: text,
+      }, options, { text, redacted })
+    }
+  }
+
+  // 5. 同身份原文命中：来源更可信 → 升级 source；否则 NOOP（记一次命中，不新增事实）
   const hash = contentHash(text)
   const dup = db.prepare(
-    "SELECT id,text FROM nodes WHERE text_hash=? AND user_id=? AND role_id=? AND workspace=? AND status='active' LIMIT 1",
+    "SELECT id,text,source FROM nodes WHERE text_hash=? AND user_id=? AND role_id=? AND workspace=? AND status='active' LIMIT 1",
   ).get(hash, ident.userId, ident.roleId, ident.workspace)
   if (dup) {
+    const incoming = mapSource(event?.source)
+    if (sourceRank(incoming) > sourceRank(dup.source)) {
+      // 内容相同、来源更可信：只改 source 与 updated_at（正文/双时态不动），审计记 MERGE/source_upgrade。
+      return settle({
+        action: 'MERGE',
+        reason: 'source_upgrade',
+        targetId: String(dup.id),
+        beforeText: String(dup.text ?? ''),
+        afterText: text,
+        sourceUpgrade: true,
+        source: incoming,
+      }, options, { text, redacted })
+    }
     return {
       action: 'NOOP',
       reason: 'duplicate',
@@ -402,7 +506,7 @@ export function decideWrite(db, event, opts = {}) {
      ORDER BY created_at DESC LIMIT ?`,
   ).all(ident.userId, ident.roleId, ident.workspace, CANDIDATE_LIMIT)
 
-  // 5. 相似合并：只有"信息只增不减"才合并，否则交给冲突/新增
+  // 6. 相似合并：只有"信息只增不减"才合并，否则交给冲突/新增
   let mergeRow = null
   let mergeScore = 0
   for (const row of candidates) {
@@ -415,16 +519,29 @@ export function decideWrite(db, event, opts = {}) {
     if (sim > mergeScore) { mergeRow = row; mergeScore = sim }
   }
   if (mergeRow) {
+    const targetId = String(mergeRow.id)
+    const beforeText = String(mergeRow.text ?? '')
+    // 保护面同样适用于合并：owner/core/procedural 的正文不得被自动改写，
+    // 改走 REVIEW（新节点 + mutex），旧节点正文保持一行不动。
+    if (isProtectedTarget(mergeRow, options)) {
+      return settle({
+        action: 'REVIEW',
+        reason: 'protected_merge',
+        targetId,
+        beforeText,
+        afterText: text,
+      }, options, { text, redacted })
+    }
     return settle({
       action: 'MERGE',
       reason: 'merge_similar',
-      targetId: String(mergeRow.id),
-      beforeText: String(mergeRow.text ?? ''),
+      targetId,
+      beforeText,
       afterText: text,
     }, options, { text, redacted })
   }
 
-  // 6. 冲突：同身份 active 候选里找"否定/槽位"冲突且时间重叠的最近一条
+  // 7. 冲突：同身份 active 候选里找"否定/槽位"冲突且时间重叠的最近一条
   const validAt = now()
   let conflictRow = null
   let conflictScore = 0
@@ -443,8 +560,7 @@ export function decideWrite(db, event, opts = {}) {
     if (PLAN_WORDS.test(text)) {
       return settle({ action: 'ADD', reason: 'plan_deferred', targetId, beforeText, afterText: text }, options, { text, redacted })
     }
-    const protectedTarget = options.protect
-      && (String(conflictRow.source) === 'owner' || String(conflictRow.level) === 'core' || String(conflictRow.memory_type) === 'procedural')
+    const protectedTarget = isProtectedTarget(conflictRow, options)
     if (protectedTarget) {
       return settle({ action: 'REVIEW', reason: 'protected', targetId, beforeText, afterText: text }, options, { text, redacted })
     }
@@ -464,17 +580,32 @@ export function decideWrite(db, event, opts = {}) {
 /**
  * 写审计行（writes）。每个决策结果都要留痕，面板/复盘靠它。
  *
+ * payload（v2）保存影子候选的决策载荷：审核 accept 时据此还原字段并按 shadowOf 执行，
+ * 避免"候选是 SUPERSEDE/MERGE，接受后却按 ADD 落库"的载荷丢失。
+ *
  * @param {import('node:sqlite').DatabaseSync} db
- * @param {{ traceId?: string, identity?: object, mode?: string }} event 原始事件
+ * @param {{ traceId?: string, identity?: object, mode?: string, level?: string, memory_type?: string,
+ *   tags?: string[], source?: string, origin?: string, expired_at?: number }} event 原始事件
  * @param {{ action: string, reason?: string, nodeId?: string|null, beforeText?: string|null,
- *   afterText?: string|null, mode?: string }} decision
+ *   afterText?: string|null, mode?: string, level?: string, memory_type?: string, tags?: string[],
+ *   source?: string, shadowOf?: string, targetId?: string|null }} decision
  * @returns {number} 新 writes 行 id
  */
 export function recordWrite(db, event, decision) {
   const ident = normalizeIdentity(event?.identity)
+  const payload = {
+    level: validLevel(decision?.level ?? event?.level),
+    memory_type: validMemoryType(decision?.memory_type ?? event?.memory_type),
+    tags: normalizeTags(decision?.tags ?? event?.tags),
+    source: mapSource(decision?.source ?? event?.source),
+    origin: String(event?.origin ?? ''),
+    expired_at: validExpiredAt(event?.expired_at),
+    shadowOf: decision?.shadowOf ? String(decision.shadowOf) : null,
+    targetId: decision?.targetId ? String(decision.targetId) : null,
+  }
   const info = db.prepare(`INSERT INTO writes
-    (ts,trace_id,action,node_id,reason,before_text,after_text,mode,user_id,role_id,workspace)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(
+    (ts,trace_id,action,node_id,reason,before_text,after_text,mode,payload,user_id,role_id,workspace)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(
     now(),
     String(event?.traceId ?? ''),
     String(decision?.action ?? ''),
@@ -483,6 +614,7 @@ export function recordWrite(db, event, decision) {
     decision?.beforeText === undefined || decision?.beforeText === null ? null : String(decision.beforeText),
     decision?.afterText === undefined || decision?.afterText === null ? null : String(decision.afterText),
     String(decision?.mode ?? event?.mode ?? 'shadow'),
+    JSON.stringify(payload),
     ident.userId,
     ident.roleId,
     ident.workspace,
@@ -540,7 +672,14 @@ function validExpiredAt(value) {
 function insertNodeRow(db, event, text, { ts, validAt, source, origin, level, memoryType, expiredAt }) {
   const ident = normalizeIdentity(event?.identity)
   const hash = contentHash(text)
-  const id = `n${Date.now()}_${hash.slice(0, 10)}`
+  // id 由"毫秒时间 + hash 前 10 位"组成；同文本写进不同身份/分区可能落在同一毫秒，
+  // 此时仅靠 hash 会撞主键。保持 id 形状不变（既有契约/面板正则），冲突时把毫秒数 +1 找空位。
+  let at = Date.now()
+  let id = `n${at}_${hash.slice(0, 10)}`
+  while (db.prepare('SELECT 1 FROM nodes WHERE id=?').get(id)) {
+    at += 1
+    id = `n${at}_${hash.slice(0, 10)}`
+  }
   db.prepare(`INSERT INTO nodes
     (id,text,text_hash,text_bigrams,level,memory_type,source,status,role_id,user_id,workspace,tags,
      context_note,weight,hits,vector_state,origin,trace_id,valid_at,expired_at,created_at,updated_at)
@@ -554,16 +693,27 @@ function insertNodeRow(db, event, text, { ts, validAt, source, origin, level, me
   return id
 }
 
-/** 配置 → 决策参数（兼容完整 config、write 段、以及扁平的 mode 别名）。 */
+/**
+ * 配置 → 决策参数（兼容完整 config、write 段、以及扁平的 mode 别名）。
+ *
+ * 注意：真实 Config 的 write 段字段都是 schemastery Ref，必须先 plain() 再比较；
+ * 否则 `w.reviewMode === 'auto'` 恒 false（auto 静默退化成 shadow）、`finite(Ref)` 恒 NaN
+ * （maxChars/dailyCap 恒回默认值）。
+ *
+ * @param {object|((() => object))|null|undefined} config
+ * @returns {{ mode: 'shadow'|'auto', maxChars: number, dailyCap: number, protect: boolean, redact: boolean }}
+ */
 function resolveConfig(config) {
-  const c = config && typeof config === 'object' ? config : {}
-  const w = c.write && typeof c.write === 'object' ? c.write : c
+  const c = plain(config)
+  const root = c && typeof c === 'object' ? c : {}
+  const section = plain(root.write)
+  const w = section && typeof section === 'object' ? section : root
   return {
-    mode: (w.reviewMode ?? w.mode) === 'auto' ? 'auto' : 'shadow',
-    maxChars: finite(w.maxChars, 500),
-    dailyCap: finite(w.dailyCap, 200),
-    protect: w.protect !== false,
-    redact: w.redact !== false,
+    mode: plain(w.reviewMode ?? w.mode) === 'auto' ? 'auto' : 'shadow',
+    maxChars: finite(plain(w.maxChars), TEXT_LIMIT),
+    dailyCap: finite(plain(w.dailyCap), 200),
+    protect: plain(w.protect) !== false,
+    redact: plain(w.redact) !== false,
   }
 }
 
@@ -572,7 +722,8 @@ function resolveConfig(config) {
  *
  * 落库动作（架构书 §6.2/§7.3）：
  * - ADD：插新节点（active），valid_at=本次时间。
- * - MERGE：改目标节点的 text/text_hash/text_bigrams/updated_at，不新增节点。
+ * - MERGE：改目标节点的 text/text_hash/text_bigrams/updated_at，不新增节点；同 origin 复写或
+ *   相似合并时若事件带 expired_at 则同时续期。来源升级（source_upgrade）只改 source/updated_at。
  * - SUPERSEDE：插新节点；旧节点 status='superseded'、invalid_at/expired_at=本次时间、superseded_by=新 id；
  *   并写 supersede 边。
  * - REVIEW：插新节点 + mutex 边（同词不同义，永不扩散）。
@@ -607,10 +758,25 @@ export function processEvent(db, event, config = {}) {
     nodeId = targetId
   } else if (action === 'MERGE') {
     if (!targetId) throw new Error('merge_target_missing')
-    withTx(db, () => {
-      db.prepare('UPDATE nodes SET text=?, text_hash=?, text_bigrams=?, updated_at=? WHERE id=?')
-        .run(text, contentHash(text), bigrams(text), ts, targetId)
-    })
+    if (decision.sourceUpgrade) {
+      // 同文来源升级：只改 source/updated_at，正文与双时态保持不变。
+      const upgraded = mapSource(decision.source ?? event?.source)
+      withTx(db, () => {
+        db.prepare('UPDATE nodes SET source=?, updated_at=? WHERE id=?').run(upgraded, ts, targetId)
+      })
+    } else {
+      // 同 origin/相似 MERGE：更新正文；事件带 TTL 时同时续期（搜索反哺每天刷新同一查询的摘要）。
+      const expiredAt = validExpiredAt(event?.expired_at)
+      withTx(db, () => {
+        if (expiredAt !== null) {
+          db.prepare('UPDATE nodes SET text=?, text_hash=?, text_bigrams=?, expired_at=?, updated_at=? WHERE id=?')
+            .run(text, contentHash(text), bigrams(text), expiredAt, ts, targetId)
+        } else {
+          db.prepare('UPDATE nodes SET text=?, text_hash=?, text_bigrams=?, updated_at=? WHERE id=?')
+            .run(text, contentHash(text), bigrams(text), ts, targetId)
+        }
+      })
+    }
     nodeId = targetId
   } else if (action === 'ADD') {
     nodeId = withTx(db, () => insertNodeRow(db, event, text, {
@@ -652,6 +818,79 @@ export function processEvent(db, event, config = {}) {
 
   recordWrite(db, event, { ...decision, nodeId })
   return { ok: true, id: nodeId ?? undefined, action, reason: String(decision.reason ?? '') }
+}
+
+/**
+ * 影子候选落库（review accept 的唯一执行器）：按 payload.shadowOf 执行与 auto 模式同构的动作。
+ *
+ * 为什么必须还原载荷：只拿 after_text 硬编码落 ADD 会把 SUPERSEDE/MERGE 候选变成新事实，
+ * 既丢双时态（expired_at）也丢关系边（supersede/mutex）。载荷缺失的旧候选回落 ADD。
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {object} row writes 行（含 after_text/trace_id/user_id/role_id/workspace）
+ * @param {string} text normalize 后的正文
+ * @param {object} payload recordWrite 存入的决策载荷
+ * @param {string} shadowOf ADD/MERGE/SUPERSEDE/REVIEW
+ * @param {number} writeId writes 行 id
+ * @returns {{ ok: boolean, id?: string, error?: string }}
+ */
+function acceptCandidate(db, row, text, payload, shadowOf, writeId) {
+  const ts = now()
+  const ident = {
+    userId: String(row.user_id ?? ''),
+    roleId: String(row.role_id ?? ''),
+    workspace: String(row.workspace ?? ''),
+  }
+  const targetId = payload?.targetId ? String(payload.targetId) : ''
+  const event = { identity: ident, traceId: String(row.trace_id ?? ''), tags: normalizeTags(payload?.tags) }
+  const insert = () => insertNodeRow(db, event, text, {
+    ts,
+    validAt: ts,
+    source: mapSource(payload?.source),
+    origin: 'shadow-review',
+    level: validLevel(payload?.level),
+    memoryType: validMemoryType(payload?.memory_type),
+    expiredAt: validExpiredAt(payload?.expired_at),
+  })
+
+  if (shadowOf === 'MERGE') {
+    const target = targetId ? db.prepare('SELECT id,source,level,memory_type FROM nodes WHERE id=?').get(targetId) : null
+    if (!target) return { ok: false, error: 'target_not_found' }
+    // 决策时目标不受保护、审核时已被标记保护：accept 必须拒绝，不能绕过保护面。
+    if (isProtectedTarget(target, { protect: true })) return { ok: false, error: 'protected_target' }
+    const incoming = mapSource(payload?.source)
+    const source = sourceRank(incoming) > sourceRank(target.source) ? incoming : target.source
+    const expiredAt = validExpiredAt(payload?.expired_at)
+    if (expiredAt !== null) {
+      db.prepare('UPDATE nodes SET text=?, text_hash=?, text_bigrams=?, source=?, expired_at=?, updated_at=? WHERE id=?')
+        .run(text, contentHash(text), bigrams(text), source, expiredAt, ts, targetId)
+    } else {
+      db.prepare('UPDATE nodes SET text=?, text_hash=?, text_bigrams=?, source=?, updated_at=? WHERE id=?')
+        .run(text, contentHash(text), bigrams(text), source, ts, targetId)
+    }
+    db.prepare("UPDATE writes SET action='MERGE', node_id=? WHERE id=?").run(targetId, writeId)
+    return { ok: true, id: targetId }
+  }
+
+  if (shadowOf === 'SUPERSEDE') {
+    const target = targetId ? db.prepare('SELECT id FROM nodes WHERE id=?').get(targetId) : null
+    if (!target) return { ok: false, error: 'target_not_found' }
+    const newId = insert()
+    db.prepare(`UPDATE nodes SET status='superseded', invalid_at=?, expired_at=?, superseded_by=?, updated_at=?
+      WHERE id=?`).run(ts, ts, newId, ts, targetId)
+    linkSupersede(db, targetId, newId)
+    db.prepare("UPDATE writes SET action='SUPERSEDE', node_id=? WHERE id=?").run(newId, writeId)
+    return { ok: true, id: newId }
+  }
+
+  // ADD / REVIEW（旧候选 payload 缺失也走这里：等价 ADD）
+  const newId = insert()
+  if (shadowOf === 'REVIEW' && targetId && db.prepare('SELECT 1 FROM nodes WHERE id=?').get(targetId)) {
+    linkMutex(db, targetId, newId)
+  }
+  const landed = shadowOf === 'REVIEW' ? 'REVIEW' : 'ADD'
+  db.prepare('UPDATE writes SET action=?, node_id=? WHERE id=?').run(landed, newId, writeId)
+  return { ok: true, id: newId }
 }
 
 /**
@@ -775,8 +1014,15 @@ export function createWriteQueue({ store, config, log = () => {} } = {}) {
 
   /**
    * 审核候选（writes 行 action='CANDIDATE'）。
-   * accept：用 after_text + 身份列落节点（source='self'、origin='shadow-review'），审计行改 ADD。
+   * accept：读 writes.payload 还原等级/类型/tags/source/expired_at，并按 shadowOf 执行动作
+   *   （ADD/REVIEW 插新节点，MERGE 改目标正文，SUPERSEDE 插新节点并让旧节点失效）；
+   *   origin 固定 'shadow-review'（审核来源可追溯，原事件 origin 仍在 payload 里）。
    * reject：审计行改 REJECT，reason 追加 review:reject[:理由]。
+   *
+   * @param {number|string} id writes 行 id
+   * @param {'accept'|'reject'} decision
+   * @param {string} [reason] 驳回理由（≤200 由路由截断）
+   * @returns {{ ok: boolean, id?: string, error?: string }}
    */
   function review(id, decision, reason) {
     const action = String(decision ?? '')
@@ -786,33 +1032,23 @@ export function createWriteQueue({ store, config, log = () => {} } = {}) {
     try {
       return onDb((db) => {
         const row = db.prepare(
-          "SELECT id,trace_id,action,reason,after_text,mode,user_id,role_id,workspace FROM writes WHERE id=? AND action='CANDIDATE'",
+          "SELECT id,trace_id,action,reason,after_text,mode,payload,user_id,role_id,workspace FROM writes WHERE id=? AND action='CANDIDATE'",
         ).get(writeId)
         if (!row) return { ok: false, error: 'candidate_not_found' }
 
-        if (action === 'accept') {
-          const text = normalize(String(row.after_text ?? ''))
-          if (!text || text.length > 500) return { ok: false, error: 'invalid_text' }
-          const ts = now()
-          const hash = contentHash(text)
-          const nodeId = `n${Date.now()}_${hash.slice(0, 10)}`
-          db.prepare(`INSERT INTO nodes
-            (id,text,text_hash,text_bigrams,level,memory_type,source,status,role_id,user_id,workspace,tags,
-             context_note,weight,hits,vector_state,origin,trace_id,valid_at,expired_at,created_at,updated_at)
-            VALUES (?,?,?,?,'normal','semantic','self','active',?,?,?,'[]','',1,0,'none','shadow-review',?,?,?,?,?)`).run(
-            nodeId, text, hash, bigrams(text),
-            String(row.role_id ?? ''), String(row.user_id ?? ''), String(row.workspace ?? ''),
-            String(row.trace_id ?? ''), ts, null, ts, ts,
-          )
-          db.prepare("UPDATE writes SET action='ADD', node_id=? WHERE id=?").run(nodeId, writeId)
-          return { ok: true, id: nodeId }
+        if (action === 'reject') {
+          const extra = `review:reject${reason ? ':' + String(reason) : ''}`
+          const previous = String(row.reason ?? '').trim()
+          db.prepare("UPDATE writes SET action='REJECT', reason=? WHERE id=?")
+            .run(previous ? `${previous} · ${extra}` : extra, writeId)
+          return { ok: true }
         }
 
-        const extra = `review:reject${reason ? ':' + String(reason) : ''}`
-        const previous = String(row.reason ?? '').trim()
-        db.prepare("UPDATE writes SET action='REJECT', reason=? WHERE id=?")
-          .run(previous ? `${previous} · ${extra}` : extra, writeId)
-        return { ok: true }
+        let payload = {}
+        try { payload = JSON.parse(String(row.payload ?? '{}')) || {} } catch { payload = {} }
+        const text = normalize(String(row.after_text ?? ''))
+        if (!text || text.length > TEXT_LIMIT) return { ok: false, error: 'invalid_text' }
+        return withTx(db, () => acceptCandidate(db, row, text, payload, String(payload.shadowOf || 'ADD'), writeId))
       })
     } catch (err) {
       return { ok: false, error: String(err?.message || err) }

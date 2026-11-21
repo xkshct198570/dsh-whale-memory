@@ -56,11 +56,13 @@ export class DbWorkerClient {
 
   /**
    * 检索。limit 由 worker 侧夹到 1..50（S2：每路 LIMIT 50）。
-   * @param {{ dbPath:string, query:string, limit?:number, identity?:unknown, minRel?:number }} q
+   * diffusion/minConf 必须原样透传：生产开关 advanced.worker=true 时，丢字段＝开关假生效。
+   * @param {{ dbPath:string, query:string, limit?:number, identity?:unknown, minRel?:number,
+   *   diffusion?:boolean, minConf?:number }} q
    * @returns {Promise<unknown>} search.js 的返回值
    */
-  async search({ dbPath, query = '', limit = 50, identity, minRel } = {}) {
-    const msg = await this._send('search', { dbPath, query, limit, identity, minRel })
+  async search({ dbPath, query = '', limit = 50, identity, minRel, diffusion, minConf } = {}) {
+    const msg = await this._send('search', { dbPath, query, limit, identity, minRel, diffusion, minConf })
     return msg?.result
   }
 

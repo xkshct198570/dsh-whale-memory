@@ -15,5 +15,7 @@ jobs:
           node-version: ${{ matrix.node }}
       - name: Static gates
         run: node scripts/check.mjs
+      - name: i18n keys
+        run: node scripts/i18n-check.mjs
       - name: Unit tests
         run: node --test test/*.test.mjs

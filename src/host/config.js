@@ -10,25 +10,29 @@ export const Config = z.object({
   dataDir: z.string().default(''),
 
   backend: z.object({
+    id: z.string().default(''),
     mode: z.union(['local', 'http', 'hybrid']).default('local'),
     url: z.string().default(''),
     timeoutMs: z.natural().min(200).max(30000).default(3000),
   }).default({}),
 
   identity: z.object({
-    mode: z.union(['auto', 'fixed']).default('auto'),
-    userId: z.string().default(''),
-    roleId: z.string().default(''),
-    workspace: z.string().default(''),
+    mode: z.union(['auto', 'fixed']).default('auto').volatile(),
+    userId: z.string().max(128).default('').volatile(),
+    roleId: z.string().max(64).default('').volatile(),
+    workspace: z.string().max(64).default('').volatile(),
   }).default({}),
 
   recall: z.object({
     enabled: z.boolean().default(true).volatile(),
     maxHits: z.natural().min(0).max(20).default(5).volatile(),
+    // 0 = 关闭注入（代码语义）；架构书 §4 S11 写"0 = 不限制"，以代码为准。
     charBudget: z.natural().min(0).max(8000).default(1500).volatile(),
     intentBudget: z.boolean().default(true).volatile(),
     minRel: z.number().min(0).max(1).default(0.34).volatile(),
     timeoutMs: z.natural().min(100).max(10000).default(2000),
+    injectLevels: z.array(z.union(['core', 'important', 'normal'])).default(['core', 'important']).volatile(),
+    showSources: z.boolean().default(true).volatile(),
   }).default({}),
 
   write: z.object({
@@ -39,13 +43,15 @@ export const Config = z.object({
     judge: z.union(['rules', 'llm']).default('rules').volatile(),
     searchFeed: z.boolean().default(false).volatile(),
     searchTtlHours: z.natural().min(1).max(720).default(24).volatile(),
+    model: z.string().default(''),
+    ignorePatterns: z.array(z.string()).default([]),
   }).default({}),
 
   reflect: z.object({
     enabled: z.boolean().default(false),
     model: z.string().default(''),
     idleMinutes: z.natural().min(5).max(1440).default(30),
-    maxItems: z.natural().min(1).max(32).default(8),
+    maxItems: z.natural().min(1).max(32).default(8).volatile(),
     maxRunsPerDay: z.natural().min(1).max(96).default(24),
   }).default({}),
 
@@ -73,6 +79,10 @@ export const Config = z.object({
 
   sync: z.object({
     enabled: z.boolean().default(false).volatile(),
+    mode: z.union(['off', 'push', 'pull', 'both']).default('off').volatile(),
+    intervalMin: z.natural().min(1).max(10080).default(15),
+    httpTimeoutMs: z.natural().min(200).max(30000).default(800).volatile(),
+    batch: z.natural().min(1).max(500).default(100).volatile(),
     bridgeUrl: z.string().default(''), // 空=未配置；由 profile 注入本机桥地址（A 包不得出现本机桥字面量）
     dryRun: z.boolean().default(true).volatile(),
   }).default({}),
@@ -84,7 +94,7 @@ export const Config = z.object({
   }).default({}),
 
   advanced: z.object({
-    traceId: z.string().default('').volatile(),
+    traceId: z.string().max(64).default('').volatile(),
     logLevel: z.union(['error', 'warn', 'info', 'debug']).default('warn').volatile(),
     worker: z.boolean().default(true).volatile(),
   }).default({}),

@@ -70,6 +70,8 @@ test('盲区②：搜索反哺落库→可召回→到期被巩固降 stale', as
     assert.equal(node.memory_type, 'episodic')
     assert.equal(node.source, 'web')
     assert.deepEqual(JSON.parse(node.tags).slice(0, 1), ['web_search'])
+    // 同查询+本地日期的稳定去重键（backend/writer 依 origin 复用；本断言锁 key 形态）。
+    assert.match(String(node.origin), /^tool:web_search#[0-9a-f]{16}$/)
     const ttlLeft = Number(node.expired_at) - Date.now() / 1000
     assert.ok(ttlLeft > 23 * 3600 && ttlLeft <= 24 * 3600 + 60, `TTL 应约 24h，实际 ${ttlLeft}s`)
 

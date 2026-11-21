@@ -19,7 +19,7 @@
 import { buildPlan } from './queryplan.js'
 import { normalize } from './tokenize.js'
 import { now } from './db.js'
-import { HOP_FACTOR, expandOneHop } from './relations.js'
+import { HOP_FACTOR, clamp01, expandOneHop } from './relations.js'
 
 const FTS_LIMIT = 50
 const MAX_CANDIDATES = 150
@@ -83,7 +83,7 @@ function identityFilter(identity) {
  * @param {{ sql: string, params: string[] }} filter
  * @param {Map<string, any>} candidates
  */
-function collectFts(db, table, match, filter, candidates) {
+function collectFts(db, table, match, filter, candidates, path = 'L1') {
   if (!match || candidates.size >= MAX_CANDIDATES) return
   const sql =
     `SELECT n.id, n.text, n.level, n.memory_type, n.source, n.created_at, n.last_hit_at, n.context_note ` +
@@ -98,7 +98,7 @@ function collectFts(db, table, match, filter, candidates) {
   }
   for (const row of rows) {
     if (candidates.size >= MAX_CANDIDATES) return
-    if (!candidates.has(row.id)) candidates.set(row.id, row)
+    if (!candidates.has(row.id)) candidates.set(row.id, { ...row, _path: path })
   }
 }
 
@@ -160,13 +160,13 @@ export function search(db, opts = {}) {
   // L1：≥3 字的整词/标识符/IP 短语 OR（trigram）。
   const l1Terms = dedupe([...plan.cjkTerms, ...plan.asciiTerms, ...plan.idents, ...plan.ips])
     .filter((t) => t.length >= 3)
-  collectFts(db, 'nodes_fts', orMatch(l1Terms), filter, candidates)
+  collectFts(db, 'nodes_fts', orMatch(l1Terms), filter, candidates, 'L1')
 
   // L2：L1 候选不足时才兜底（中文 bigram + ASCII trigram）；候选已够不浪费查询。
   if (candidates.size < limit || candidates.size === 0) {
-    collectFts(db, 'nodes_fts_bi', orMatch(plan.cjkGrams), filter, candidates)
+    collectFts(db, 'nodes_fts_bi', orMatch(plan.cjkGrams), filter, candidates, 'L2')
     const l2Ascii = dedupe([...plan.asciiTerms, ...plan.idents]).filter((t) => t.length >= 3)
-    collectFts(db, 'nodes_fts', orMatch(l2Ascii), filter, candidates)
+    collectFts(db, 'nodes_fts', orMatch(l2Ascii), filter, candidates, 'L2')
   }
 
   const nowSec = now()
@@ -177,7 +177,12 @@ export function search(db, opts = {}) {
   for (const row of candidates.values()) {
     const haystack = normalize(row.text)
     let sum = 0
-    for (const term of terms) if (haystack.includes(term.text)) sum += term.weight
+    const matched = []
+    for (const term of terms) {
+      if (!haystack.includes(term.text)) continue
+      sum += term.weight
+      if (matched.length < 8) matched.push(term.text)
+    }
     const rel = denominator > 0 ? Math.min(1, sum / denominator) : 0
     if (rel < minRel) {
       below += 1
@@ -204,14 +209,15 @@ export function search(db, opts = {}) {
       source: row.source,
       score,
       rel,
-      components: { rel, mult, gain, effWeight, vec: 0 },
+      components: { rel, mult, gain, effWeight, vec: 0, path: String(row._path || 'L1'), matched },
       // 排序辅助，不返回
       _lastHitAt: Number(row.last_hit_at ?? 0),
     })
   }
 
-  // 1 跳扩散（架构书 §7.1）：只从 top-3 种子沿 topic/reference 边扩，每跳跃 ×0.6；
-  // mutex/supersede 不参与（passDiffusion 已在 expandOneHop 的 SQL 里按 etype 过滤）。
+  // 1 跳扩散（架构书 §7.1）：只从 top-3 种子沿 topic/reference 边扩，
+  // 每跳 ×0.6 且再乘边置信 conf（minConf 由 expandOneHop 的 SQL 过滤）；
+  // mutex/supersede 不参与（expandOneHop 的 SQL 已按 etype 过滤）。
   const seen = new Set(hits.map((h) => h.id))
   const relBySeed = new Map(hits.slice(0, 3).map((h) => [h.id, h.rel]))
   if (opts.diffusion !== false && hits.length > 0) {
@@ -223,8 +229,14 @@ export function search(db, opts = {}) {
     })) {
       if (seen.has(row.id)) continue
       seen.add(row.id)
-      const seedRel = relBySeed.get(String(row.from_id)) ?? relBySeed.get(String(row.to_id)) ?? 0
-      const rel = Math.min(1, seedRel * HOP_FACTOR)
+      // 边的方向不固定：via 是种子那一端，另一头才是扩散命中。
+      const fromId = String(row.from_id)
+      const toId = String(row.to_id)
+      const viaSeed = relBySeed.has(fromId) ? fromId : toId
+      const seedRel = relBySeed.get(viaSeed) ?? 0
+      // 扩散分 = 种子分 × 每跳衰减 × 边置信：低置信边不该和 1.0 边一样响。
+      const viaConf = clamp01(row.via_conf)
+      const rel = Math.min(1, seedRel * HOP_FACTOR * viaConf)
       if (rel < minRel) { below += 1; continue }
       const level = levelRank(row.level)
       const source = SOURCE[row.source] ?? 0.5
@@ -242,7 +254,10 @@ export function search(db, opts = {}) {
         source: row.source,
         score: rel * mult * gain,
         rel,
-        components: { rel, mult, gain, effWeight, vec: 0, path: 'diffusion', hops: 1, via: String(row.from_id) },
+        components: {
+          rel, mult, gain, effWeight, vec: 0,
+          path: 'diffusion', hops: 1, via: viaSeed, conf: viaConf,
+        },
         _lastHitAt: Number(row.last_hit_at ?? 0),
       })
     }

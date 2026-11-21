@@ -82,6 +82,8 @@ export function installHook(ctx, { backend, config, getIdentityCfg = () => confi
       const timer = setTimeout(() => ac.abort(), timeoutMs)
       try {
         const started = Date.now()
+        // trace_id 贯穿 hook -> backend：sessionId 前缀保证能追到具体会话。
+        const traceId = `${sessionId}:${Date.now()}`
         const result = await backend.recall({
           query,
           maxHits: num(config?.recall?.maxHits, 5),
@@ -91,6 +93,7 @@ export function installHook(ctx, { backend, config, getIdentityCfg = () => confi
           diffusion: bool(config?.edges?.diffusion, true),
           minConf: num(config?.edges?.minConf, 0.6),
           identity: ident.identity,
+          traceId,
         }, ac.signal)
         if (result && typeof result.prefix === 'string' && result.prefix) {
           cache.set(String(sessionId), { text: result.prefix, exp: Date.now() + CACHE_TTL_MS })

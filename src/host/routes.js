@@ -9,10 +9,111 @@
 import { Buffer } from 'node:buffer'
 import { clamp, isLoopback, readJson, sendJson } from './http-kit.js'
 import { resolveIdentity } from './identity.js'
-import { bool, num, value } from './config-values.js'
+import { bool, value } from './config-values.js'
+import { Config } from './config.js'
 import { HttpSyncTransport, pullFromGateway, pushToGateway } from '../core/sync.js'
 
 const PREFIX = '/whale-memory/api'
+
+/**
+ * 面板可读写的配置组：GET 回显与 POST 保存共用同一份清单，
+ * 避免"回显 23 字段、保存手抄 6 组"导致组内叶子被整组覆盖回落默认。
+ */
+export const CONFIG_GROUPS = [
+  'backend', 'identity', 'recall', 'write', 'reflect', 'consolidate',
+  'embed', 'privacy', 'edges', 'sync', 'panel', 'advanced',
+]
+export const CONFIG_KEYS = ['dataDir', ...CONFIG_GROUPS]
+
+/** schemastery 默认值（空配置即开箱值），作为回显/深合并的基线。 */
+const CONFIG_DEFAULTS = Config({})
+
+/** schemastery 的 `.volatile()` 字段是 Ref；回显一律先解 Ref。 */
+export function resolveTree(input) {
+  if (input && typeof input === 'object' && typeof input.get === 'function' && !Array.isArray(input)) {
+    return resolveTree(input.get())
+  }
+  if (Array.isArray(input)) return input.map((item) => resolveTree(item))
+  if (input && typeof input === 'object') {
+    const out = {}
+    for (const [key, val] of Object.entries(input)) out[key] = resolveTree(val)
+    return out
+  }
+  return input
+}
+
+/**
+ * 按叶子字段深合并：对象递归合并，数组/标量直接替换。
+ * 只有提交的叶子会被覆盖；未提交的叶子（含组内默认值）保持原样。
+ */
+export function deepMergeLeaf(current, patch) {
+  const out = current && typeof current === 'object' && !Array.isArray(current) ? { ...current } : {}
+  if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return out
+  for (const [key, val] of Object.entries(patch)) {
+    if (val === undefined) continue
+    if (val && typeof val === 'object' && !Array.isArray(val)) {
+      const base = out[key] && typeof out[key] === 'object' && !Array.isArray(out[key]) ? out[key] : {}
+      out[key] = deepMergeLeaf(base, val)
+    } else {
+      out[key] = Array.isArray(val) ? val.slice() : val
+    }
+  }
+  return out
+}
+
+/** 全部组回显：默认值打底 + 运行时实值覆盖（值一律解 Ref）。 */
+export function echoConfig(config) {
+  return deepMergeLeaf(resolveTree(CONFIG_DEFAULTS), resolveTree(config || {}))
+}
+
+/** 统一 trace_id：`x-trace-id` 头（≤64）优先，否则 `panel:<ms>`。 */
+export function traceIdOf(req) {
+  const raw = req?.headers?.['x-trace-id']
+  const text = Array.isArray(raw) ? raw[0] : raw
+  const trimmed = typeof text === 'string' ? text.trim() : ''
+  return (trimmed || `panel:${Date.now()}`).slice(0, 64)
+}
+
+/** 只看 GET 回显集合内的顶层键（白名单与 echoConfig 同源）。 */
+function pickConfigKeys(next) {
+  const patch = {}
+  for (const key of CONFIG_KEYS) {
+    if (!(key in next)) continue
+    const val = next[key]
+    if (key === 'dataDir') {
+      if (typeof val === 'string') patch.dataDir = val
+    } else if (val && typeof val === 'object' && !Array.isArray(val)) {
+      patch[key] = val
+    }
+  }
+  return patch
+}
+
+/** 保存后回读：编辑器支持 configuration() 时以加载器层为准。 */
+function readBackConfig(editor, entry, fallback) {
+  try {
+    if (typeof editor.configuration !== 'function') return fallback
+    const rows = editor.configuration()
+    const row = Array.isArray(rows) ? rows.find((item) => item && item.entry === entry) : null
+    const override = row?.override
+    if (override && typeof override === 'object' && !Array.isArray(override)) {
+      return deepMergeLeaf(fallback || {}, resolveTree(override))
+    }
+  } catch { /* 回读失败不阻塞保存：以 editor.edit 回调结果为准 */ }
+  return fallback
+}
+
+/** 把保存结果按叶子合并进运行时 config（同一 deepMergeLeaf，不整组替换）。 */
+function syncRuntimeConfig(config, saved) {
+  if (!config || typeof config !== 'object' || !saved || typeof saved !== 'object') return
+  for (const key of CONFIG_GROUPS) {
+    if (!(key in saved)) continue
+    const current = resolveTree(config[key] ?? {})
+    config[key] = deepMergeLeaf(current && typeof current === 'object' && !Array.isArray(current) ? current : {}, saved[key])
+  }
+  if (typeof saved.dataDir === 'string') config.dataDir = saved.dataDir
+}
+
 
 /** 写入文本上限（与 Config.write.maxChars 默认值一致，路由侧再做硬顶）。 */
 const MAX_WRITE_CHARS = 500
@@ -42,11 +143,14 @@ function sendMethodNotAllowed(res, allow) {
 
 /** @param {{ config: any, backend: any, log?: (s:string)=>void }} deps */
 export function createRoutes({ config, backend, getIdentityCfg = () => config?.identity, ctx, reflect, log = () => {} }) {
-  const allowRemote = bool(config?.panel?.allowRemote, false)
-
   return async function handle(req, res) {
+    // 每次请求读实时配置：面板改了 allowRemote 必须立刻生效，不能闭包快照。
     const addr = req.socket?.remoteAddress
-    if (!allowRemote && !isLoopback(addr)) return sendJson(res, 403, { ok: false, error: 'not_loopback' })
+    if (!bool(config?.panel?.allowRemote, false) && !isLoopback(addr)) {
+      return sendJson(res, 403, { ok: false, error: 'not_loopback' })
+    }
+
+    const traceId = traceIdOf(req)
 
     let path = ''
     try { path = new URL(req.url || '/', 'http://127.0.0.1').pathname } catch { path = '' }
@@ -77,7 +181,7 @@ export function createRoutes({ config, backend, getIdentityCfg = () => config?.i
       if (!query) return sendJson(res, 400, { ok: false, error: 'invalid_query' })
       const limit = clamp(body.value?.limit, 1, 20, 5)
       const started = Date.now()
-      const data = await backend.search({ query, limit, identity })
+      const data = await backend.search({ query, limit, identity, traceId })
       if (!data) return sendJson(res, 502, { ok: false, error: 'backend_unreachable' })
       return sendJson(res, 200, {
         ok: true,
@@ -85,6 +189,7 @@ export function createRoutes({ config, backend, getIdentityCfg = () => config?.i
         hits: Array.isArray(data.hits) ? data.hits : [],
         below_min_n: Number(data.below_min_n ?? 0),
         elapsed_ms: Date.now() - started,
+        trace_id: traceId,
       })
     }
 
@@ -96,7 +201,7 @@ export function createRoutes({ config, backend, getIdentityCfg = () => config?.i
       if (!query) return sendJson(res, 400, { ok: false, error: 'invalid_query' })
       const maxHits = clamp(body.value?.maxHits, 1, 10, 5)
       const started = Date.now()
-      const data = await backend.search({ query, limit: maxHits, identity })
+      const data = await backend.search({ query, limit: maxHits, identity, traceId })
       if (!data) return sendJson(res, 502, { ok: false, error: 'backend_unreachable' })
       return sendJson(res, 200, {
         ok: true,
@@ -104,6 +209,7 @@ export function createRoutes({ config, backend, getIdentityCfg = () => config?.i
         count: Number(data.count ?? (Array.isArray(data.hits) ? data.hits.length : 0)),
         hits: Array.isArray(data.hits) ? data.hits : [],
         elapsed_ms: Date.now() - started,
+        trace_id: traceId,
       })
     }
 
@@ -139,6 +245,7 @@ export function createRoutes({ config, backend, getIdentityCfg = () => config?.i
           memory_type: rawType || 'semantic',
           tags,
           identity,
+          traceId,
         })
       } catch (err) {
         log(`[whale-memory] write fail: ${err?.message || 'error'}`)
@@ -200,13 +307,20 @@ export function createRoutes({ config, backend, getIdentityCfg = () => config?.i
       }
       if (!result) return sendJson(res, 502, { ok: false, error: 'backend_unreachable' })
       if (result.ok === false) return sendJson(res, 502, { ok: false, error: 'backend_error' })
-      return sendJson(res, 200, {
+      const resultBody = {
         ok: true,
         added: Number(result.added ?? 0),
         skipped: Number(result.skipped ?? 0),
         errors: Number(result.errors ?? 0),
         dryRun: result.dryRun === undefined ? dryRun : Boolean(result.dryRun),
-      })
+      }
+      // 计划书 §8.3 的「保留/拆分/拒绝」三计数：只有 backend 真返回时才透传（旧/假后端保持原契约）。
+      if (result.kept !== undefined) resultBody.kept = Number(result.kept)
+      if (result.split !== undefined) resultBody.split = Number(result.split)
+      if (result.rejected !== undefined) resultBody.rejected = Number(result.rejected)
+      if (result.reasons && typeof result.reasons === 'object') resultBody.reasons = result.reasons
+      if (Array.isArray(result.error_details)) resultBody.error_details = result.error_details.slice(0, 20)
+      return sendJson(res, 200, resultBody)
     }
 
     // 导出（S2）：直接回 JSONL 正文，不再套 JSON 信封；固定下载文件名。
@@ -267,9 +381,9 @@ export function createRoutes({ config, backend, getIdentityCfg = () => config?.i
       const ident = resolveIdentity(getIdentityCfg())
       if (!ident.ok) return sendJson(res, 400, { ok: false, error: ident.error })
       const out = {}
-      if (direction === 'pull' || direction === 'both') out.pull = await pullFromGateway({ backend, transport, identity: ident.identity, dryRun })
-      if (direction === 'push' || direction === 'both') out.push = await pushToGateway({ backend, transport, identity: ident.identity, dryRun })
-      return sendJson(res, 200, { ok: true, dryRun, ...out })
+      if (direction === 'pull' || direction === 'both') out.pull = await pullFromGateway({ backend, transport, identity: ident.identity, dryRun, traceId })
+      if (direction === 'push' || direction === 'both') out.push = await pushToGateway({ backend, transport, identity: ident.identity, dryRun, traceId })
+      return sendJson(res, 200, { ok: true, dryRun, trace_id: traceId, ...out })
     }
 
     // 手动反思（S4）：不阻塞；返回 started，结果由 stats/日志观察。
@@ -359,16 +473,27 @@ export function createRoutes({ config, backend, getIdentityCfg = () => config?.i
       const body = await readJson(req)
       if (!body.ok) return sendJson(res, body.status, { ok: false, error: body.error })
       const next = body.value?.config
-      if (!next || typeof next !== 'object') return sendJson(res, 400, { ok: false, error: 'invalid_config' })
+      if (!next || typeof next !== 'object' || Array.isArray(next)) {
+        return sendJson(res, 400, { ok: false, error: 'invalid_config' })
+      }
+      const patch = pickConfigKeys(next)
+      if (Object.keys(patch).length === 0) {
+        return sendJson(res, 400, { ok: false, error: 'invalid_config' })
+      }
       try {
         const editor = ctx?.get?.('configEditor')
         if (!editor || typeof editor.edit !== 'function' || !ctx?.fiber?.entry) {
           return sendJson(res, 501, { ok: false, error: 'config_save_unavailable' })
         }
-        await editor.edit(ctx.fiber.entry, (current) => ({ ...(current || {}), ...next }))
-        for (const key of ['backend', 'identity', 'recall', 'write', 'reflect', 'sync', 'edges', 'panel', 'advanced']) {
-          if (next[key] && typeof next[key] === 'object') config[key] = { ...(config[key] || {}), ...next[key] }
-        }
+        let saved = null
+        // 只按提交的叶子深合并；current 里的未提交字段原样保留。
+        await editor.edit(ctx.fiber.entry, (current) => {
+          saved = deepMergeLeaf(resolveTree(current || {}), patch)
+          return saved
+        })
+        saved = readBackConfig(editor, ctx.fiber.entry, saved)
+          || deepMergeLeaf(echoConfig(config), patch)
+        syncRuntimeConfig(config, saved)
         return sendJson(res, 200, { ok: true })
       } catch (err) {
         log(`[whale-memory] config save fail: ${err?.message || err}`)
@@ -377,37 +502,16 @@ export function createRoutes({ config, backend, getIdentityCfg = () => config?.i
     }
 
     if (path === `${PREFIX}/config` && req.method === 'GET') {
-      return sendJson(res, 200, { ok: true, config: redact(config) })
+      return sendJson(res, 200, {
+        ok: true,
+        config: echoConfig(config),
+        // 文档 §4 S11 写 0=不限制，代码里 0=关闭注入；以代码为准，冲突待文档侧修正。
+        notes: { recall_charBudget: '0 = 关闭注入（与文档 §4 S11 的 0=不限制 冲突，以代码为准）' },
+      })
     }
 
     log(`[whale-memory] 404 ${req.method} ${path}`)
     return sendJson(res, 404, { ok: false, error: 'not_found' })
-  }
-}
-
-/** 配置回显只给面板需要的字段，不把内部对象原样吐出。 */
-function redact(config) {
-  return {
-    backend: { mode: value(config?.backend?.mode, 'local'), url: value(config?.backend?.url, ''), timeoutMs: num(config?.backend?.timeoutMs, 3000) },
-    identity: { ...config?.identity },
-    recall: {
-      enabled: bool(config?.recall?.enabled, true),
-      maxHits: num(config?.recall?.maxHits, 5),
-      charBudget: num(config?.recall?.charBudget, 1500),
-      intentBudget: bool(config?.recall?.intentBudget, true),
-      minRel: num(config?.recall?.minRel, 0.34),
-      timeoutMs: num(config?.recall?.timeoutMs, 2000),
-    },
-    write: {
-      enabled: bool(config?.write?.enabled, true),
-      reviewMode: value(config?.write?.reviewMode, 'shadow'),
-      maxChars: num(config?.write?.maxChars, 500),
-      searchFeed: bool(config?.write?.searchFeed, false),
-    },
-    reflect: { enabled: bool(config?.reflect?.enabled, false) },
-    sync: { enabled: bool(config?.sync?.enabled, false) },
-    panel: { allowRemote: bool(config?.panel?.allowRemote, false), pollMs: num(config?.panel?.pollMs, 60000) },
-    advanced: { logLevel: value(config?.advanced?.logLevel, 'warn'), worker: bool(config?.advanced?.worker, true) },
   }
 }
 

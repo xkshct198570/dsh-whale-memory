@@ -19,6 +19,97 @@ export const inject = ['webServer', 'systemPrompt']
 
 const log = (line) => { try { console.log(line) } catch { /* log 永远不是故障点 */ } }
 
+/**
+ * backend 代理：registerBackend() 换实现后，路由/keeper/hook 立刻取到 current，
+ * 不再各自持有建库时的旧引用。所有已用方法（含 withDb/dbFile 等）原样转发。
+ * @param {{ current: any }} ref
+ */
+export function createBackendProxy(ref) {
+  return new Proxy({}, {
+    get(_target, prop) {
+      const current = ref?.current
+      if (!current) return undefined
+      const member = current[prop]
+      return typeof member === 'function' ? member.bind(current) : member
+    },
+    has(_target, prop) {
+      return Boolean(ref?.current) && prop in ref.current
+    },
+  })
+}
+
+/**
+ * 对外 `whaleMemory` service（架构书 §12.2）：记忆统计、分区、后端注册、缓存失效、身份提示。
+ * @param {{ ctx: any, backendRef: { current: any }, getHook?: () => any, identityState?: { hint: any }, log?: (line:string)=>void }} deps
+ */
+export function createWhaleMemoryService({ ctx, backendRef, getHook = () => null, identityState = { hint: null }, log = () => {} }) {
+  const service = {
+    /** stats 失败一律 fail-open 返回 null，绝不把异常抛给调用方插件。 */
+    async stats() {
+      try {
+        const current = backendRef?.current
+        if (!current || typeof current.stats !== 'function') return null
+        return await current.stats()
+      } catch (err) {
+        log(`[whale-memory] service stats fail-open: ${err?.message || err}`)
+        return null
+      }
+    },
+
+    /** 当前库里的身份分区摘要（最多 20 条）；读不到就返回空数组。 */
+    listPartitions() {
+      try {
+        const current = backendRef?.current
+        if (!current || typeof current.withDb !== 'function') return []
+        const rows = current.withDb((db) => db.prepare(
+          'SELECT user_id AS userId, role_id AS roleId, workspace, count(*) AS nodes '
+          + 'FROM nodes GROUP BY user_id, role_id, workspace ORDER BY nodes DESC LIMIT 20',
+        ).all())
+        return Array.isArray(rows) ? rows.slice(0, 20) : []
+      } catch (err) {
+        log(`[whale-memory] service listPartitions fail-open: ${err?.message || err}`)
+        return []
+      }
+    },
+
+    /** 替换后端实现；只接受具备 stats/search/recall 的对象。 */
+    registerBackend(next) {
+      const valid = Boolean(next)
+        && typeof next.stats === 'function'
+        && typeof next.search === 'function'
+        && typeof next.recall === 'function'
+      if (!valid) return { ok: false, error: 'invalid_backend' }
+      backendRef.current = next
+      log(`[whale-memory] backend registered mode=${next?.mode || 'custom'}`)
+      return { ok: true }
+    },
+
+    /** 清召回缓存（hook 的 pre-step 缓存）；hook 未安装也算成功。 */
+    invalidateCache() {
+      try {
+        const hook = getHook?.()
+        const cache = hook?.cache
+        const cleared = cache && typeof cache.size === 'number' ? cache.size : 0
+        if (cache && typeof cache.clear === 'function') cache.clear()
+        return { ok: true, cleared }
+      } catch (err) {
+        log(`[whale-memory] service invalidateCache fail-open: ${err?.message || err}`)
+        return { ok: false, error: 'cache_unavailable' }
+      }
+    },
+
+    setIdentityHint(hint) {
+      identityState.hint = hint && typeof hint === 'object' ? hint : null
+    },
+    clearIdentityHint() {
+      identityState.hint = null
+    },
+  }
+
+  if (ctx && typeof ctx.provide === 'function') ctx.provide('whaleMemory', service)
+  return service
+}
+
 export function apply(ctx, config) {
   const backend = createBackend(config?.backend, {
     log,
@@ -26,24 +117,25 @@ export function apply(ctx, config) {
     useWorker: bool(config?.advanced?.worker, true),
     config: () => config,
   })
+  const backendRef = { current: backend }
+  const backendProxy = createBackendProxy(backendRef)
 
   // 外部角色插件可选的"身份提示"：A 只存 role_id/workspace/user_id，不理解角色语义。
-  let identityHint = null
-  const getIdentityCfg = () => (identityHint ? { ...config?.identity, ...identityHint } : config?.identity)
-  ctx.provide('whaleMemory', {
-    setIdentityHint(hint) { identityHint = hint && typeof hint === 'object' ? hint : null },
-    clearIdentityHint() { identityHint = null },
-  })
+  const identityState = { hint: null }
+  const getIdentityCfg = () => (identityState.hint ? { ...config?.identity, ...identityState.hint } : config?.identity)
+
+  let hook = null
+  createWhaleMemoryService({ ctx, backendRef, getHook: () => hook, identityState, log })
 
   // S4 后台调度：jobs 状态机 + 单飞 + 启动补偿 + 水位闸门；反思/巩固/日报都走它。
-  const keeper = installKeeper(ctx, { store: backend, config, log })
+  const keeper = installKeeper(ctx, { store: backendProxy, config, log })
   keeper.register('write', async () => {
-    if (typeof backend.drainWrites !== 'function') return { skipped: 'writer_unavailable' }
-    return await backend.drainWrites()
+    if (typeof backendProxy.drainWrites !== 'function') return { skipped: 'writer_unavailable' }
+    return await backendProxy.drainWrites()
   })
 
   const reflect = installReflectScheduler(ctx, {
-    backend, config, keeper,
+    backend: backendProxy, config, keeper,
     getLlm: () => ctx.get('llm'),
     getSelection: () => ctx.get('agentDefaultModel')?.currentSelection?.(),
     log,
@@ -67,18 +159,18 @@ export function apply(ctx, config) {
     return () => { for (const t of timers) clearInterval(t) }
   }, 'whale-memory: keeper schedule')
 
-  installSearchFeed(ctx, { backend, config, log })
+  installSearchFeed(ctx, { backend: backendProxy, config, log })
 
-  const handler = createRoutes({ config, backend, getIdentityCfg, ctx, reflect, log })
+  const handler = createRoutes({ config, backend: backendProxy, getIdentityCfg, ctx, reflect, log })
 
   ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: PREFIX, handler }), 'whale-memory: routes')
 
   // backend 生命周期：worker 线程与 SQLite 连接随插件 dispose 收尾。
+  // 只销毁本插件自己建的 backend；registerBackend 换进来的外部实现归注入方管。
   ctx.effect(() => () => { reflect.dispose(); backend.dispose?.() }, 'whale-memory: backend')
 
-  let hook = null
   ctx.effect(() => {
-    hook = installHook(ctx, { backend, config, getIdentityCfg, log })
+    hook = installHook(ctx, { backend: backendProxy, config, getIdentityCfg, log })
     return () => hook?.dispose()
   }, 'whale-memory: recall hook')
 

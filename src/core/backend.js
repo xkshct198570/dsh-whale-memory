@@ -4,22 +4,275 @@
  * 主线程零大批量检索：search/recall 走 DbWorkerClient（worker_threads，1200ms 超时）；
  * 写入/导入/导出仍在主线程短事务（≤20/批），因为写需要单写者一致性。
  * 所有失败 fail-open：检索失败返回 null/空结果，不阻塞对话。
+ *
+ * 两条硬口径（Why）：
+ * - 配置来自 schemastery，`write.enabled` 是 Ref；不 `get()` 就直接判 `=== false` 恒假，
+ *   "关写"开关等于没有。这里统一解包后再判（core 不 import host，故本地实现 plain()）。
+ * - 导入/导出必须保真：状态（superseded/archived/stale）、双时态（valid_at/invalid_at/expired_at/
+ *   superseded_by）、命中统计与向量态都要往返；否则 export→import 会把已失效事实"复活"。
+ *   导入事务末尾还要用 nodes 与两张 FTS 的行数闸门证明索引没有写坏。
  */
 import { closeDb, getMeta, now, openDb, setMeta } from './db.js'
 import { bigrams, contentHash, normalize } from './tokenize.js'
 import { search as searchDb } from './search.js'
 import { planBudget, trimHits } from './budget.js'
 import { applyNeighborNotes, relationStats } from './relations.js'
-import { createWriteQueue } from './writer.js'
+import { memoryPressure } from '../host/memory-guard.js'
+import { createWriteQueue, recordWrite } from './writer.js'
 import { DbWorkerClient } from './workers/client.js'
 
 /** @typedef {{ userId: string, roleId: string, workspace: string }} Identity */
 
 const NODE_EXPORT_FIELDS = [
   'id', 'role_id', 'user_id', 'workspace', 'text', 'level', 'memory_type', 'source', 'status',
-  'tags', 'context_note', 'weight', 'created_at', 'updated_at', 'valid_at', 'invalid_at',
-  'expired_at', 'superseded_by', 'origin', 'trace_id', 'text_hash',
+  'tags', 'context_note', 'weight', 'hits', 'last_hit_at', 'vector_state',
+  'created_at', 'updated_at', 'valid_at', 'invalid_at', 'expired_at', 'superseded_by',
+  'origin', 'trace_id', 'text_hash',
 ]
+
+/** 导入字段白名单（非法枚举回落默认，避免把 export 的脏值写进 CHECK 约束）。 */
+const NODE_STATUS = new Set(['active', 'archived', 'superseded', 'stale'])
+const NODE_LEVELS = new Set(['core', 'important', 'normal'])
+const NODE_TYPES = new Set(['semantic', 'procedural', 'episodic', 'mixed'])
+const NODE_SOURCES = new Set(['owner', 'self', 'group', 'web', 'tool', 'import'])
+const VECTOR_STATES = new Set(['none', 'pending', 'ready', 'failed'])
+
+/** 文本硬顶（与 nodes.text CHECK 同值）。 */
+const TEXT_LIMIT = 500
+/** 规则边界：行首 "1." / "1、" / "1)" 或 【标题】行（导入长文本拆分用）。 */
+const RULE_BOUNDARY = /^\s*(?:\d+\s*[.、)]|【[^】]*】)/
+/** 导入失败明细上限（返回体不塞全文，只给序号/原因/哈希前缀）。 */
+const ERROR_DETAIL_LIMIT = 20
+
+/**
+ * 导入 INSERT：显式列出全部可保真字段（v1 导入写死 active/''/1/0/none 会让
+ * superseded/archived/stale 在 export→import 后复活）。
+ */
+const IMPORT_INSERT_SQL = `INSERT INTO nodes
+  (id,text,text_hash,text_bigrams,level,memory_type,source,status,role_id,user_id,workspace,tags,
+   context_note,weight,hits,last_hit_at,vector_state,origin,trace_id,valid_at,invalid_at,expired_at,
+   superseded_by,created_at,updated_at)
+  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+
+/** 枚举回落。 @param {unknown} value @param {Set<string>} allowed @param {string} fallback */
+function pickEnum(value, allowed, fallback) {
+  const v = String(value ?? '')
+  return allowed.has(v) ? v : fallback
+}
+
+/**
+ * schemastery Ref 解包：`.volatile()` 字段 `get()` 才是值。
+ * 不 import host（分层约束），在 core 内做同一口径。
+ * @param {unknown} value
+ * @returns {unknown}
+ */
+function plain(value) {
+  return value && typeof value.get === 'function' ? value.get() : value
+}
+
+/** 数值回落（空值/null 不参与 Number，避免 Number(null)===0 的假值）。 */
+function finiteOr(value, fallback) {
+  if (value === null || value === undefined || value === '') return fallback
+  const n = Number(value)
+  return Number.isFinite(n) ? n : fallback
+}
+
+/** 时间戳兜底：缺失/非法返回 null（不能返回 0，0 会让双时态判断产生假"已失效"）。 */
+function timeOrNull(value) {
+  if (value === null || value === undefined || value === '') return null
+  const n = Number(value)
+  return Number.isFinite(n) ? n : null
+}
+
+/**
+ * 导出身份过滤：与 search 同口径 `(列='' OR 列=?)`，空身份字段不过滤。
+ * 为什么导出也要过滤：导出文件会被拿去推送/外传，不带身份条件等于跨分区泄漏。
+ *
+ * @param {{ userId?: unknown, roleId?: unknown, workspace?: unknown } | null | undefined} identity
+ * @returns {{ sql: string, params: string[] }}
+ */
+function identityFilter(identity) {
+  const clauses = []
+  const params = []
+  for (const [col, raw] of [
+    ['user_id', identity?.userId],
+    ['role_id', identity?.roleId],
+    ['workspace', identity?.workspace],
+  ]) {
+    const value = typeof raw === 'string' ? raw : String(raw ?? '')
+    if (!value) continue
+    clauses.push(`(${col} = '' OR ${col} = ?)`)
+    params.push(value)
+  }
+  return { sql: clauses.length ? ` WHERE ${clauses.join(' AND ')}` : '', params }
+}
+
+/**
+ * 长文本按规则边界拆分。
+ *
+ * 为什么在导入时拆：>500 字直接丢弃等于静默丢数据，而"多条规则挤成一行"是最常见的导入形态，
+ * 按行首编号/【标题】切段就能无损落库；切不出来（单条超长规则）才拒绝。
+ *
+ * @param {string} raw 原始文本（拆分必须在 normalize 前做，normalize 会压缩换行）
+ * @returns {string[] | null} 每段 normalize 后 ≤500 且段数 ≥2；否则 null
+ */
+function splitLongText(raw) {
+  const starts = []
+  let offset = 0
+  for (const line of raw.split('\n')) {
+    if (RULE_BOUNDARY.test(line)) starts.push(offset)
+    offset += line.length + 1
+  }
+  if (starts.length < 2) return null
+  const points = [0]
+  for (const at of starts) if (at > 0 && !points.includes(at)) points.push(at)
+  const segments = []
+  for (let i = 0; i < points.length; i += 1) {
+    const end = i + 1 < points.length ? points[i + 1] : raw.length
+    const segment = normalize(raw.slice(points[i], end))
+    if (!segment) continue
+    if (segment.length > TEXT_LIMIT) return null
+    segments.push(segment)
+  }
+  return segments.length >= 2 ? segments : null
+}
+
+/** 组装一条导入节点行（字段全部已回落/校验）。 */
+function importNodeRow(base, id, text, tags) {
+  return {
+    ...base,
+    id,
+    text,
+    text_hash: contentHash(text),
+    text_bigrams: bigrams(text),
+    tags: JSON.stringify(Array.isArray(tags) ? tags : []),
+  }
+}
+
+/**
+ * 单行导入 → 落库计划（同步/异步共用）。
+ *
+ * @param {object} row JSONL 行对象
+ * @param {{ userId?: string, roleId?: string, workspace?: string }} identity 调用方身份（行内字段优先）
+ * @param {{ ts: number, seq: number }} opts ts=当前时间兜底；seq=行序号（生成 id 保证唯一）
+ * @returns {{ kind: 'error', reason: string, textHash: string } | { kind: 'rows', rows: object[], split?: boolean }}
+ */
+function planImportRows(row, identity, { ts, seq }) {
+  const raw = String(row?.text ?? '')
+  const text = normalize(raw)
+  if (!text) return { kind: 'error', reason: 'invalid_text', textHash: contentHash(raw) }
+
+  const base = {
+    role_id: String(row?.role_id ?? identity?.roleId ?? ''),
+    user_id: String(row?.user_id ?? identity?.userId ?? ''),
+    workspace: String(row?.workspace ?? identity?.workspace ?? ''),
+    level: pickEnum(row?.level, NODE_LEVELS, 'normal'),
+    memory_type: pickEnum(row?.memory_type, NODE_TYPES, 'semantic'),
+    source: pickEnum(row?.source, NODE_SOURCES, 'import'),
+    status: pickEnum(row?.status, NODE_STATUS, 'active'),
+    context_note: String(row?.context_note ?? '').slice(0, 200),
+    weight: finiteOr(row?.weight, 1),
+    hits: Math.max(0, Math.floor(finiteOr(row?.hits, 0))),
+    last_hit_at: timeOrNull(row?.last_hit_at),
+    vector_state: pickEnum(row?.vector_state, VECTOR_STATES, 'none'),
+    origin: String(row?.origin ?? '') || 'import',
+    trace_id: String(row?.trace_id ?? ''),
+    valid_at: timeOrNull(row?.valid_at),
+    invalid_at: timeOrNull(row?.invalid_at),
+    expired_at: timeOrNull(row?.expired_at),
+    superseded_by: row?.superseded_by === null || row?.superseded_by === undefined || row?.superseded_by === ''
+      ? null
+      : String(row.superseded_by),
+    created_at: finiteOr(row?.created_at, ts),
+    updated_at: finiteOr(row?.updated_at, ts),
+  }
+  const originId = String(row?.id ?? '')
+  const pieces = text.length > TEXT_LIMIT ? splitLongText(raw) : null
+
+  if (text.length > TEXT_LIMIT && !pieces) {
+    return { kind: 'error', reason: 'too_long_single_rule', textHash: contentHash(raw) }
+  }
+  if (!pieces) {
+    const id = originId || `n${Date.now()}_${contentHash(text).slice(0, 10)}_${seq}`
+    return { kind: 'rows', rows: [importNodeRow(base, id, text, row?.tags)] }
+  }
+
+  // 拆分保真：每段 tags 追加 split_from:<原 id>，让检索/复盘能追回原条目。
+  const splitFrom = originId || `import:${contentHash(raw).slice(0, 12)}`
+  const tags = [...(Array.isArray(row?.tags) ? row.tags : []), `split_from:${splitFrom}`]
+  const rows = pieces.map((piece, i) => {
+    const id = originId
+      ? `${originId}_s${i + 1}`
+      : `n${Date.now()}_${contentHash(piece).slice(0, 10)}_${seq}_${i}`
+    return importNodeRow(base, id, piece, tags)
+  })
+  return { kind: 'rows', rows, split: true }
+}
+
+/**
+ * 导入事务末尾的 FTS 一致性闸。
+ *
+ * 先按契约比对 nodes 与两张 FTS 的行数；但外部内容表（content='nodes'）的 count(*)
+ * 实际是扫内容表，触发器缺失时仍然相等，不能作为证据。真正的索引行数在 FTS5 的
+ * shadow 表 `*_docsize` 里（每个入索引的文档一行），所以再用它证明"每个节点都进了索引"。
+ * 任一不一致 → false（调用方 ROLLBACK 并返回 fts_misaligned）。
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @returns {boolean}
+ */
+function ftsAligned(db) {
+  const one = (sql) => Number(db.prepare(sql).get()?.n || 0)
+  const nodes = one('SELECT count(*) AS n FROM nodes')
+  if (nodes !== one('SELECT count(*) AS n FROM nodes_fts')) return false
+  if (nodes !== one('SELECT count(*) AS n FROM nodes_fts_bi')) return false
+  try {
+    if (nodes !== one('SELECT count(*) AS n FROM nodes_fts_docsize')) return false
+    if (nodes !== one('SELECT count(*) AS n FROM nodes_fts_bi_docsize')) return false
+  } catch {
+    // 极端裁剪的 FTS5 构建可能没有 docsize：此时只能退回上面的内容表比对，不阻断导入。
+    return true
+  }
+  return true
+}
+
+/**
+ * 落库一批导入计划行（同步/异步共用）。
+ *
+ * 幂等键不限定 status：已存在 superseded/archived 节点再次导入也必须 skipped，
+ * 否则 export→import 会把已失效事实"复活"成新 active 行。
+ * 拆分段额外写 writes(action='SPLIT')，让"一行变多行"可复盘。
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {Array<{ node: object, split: boolean }>} items
+ * @param {{ insert: any, exists: any, dryRun?: boolean }} io
+ * @returns {{ added: number, skipped: number }}
+ */
+function landImportRows(db, items, { insert, exists, dryRun = false }) {
+  let added = 0
+  let skipped = 0
+  for (const item of items) {
+    const node = item.node
+    if (exists.get(node.text_hash, node.user_id, node.role_id, node.workspace)) { skipped += 1; continue }
+    if (!dryRun) {
+      insert.run(
+        node.id, node.text, node.text_hash, node.text_bigrams,
+        node.level, node.memory_type, node.source, node.status,
+        node.role_id, node.user_id, node.workspace, node.tags,
+        node.context_note, node.weight, node.hits, node.last_hit_at,
+        node.vector_state, node.origin, node.trace_id,
+        node.valid_at, node.invalid_at, node.expired_at, node.superseded_by,
+        node.created_at, node.updated_at,
+      )
+      if (item.split) {
+        recordWrite(db, { identity: { userId: node.user_id, roleId: node.role_id, workspace: node.workspace } }, {
+          action: 'SPLIT', reason: 'split_import', nodeId: node.id, afterText: node.text, mode: 'auto',
+        })
+      }
+    }
+    added += 1
+  }
+  return { added, skipped }
+}
 
 export class LocalBackend {
   /**
@@ -40,7 +293,7 @@ export class LocalBackend {
       ? (typeof config === 'function' ? config : () => config)
       : () => ({ write: { reviewMode: 'auto' } })
     this.writeQueue = null
-    /** @type {Map<string,{lines:string[],next:number,added:number,skipped:number,errors:number,total:number,identity:any}>} */
+    /** @type {Map<string,{lines:string[],next:number,added:number,skipped:number,errors:number,kept:number,splitLines:number,reasons:object,errorDetails:object[],total:number,identity:any,failed:boolean}>} */
     this._imports = new Map()
   }
 
@@ -109,11 +362,27 @@ export class LocalBackend {
   async stats() {
     const db = this._db()
     const one = (sql) => Number(db.prepare(sql).get()?.n || 0)
+    const nodesTotal = one('SELECT count(*) AS n FROM nodes')
+    const dayStart = (() => { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime() / 1000 })()
+    const ftsRows = (() => { try { return one('SELECT count(*) AS n FROM nodes_fts_docsize') } catch { return null } })()
+    const ftsBiRows = (() => { try { return one('SELECT count(*) AS n FROM nodes_fts_bi_docsize') } catch { return null } })()
+    const jobRow = (state) => one(`SELECT count(*) AS n FROM jobs WHERE state='${state}'`)
+    const lastFailed = (() => { try { return db.prepare("SELECT last_error FROM jobs WHERE state='failed' AND last_error IS NOT NULL ORDER BY updated_at DESC LIMIT 1").get()?.last_error || null } catch { return null } })()
     return {
       totals: {
-        nodes_total: one('SELECT count(*) AS n FROM nodes'),
+        nodes_total: nodesTotal,
         nodes_active: one("SELECT count(*) AS n FROM nodes WHERE status='active'"),
         edges: one('SELECT count(*) AS n FROM edges'),
+        recalls_today: one(`SELECT count(*) AS n FROM recalls WHERE ts >= ${dayStart}`),
+        injected_chars_today: one(`SELECT coalesce(sum(chars),0) AS n FROM recalls WHERE ts >= ${dayStart}`),
+      },
+      health: {
+        fts_aligned: ftsRows !== null && ftsBiRows !== null && ftsRows === nodesTotal && ftsBiRows === nodesTotal,
+        fts_rows: ftsRows,
+        fts_bi_rows: ftsBiRows,
+        vector_pending: one("SELECT count(*) AS n FROM nodes WHERE vector_state='pending'"),
+        jobs: { running: jobRow('running'), queued: jobRow('queued'), failed: jobRow('failed'), last_error: lastFailed },
+        pressure: memoryPressure(),
       },
       schema_version: getMeta(db, 'schema_version'),
       generated_at: new Date().toISOString(),
@@ -123,10 +392,10 @@ export class LocalBackend {
   async recent(limit = 3) {
     const db = this._db()
     const rows = db.prepare(
-      'SELECT ts,hit_ids,chars,injected,elapsed_ms FROM recalls ORDER BY ts DESC LIMIT ?',
+      'SELECT ts,query,hit_ids,chars,injected,elapsed_ms FROM recalls ORDER BY ts DESC LIMIT ?',
     ).all(Math.max(1, Math.min(10, Number(limit) || 3)))
     return { items: rows.map((r) => ({
-      ts: r.ts, hits: (JSON.parse(r.hit_ids || '[]')).length, chars: r.chars,
+      ts: r.ts, query: String(r.query || ''), hits: (JSON.parse(r.hit_ids || '[]')).length, chars: r.chars,
       injected: Boolean(r.injected), elapsed_ms: r.elapsed_ms,
     })) }
   }
@@ -207,8 +476,9 @@ export class LocalBackend {
     const text = normalize(String(q?.text || ''))
     if (!text) return { ok: false, error: 'invalid_text' }
     if (text.length > 500) return { ok: false, error: 'text_too_long' }
-    const writeCfg = this._config()?.write || {}
-    if (writeCfg.enabled === false) return { ok: false, error: 'write_disabled' }
+    const writeCfg = plain(this._config()?.write) || {}
+    // 关写开关必须先解包 Ref（schemas 里是 .volatile()，直接 === false 恒假，开关等于没有）。
+    if (plain(writeCfg.enabled) === false) return { ok: false, error: 'write_disabled' }
     const ident = q?.identity || {}
     const tags = Array.isArray(q.tags) ? q.tags.filter((x) => typeof x === 'string').slice(0, 32) : []
     const event = {
@@ -253,55 +523,102 @@ export class LocalBackend {
     return rows
   }
 
-  /** @param {{ jsonl:string, identity:Identity, dryRun?:boolean }} q */
+  /**
+   * 同步导入 JSONL（≤50 行走这里；大导入走 startImport 分片）。
+   *
+   * 保真口径：status/vector_state 校验枚举回落，双时态与 superseded_by 直通，
+   * context_note 截 200，hits/weight/last_hit_at 数值回落；>500 字按规则边界拆分，
+   * 拆不出才拒绝并计入 reasons / error_details（不再静默丢行）。
+   * 事务末尾做 FTS 一致性闸，不一致整个 ROLLBACK 并返回 fts_misaligned。
+   * 统计口径（计划书 §8.3）：kept=原样保留的源行数、split=被拆分的源行数（不是段数）、
+   * rejected=拒绝的源行数（与 errors 同值）；added 仍是实际写入节点数。
+   *
+   * @param {{ jsonl:string, identity?:Identity, dryRun?:boolean }} q
+   * @returns {Promise<{ ok:boolean, added:number, skipped:number, errors:number, kept:number,
+   *   split:number, rejected:number, reasons:object,
+   *   error_details:Array<{index:number,reason:string,text_hash:string}>, dryRun:boolean, error?:string }>}
+   */
   async importJsonl(q) {
     const db = this._db()
     const lines = String(q?.jsonl || '').split('\n').map((s) => s.trim()).filter(Boolean)
     const ident = q?.identity || {}
-    let added = 0; let skipped = 0; let errors = 0
     const ts = now()
-    const insert = db.prepare(`INSERT INTO nodes
-      (id,text,text_hash,text_bigrams,level,memory_type,source,status,role_id,user_id,workspace,tags,
-       context_note,weight,hits,vector_state,origin,trace_id,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,?,'active',?,?,?,?,?,1,0,'none',?,?,?,?)`)
+    const dryRun = Boolean(q?.dryRun)
+    const insert = db.prepare(IMPORT_INSERT_SQL)
     const exists = db.prepare(
-      "SELECT 1 FROM nodes WHERE text_hash=? AND user_id=? AND role_id=? AND workspace=? AND status='active' LIMIT 1",
+      'SELECT 1 FROM nodes WHERE text_hash=? AND user_id=? AND role_id=? AND workspace=? LIMIT 1',
     )
+
+    let errors = 0
+    let kept = 0
+    let splitLines = 0
+    /** @type {Record<string, number>} */
+    const reasons = {}
+    /** @type {Array<{ index: number, reason: string, text_hash: string }>} */
+    const errorDetails = []
+    /** @type {Array<{ node: object, split: boolean }>} */
+    const items = []
+
+    lines.forEach((line, index) => {
+      let row
+      try {
+        row = JSON.parse(line)
+      } catch {
+        errors += 1
+        reasons.invalid_json = (reasons.invalid_json || 0) + 1
+        if (errorDetails.length < ERROR_DETAIL_LIMIT) {
+          errorDetails.push({ index, reason: 'invalid_json', text_hash: contentHash(line).slice(0, 12) })
+        }
+        return
+      }
+      const plan = planImportRows(row, ident, { ts, seq: index })
+      if (plan.kind === 'error') {
+        errors += 1
+        reasons[plan.reason] = (reasons[plan.reason] || 0) + 1
+        if (errorDetails.length < ERROR_DETAIL_LIMIT) {
+          errorDetails.push({ index, reason: plan.reason, text_hash: plan.textHash.slice(0, 12) })
+        }
+        return
+      }
+      if (plan.split) splitLines += 1
+      else kept += 1
+      for (const node of plan.rows) items.push({ node, split: plan.split === true })
+    })
+
+    let added = 0
+    let skipped = 0
     db.exec('BEGIN IMMEDIATE')
     try {
-      for (const line of lines) {
-        let row
-        try { row = JSON.parse(line) } catch { errors += 1; continue }
-        const text = normalize(String(row?.text || ''))
-        if (!text || text.length > 500) { errors += 1; continue }
-        const hash = contentHash(text)
-        const u = String(row?.user_id ?? ident.userId ?? '')
-        const r = String(row?.role_id ?? ident.roleId ?? '')
-        const w = String(row?.workspace ?? ident.workspace ?? '')
-        if (exists.get(hash, u, r, w)) { skipped += 1; continue }
-        if (q?.dryRun) { added += 1; continue }
-        insert.run(
-          String(row?.id || '') || `n${Date.now()}_${hash.slice(0, 10)}_${added}`,
-          text, hash, bigrams(text),
-          row?.level || 'normal', row?.memory_type || 'semantic', row?.source || 'import',
-          r, u, w, JSON.stringify(Array.isArray(row?.tags) ? row.tags : []), '',
-          String(row?.origin || 'import'), String(row?.trace_id || ''),
-          Number(row?.created_at) || ts, Number(row?.updated_at) || ts,
-        )
-        added += 1
+      ;({ added, skipped } = landImportRows(db, items, { insert, exists, dryRun }))
+      if (!dryRun && !ftsAligned(db)) {
+        db.exec('ROLLBACK')
+        return {
+          ok: false, error: 'fts_misaligned', added: 0, skipped: 0, errors,
+          kept, split: splitLines, rejected: errors, reasons, error_details: errorDetails, dryRun,
+        }
       }
-      db.exec(q?.dryRun ? 'ROLLBACK' : 'COMMIT')
+      db.exec(dryRun ? 'ROLLBACK' : 'COMMIT')
     } catch (err) {
       try { db.exec('ROLLBACK') } catch { /* noop */ }
       throw err
     }
-    return { added, skipped, errors, dryRun: Boolean(q?.dryRun) }
+    return {
+      ok: true, added, skipped, errors, kept, split: splitLines, rejected: errors,
+      reasons, error_details: errorDetails, dryRun,
+    }
   }
 
-  /** @param {{ identity:Identity }} [q] */
+  /**
+   * 导出 JSONL：按身份过滤（与 search 同口径 `(列='' OR 列=?)`），补 hits/last_hit_at/vector_state。
+   * 身份过滤是硬要求：导出文件会被拿去推送/外传，不过滤等于跨分区泄漏。
+   * @param {{ identity?:Identity }} [q]
+   */
   async exportJsonl(q = {}) {
     const db = this._db()
-    const rows = db.prepare(`SELECT ${NODE_EXPORT_FIELDS.join(',')} FROM nodes ORDER BY created_at, id`).all()
+    const filter = identityFilter(q?.identity)
+    const rows = db.prepare(
+      `SELECT ${NODE_EXPORT_FIELDS.join(',')} FROM nodes${filter.sql} ORDER BY created_at, id`,
+    ).all(...filter.params)
     return rows.map((r) => JSON.stringify(r)).join('\n') + (rows.length ? '\n' : '')
   }
 
@@ -377,64 +694,106 @@ export class LocalBackend {
 
   /**
    * 异步分片导入：>50 行返回 202 + jobId；每批 50 条、用 setImmediate 让出事件循环。
-   * @param {{ jsonl:string, identity:Identity }} q
+   * 与同步导入共用 planImportRows / landImportRows（保真字段、长文本拆分、FTS 闸门口径一致）。
+   * @param {{ jsonl:string, identity?:Identity }} q
    */
   async startImport(q) {
     const db = this._db()
     const lines = String(q?.jsonl || '').split('\n').map((s) => s.trim()).filter(Boolean)
     const ts = now()
+    const payload = {
+      total: lines.length, added: 0, skipped: 0, errors: 0, kept: 0, split: 0, rejected: 0,
+      reasons: {}, error_details: [],
+    }
     const created = db.prepare('INSERT INTO jobs (kind,state,attempts,payload,created_at,updated_at) VALUES (?,?,?,?,?,?)')
-      .run('import', 'queued', 0, JSON.stringify({ total: lines.length, added: 0, skipped: 0, errors: 0 }), ts, ts)
+      .run('import', 'queued', 0, JSON.stringify(payload), ts, ts)
     const jobId = String(created.lastInsertRowid)
-    this._imports.set(jobId, { lines, next: 0, added: 0, skipped: 0, errors: 0, total: lines.length, identity: q?.identity || {} })
+    this._imports.set(jobId, {
+      lines, next: 0, added: 0, skipped: 0, errors: 0, kept: 0, splitLines: 0,
+      reasons: {}, errorDetails: [], total: lines.length, identity: q?.identity || {}, failed: false,
+    })
     this._runImport(jobId)
     return { ok: true, async: true, jobId, total: lines.length }
   }
 
+  /** 按批推进异步导入（每批 50 行；FTS 闸门不一致则整批回滚并终止，不继续污染索引）。 */
   _runImport(jobId) {
     const job = this._imports.get(jobId)
     if (!job || this.closed) return
     const db = this._db()
     db.prepare("UPDATE jobs SET state='running', updated_at=? WHERE id=?").run(now(), Number(jobId))
     const ident = job.identity || {}
-    const insert = db.prepare(`INSERT INTO nodes
-      (id,text,text_hash,text_bigrams,level,memory_type,source,status,role_id,user_id,workspace,tags,
-       context_note,weight,hits,vector_state,origin,trace_id,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,?,'active',?,?,?,?,?,1,0,'none',?,?,?,?)`)
-    const exists = db.prepare("SELECT 1 FROM nodes WHERE text_hash=? AND user_id=? AND role_id=? AND workspace=? AND status='active' LIMIT 1")
+    const ts = now()
+    const insert = db.prepare(IMPORT_INSERT_SQL)
+    const exists = db.prepare('SELECT 1 FROM nodes WHERE text_hash=? AND user_id=? AND role_id=? AND workspace=? LIMIT 1')
     const batch = job.lines.slice(job.next, job.next + 50)
+    const batchStart = job.next
     job.next += batch.length
+
+    /** @type {Array<{ node: object, split: boolean }>} */
+    const items = []
+    batch.forEach((line, i) => {
+      const index = batchStart + i
+      let row
+      try {
+        row = JSON.parse(line)
+      } catch {
+        job.errors += 1
+        job.reasons.invalid_json = (job.reasons.invalid_json || 0) + 1
+        if (job.errorDetails.length < ERROR_DETAIL_LIMIT) {
+          job.errorDetails.push({ index, reason: 'invalid_json', text_hash: contentHash(line).slice(0, 12) })
+        }
+        return
+      }
+      const plan = planImportRows(row, ident, { ts, seq: index })
+      if (plan.kind === 'error') {
+        job.errors += 1
+        job.reasons[plan.reason] = (job.reasons[plan.reason] || 0) + 1
+        if (job.errorDetails.length < ERROR_DETAIL_LIMIT) {
+          job.errorDetails.push({ index, reason: plan.reason, text_hash: plan.textHash.slice(0, 12) })
+        }
+        return
+      }
+      if (plan.split) job.splitLines += 1
+      else job.kept += 1
+      for (const node of plan.rows) items.push({ node, split: plan.split === true })
+    })
+
     try {
       db.exec('BEGIN IMMEDIATE')
-      for (const line of batch) {
-        let row
-        try { row = JSON.parse(line) } catch { job.errors += 1; continue }
-        const text = normalize(String(row?.text || ''))
-        if (!text || text.length > 500) { job.errors += 1; continue }
-        const hash = contentHash(text)
-        const u = String(row?.user_id ?? ident.userId ?? '')
-        const r = String(row?.role_id ?? ident.roleId ?? '')
-        const w = String(row?.workspace ?? ident.workspace ?? '')
-        if (exists.get(hash, u, r, w)) { job.skipped += 1; continue }
-        insert.run(
-          String(row?.id || '') || `n${Date.now()}_${hash.slice(0, 10)}_${job.added}`,
-          text, hash, bigrams(text), row?.level || 'normal', row?.memory_type || 'semantic', row?.source || 'import',
-          r, u, w, JSON.stringify(Array.isArray(row?.tags) ? row.tags : []), '',
-          String(row?.origin || 'import'), String(row?.trace_id || ''),
-          Number(row?.created_at) || now(), Number(row?.updated_at) || now(),
-        )
-        job.added += 1
+      const { added, skipped } = landImportRows(db, items, { insert, exists })
+      if (!ftsAligned(db)) {
+        db.exec('ROLLBACK')
+        job.failed = true
+        job.errors += items.length
+        job.reasons.fts_misaligned = (job.reasons.fts_misaligned || 0) + 1
+        if (job.errorDetails.length < ERROR_DETAIL_LIMIT) {
+          job.errorDetails.push({ index: batchStart, reason: 'fts_misaligned', text_hash: '' })
+        }
+      } else {
+        db.exec('COMMIT')
+        job.added += added
+        job.skipped += skipped
       }
-      db.exec('COMMIT')
     } catch (err) {
       try { db.exec('ROLLBACK') } catch { /* noop */ }
       job.errors += batch.length
       this.log(`[whale-memory] import batch fail: ${err?.message || err}`)
     }
-    const payload = JSON.stringify({ total: job.total, added: job.added, skipped: job.skipped, errors: job.errors })
-    const done = job.next >= job.total
+
+    const payload = JSON.stringify({
+      total: job.total, added: job.added, skipped: job.skipped, errors: job.errors,
+      kept: job.kept, split: job.splitLines, rejected: job.errors,
+      reasons: job.reasons, error_details: job.errorDetails,
+    })
+    const done = job.failed || job.next >= job.total
     db.prepare('UPDATE jobs SET state=?, payload=?, last_error=?, updated_at=? WHERE id=?')
-      .run(done ? 'done' : 'running', payload, job.errors ? 'partial_errors' : null, now(), Number(jobId))
+      .run(
+        job.failed ? 'failed' : done ? 'done' : 'running',
+        payload,
+        job.failed ? 'fts_misaligned' : job.errors ? 'partial_errors' : null,
+        now(), Number(jobId),
+      )
     if (done) { this._imports.delete(jobId); return }
     setImmediate(() => this._runImport(jobId))
   }

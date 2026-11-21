@@ -13,6 +13,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { openDb, closeDb, now } from '../src/core/db.js'
 import { bigrams, contentHash } from '../src/core/tokenize.js'
+import { Config } from '../src/host/config.js'
 import {
   contradiction, createWriteQueue, decideWrite, privacyCheck, processEvent,
   recordWrite, slotsOf, timeOverlap,
@@ -413,4 +414,244 @@ test('review：accept 落节点并改审计为 ADD；reject 改 REJECT；找不�
   assert.deepEqual(q.review(999999, 'accept'), { ok: false, error: 'candidate_not_found' })
   assert.deepEqual(q.review(candidate.id, 'accept'), { ok: false, error: 'candidate_not_found' })
   assert.equal(Number(db.prepare('SELECT count(*) AS n FROM nodes').get().n), 1)
+})
+
+// ---------------------------------------------------------------------------
+// 审计缺陷回归（P0）：Ref 解包 / 来源升级 / 保护面合并 / 影子载荷 / origin 复写
+// ---------------------------------------------------------------------------
+
+test('Ref 解包：真实 Config 的 reviewMode/maxChars/dailyCap 在 writer 生效', (t) => {
+  const db = freshDb(t)
+  const cfg = new Config({ write: { reviewMode: 'auto', maxChars: 20, dailyCap: 1 } })
+
+  // maxChars=20：21 字必须拒绝（Ref 未解包时 finite(Ref) 恒 NaN → 上限恒 500）
+  const tooLong = processEvent(db, event('x'.repeat(21)), cfg)
+  assert.equal(tooLong.action, 'REJECT')
+  assert.equal(tooLong.reason, 'text_too_long')
+
+  // reviewMode=auto：真落库（Ref 未解包时恒 shadow → CANDIDATE）
+  const first = processEvent(db, event('y'.repeat(20)), cfg)
+  assert.equal(first.ok, true)
+  assert.equal(first.action, 'ADD')
+  assert.equal(Number(db.prepare('SELECT count(*) AS n FROM nodes').get().n), 1)
+
+  // dailyCap=1：第二条新事实拒绝
+  const capped = processEvent(db, event('z'.repeat(20)), cfg)
+  assert.equal(capped.action, 'REJECT')
+  assert.equal(capped.reason, 'daily_cap')
+
+  // 默认 Config 仍是保守 shadow（不能因为解包把默认值弄丢）
+  const shadowDb = freshDb(t)
+  const shadow = processEvent(shadowDb, event('默认配置下的影子候选'), new Config({}))
+  assert.equal(shadow.action, 'CANDIDATE')
+  assert.equal(Number(shadowDb.prepare('SELECT count(*) AS n FROM nodes').get().n), 0)
+})
+
+test('NOOP → 来源升级：web 先写、owner 再写同文 → source 升 owner 且审计 source_upgrade', (t) => {
+  const db = freshDb(t)
+  const text = '同一事实但来源可信度不同'
+  const web = processEvent(db, event(text, { source: 'web' }), auto())
+  assert.equal(web.action, 'ADD')
+  assert.equal(db.prepare('SELECT source FROM nodes WHERE id=?').get(web.id).source, 'web')
+
+  const owner = processEvent(db, event(text, { source: 'owner' }), auto())
+  assert.equal(owner.action, 'MERGE')
+  assert.equal(owner.reason, 'source_upgrade')
+  assert.equal(owner.id, web.id, '来源升级是原地更新，不新增节点')
+  assert.equal(Number(db.prepare('SELECT count(*) AS n FROM nodes').get().n), 1)
+  assert.equal(db.prepare('SELECT source FROM nodes WHERE id=?').get(web.id).source, 'owner')
+
+  const write = db.prepare('SELECT action,reason,before_text,after_text,node_id FROM writes ORDER BY id DESC LIMIT 1').get()
+  assert.equal(write.action, 'MERGE')
+  assert.equal(write.reason, 'source_upgrade')
+  assert.equal(write.node_id, web.id)
+  assert.equal(write.before_text, text)
+  assert.equal(write.after_text, text)
+
+  // 反向（owner 先、web 后）不得降级：仍是 NOOP
+  const db2 = freshDb(t)
+  const ownerFirst = processEvent(db2, event('owner 事实不允许被降级', { source: 'owner' }), auto())
+  const webAfter = processEvent(db2, event('owner 事实不允许被降级', { source: 'web' }), auto())
+  assert.equal(webAfter.action, 'NOOP')
+  assert.equal(webAfter.reason, 'duplicate')
+  assert.equal(db2.prepare('SELECT source FROM nodes WHERE id=?').get(ownerFirst.id).source, 'owner')
+
+  // web 与 tool 同级（架构书 §6.3）：同级不算升级，仍 NOOP
+  const db3 = freshDb(t)
+  processEvent(db3, event('web 与 tool 同级不升级', { source: 'web' }), auto())
+  const toolAfter = processEvent(db3, event('web 与 tool 同级不升级', { source: 'tool' }), auto())
+  assert.equal(toolAfter.action, 'NOOP')
+  assert.equal(db3.prepare('SELECT source FROM nodes WHERE id=?').get(toolAfter.id).source, 'web')
+})
+
+test('MERGE 保护面：core 节点不被自动改写，改走 REVIEW(protected_merge)+mutex', (t) => {
+  const db = freshDb(t)
+  const oldText = '生产库连接池上限设置为 200 并开启慢查询日志与连接复用'
+  const newText = `${oldText}功能`
+  const old = processEvent(db, event(oldText, { level: 'core' }), auto())
+
+  const r = processEvent(db, event(newText), auto())
+  assert.equal(r.action, 'REVIEW')
+  assert.match(r.reason, /protected_merge/)
+
+  const oldRow = db.prepare('SELECT text,status FROM nodes WHERE id=?').get(old.id)
+  assert.equal(oldRow.text, oldText, '旧节点正文一行不动')
+  assert.equal(oldRow.status, 'active')
+  assert.equal(db.prepare('SELECT status FROM nodes WHERE id=?').get(r.id).status, 'active')
+  const edge = db.prepare("SELECT * FROM edges WHERE etype='mutex' AND from_id=? AND to_id=?").get(old.id, r.id)
+  assert.ok(edge, '保护面合并必须留下 mutex 告警边')
+
+  const write = db.prepare('SELECT action,reason,payload FROM writes ORDER BY id DESC LIMIT 1').get()
+  assert.equal(write.action, 'REVIEW')
+  assert.match(write.reason, /protected_merge/)
+  assert.equal(JSON.parse(write.payload).targetId, old.id, 'REVIEW 必须保留被保护的 targetId')
+
+  // protect=false 时同样的文本回到普通 MERGE
+  const db2 = freshDb(t)
+  const old2 = processEvent(db2, event(oldText, { level: 'core' }), auto())
+  const merged = processEvent(db2, event(newText), auto({ protect: false }))
+  assert.equal(merged.action, 'MERGE')
+  assert.equal(merged.id, old2.id)
+})
+
+test('shadow 载荷：accept 还原 source/memory_type/tags/expired_at', (t) => {
+  const db = freshDb(t)
+  const shadow = { write: { reviewMode: 'shadow' } }
+  const q = createWriteQueue({ store: storeOf(db), config: shadow })
+  t.after(() => q.dispose())
+
+  const expires = now() + 3600
+  const r = processEvent(db, event('影子候选里的网页摘要', {
+    source: 'web', memory_type: 'episodic', tags: ['网页', '摘要'], expired_at: expires,
+  }), shadow)
+  assert.equal(r.action, 'CANDIDATE')
+
+  const candidate = db.prepare("SELECT * FROM writes WHERE action='CANDIDATE' ORDER BY id DESC LIMIT 1").get()
+  const payload = JSON.parse(candidate.payload)
+  assert.equal(payload.source, 'web')
+  assert.equal(payload.memory_type, 'episodic')
+  assert.deepEqual(payload.tags, ['网页', '摘要'])
+  assert.equal(payload.shadowOf, 'ADD')
+  assert.equal(payload.targetId, null)
+  assert.equal(Number(payload.expired_at), expires)
+
+  const accepted = q.review(candidate.id, 'accept')
+  assert.equal(accepted.ok, true)
+  const node = db.prepare('SELECT * FROM nodes WHERE id=?').get(accepted.id)
+  assert.equal(node.text, '影子候选里的网页摘要')
+  assert.equal(node.source, 'web')
+  assert.equal(node.memory_type, 'episodic')
+  assert.deepEqual(JSON.parse(node.tags), ['网页', '摘要'])
+  assert.equal(Number(node.expired_at), expires, 'TTL 必须随载荷还原')
+  assert.equal(node.origin, 'shadow-review')
+  assert.equal(node.user_id, 'u1')
+  assert.equal(node.workspace, 'web')
+})
+
+test('shadow SUPERSEDE：accept 后旧节点失效、双时态齐备并有 supersede 边', (t) => {
+  const db = freshDb(t)
+  const shadow = { write: { reviewMode: 'shadow' } }
+  const q = createWriteQueue({ store: storeOf(db), config: shadow })
+  t.after(() => q.dispose())
+
+  const old = processEvent(db, event('项目部署在测试环境 端口是 8080'), auto())
+  const candidateRun = processEvent(db, event('项目部署在测试环境 端口是 9090'), shadow)
+  assert.equal(candidateRun.action, 'CANDIDATE')
+
+  const candidate = db.prepare("SELECT * FROM writes WHERE action='CANDIDATE' ORDER BY id DESC LIMIT 1").get()
+  const payload = JSON.parse(candidate.payload)
+  assert.equal(payload.shadowOf, 'SUPERSEDE')
+  assert.equal(payload.targetId, old.id)
+
+  const accepted = q.review(candidate.id, 'accept')
+  assert.equal(accepted.ok, true)
+  assert.notEqual(accepted.id, old.id)
+
+  const oldRow = db.prepare('SELECT status,invalid_at,expired_at,superseded_by FROM nodes WHERE id=?').get(old.id)
+  assert.equal(oldRow.status, 'superseded')
+  assert.ok(Number(oldRow.invalid_at) > 0)
+  assert.ok(Number(oldRow.expired_at) > 0)
+  assert.equal(oldRow.superseded_by, accepted.id)
+  const edge = db.prepare("SELECT * FROM edges WHERE etype='supersede' AND from_id=? AND to_id=?").get(old.id, accepted.id)
+  assert.ok(edge, 'shadow SUPERSEDE 接受后必须补 supersede 边')
+
+  const after = db.prepare('SELECT action,node_id FROM writes WHERE id=?').get(candidate.id)
+  assert.equal(after.action, 'SUPERSEDE')
+  assert.equal(after.node_id, accepted.id)
+})
+
+test('shadow MERGE：目标已被标为核心 → accept 拒绝 protected_target 且不落库', (t) => {
+  const db = freshDb(t)
+  const shadow = { write: { reviewMode: 'shadow' } }
+  const q = createWriteQueue({ store: storeOf(db), config: shadow })
+  t.after(() => q.dispose())
+
+  const oldText = '生产库连接池上限设置为 200 并开启慢查询日志与连接复用'
+  const newText = `${oldText}功能`
+  const old = processEvent(db, event(oldText), auto())
+  const r = processEvent(db, event(newText), shadow)
+  assert.equal(r.action, 'CANDIDATE')
+  const candidate = db.prepare("SELECT * FROM writes WHERE action='CANDIDATE' ORDER BY id DESC LIMIT 1").get()
+  assert.equal(JSON.parse(candidate.payload).shadowOf, 'MERGE')
+
+  db.prepare("UPDATE nodes SET level='core' WHERE id=?").run(old.id)
+  const rejected = q.review(candidate.id, 'accept')
+  assert.deepEqual({ ok: rejected.ok, error: rejected.error }, { ok: false, error: 'protected_target' })
+  assert.equal(db.prepare('SELECT text FROM nodes WHERE id=?').get(old.id).text, oldText)
+  assert.equal(db.prepare('SELECT action FROM writes WHERE id=?').get(candidate.id).action, 'CANDIDATE')
+})
+
+test('origin 复写：同身份同 origin 不同摘要 → MERGE 更新正文并续 TTL；跨 origin/分区不合并', (t) => {
+  const db = freshDb(t)
+  const origin = 'tool:web_search#0123456789abcdef'
+  const firstTtl = now() + 3600
+  const nextTtl = firstTtl + 7200
+
+  const first = processEvent(db, event('同查询摘要第一版', {
+    origin, source: 'tool', memory_type: 'episodic', expired_at: firstTtl,
+  }), auto())
+  assert.equal(first.action, 'ADD')
+
+  const second = processEvent(db, event('同查询摘要第二版更完整', {
+    origin, source: 'tool', memory_type: 'episodic', expired_at: nextTtl,
+  }), auto())
+  assert.equal(second.action, 'MERGE')
+  assert.equal(second.reason, 'origin_merge')
+  assert.equal(second.id, first.id)
+  const node = db.prepare('SELECT text,expired_at,status FROM nodes WHERE id=?').get(first.id)
+  assert.equal(node.text, '同查询摘要第二版更完整')
+  assert.equal(Number(node.expired_at), nextTtl, '同 origin 复写必须续 TTL')
+  assert.equal(node.status, 'active')
+  assert.equal(Number(db.prepare("SELECT count(*) AS n FROM nodes WHERE status='active'").get().n), 1)
+  const audit = db.prepare('SELECT action,reason,node_id FROM writes ORDER BY id DESC LIMIT 1').get()
+  assert.equal(audit.action, 'MERGE')
+  assert.equal(audit.reason, 'origin_merge')
+  assert.equal(audit.node_id, first.id)
+
+  // 同 origin 且文本完全相同时也走 MERGE（优先级高于同 hash NOOP），不新增节点
+  const third = processEvent(db, event('同查询摘要第二版更完整', {
+    origin, source: 'tool', memory_type: 'episodic', expired_at: nextTtl + 1,
+  }), auto())
+  assert.equal(third.action, 'MERGE')
+  assert.equal(third.id, first.id)
+  assert.equal(Number(db.prepare('SELECT count(*) AS n FROM nodes').get().n), 1)
+
+  // 不同 origin：不合并
+  const db2 = freshDb(t)
+  processEvent(db2, event('摘要甲', { origin: 'tool:web_search#aaaaaaaaaaaaaaaa', source: 'tool' }), auto())
+  const other = processEvent(db2, event('摘要乙', { origin: 'tool:web_search#bbbbbbbbbbbbbbbb', source: 'tool' }), auto())
+  assert.equal(other.action, 'ADD')
+  assert.equal(Number(db2.prepare("SELECT count(*) AS n FROM nodes WHERE status='active'").get().n), 2)
+
+  // 跨 workspace：同 origin 也不合并
+  const db3 = freshDb(t)
+  const web = processEvent(db3, event('跨分区同 origin 摘要', {
+    origin, source: 'tool', identity: { userId: 'u1', roleId: '', workspace: 'web' },
+  }), auto())
+  assert.equal(web.action, 'ADD')
+  const qq = processEvent(db3, event('跨分区同 origin 摘要', {
+    origin, source: 'tool', identity: { userId: 'u1', roleId: '', workspace: 'qq' },
+  }), auto())
+  assert.equal(qq.action, 'ADD')
+  assert.equal(Number(db3.prepare("SELECT count(*) AS n FROM nodes WHERE status='active'").get().n), 2)
 })

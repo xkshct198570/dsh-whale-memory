@@ -43,3 +43,51 @@ test('开关关闭 / 非搜索工具不写', async () => {
   await new Promise((r) => setTimeout(r, 10))
   assert.equal(n, 0)
 })
+
+test('advanced_search 触发；origin = tool:web_search#sha256(查询+本地日期)，同 key 重复事件同 origin', async () => {
+  const { ctx, state } = fakeCtx()
+  const writes = []
+  installSearchFeed(ctx, {
+    backend: { async write(q) { writes.push(q); return { ok: true, id: `n${writes.length}` } } }, config,
+  })
+  const exec = { name: 'advanced_search', callId: 'c2', arguments: { query: '潮州天气' } }
+  state['tools/result'](exec, { value: { answer: '多云 26 度' } })
+  state['tools/result'](exec, { value: { answer: '多云转晴 27 度' } })
+  state['tools/result']({ name: 'advanced_search', arguments: { query: '潮州美食' } }, { value: { answer: '牛肉丸' } })
+  await new Promise((r) => setTimeout(r, 10))
+
+  assert.equal(writes.length, 3, 'advanced_search 必须在白名单里')
+  for (const w of writes) {
+    // 16 位 hex 是跨进程稳定的去重键，backend/writer 依此复用同一节点。
+    assert.match(w.origin, /^tool:web_search#[0-9a-f]{16}$/)
+    assert.deepEqual(w.tags.slice(0, 1), ['web_search'])
+  }
+  assert.ok(writes[0].tags.includes('潮州天气'), 'tags 必须带查询词')
+  assert.equal(writes[0].origin, writes[1].origin, '同查询同日必须撞同一个 key')
+  assert.notEqual(writes[0].origin, writes[2].origin, '不同查询必须不同 key')
+})
+
+test('research 单独也认；长摘要逐条 ≤80 字、整体仍 ≤200', async () => {
+  const { ctx, state } = fakeCtx()
+  const writes = []
+  installSearchFeed(ctx, { backend: { async write(q) { writes.push(q); return { ok: true, id: 'n1' } } }, config })
+  state['tools/result']({ name: 'research', callId: 'c3', arguments: { query: '长摘要测试' } }, {
+    value: {
+      answer: 'A'.repeat(200),
+      sources: [
+        { title: 'T'.repeat(30), snippet: 'S'.repeat(200) },
+        { title: '第二来源', snippet: 'B'.repeat(120) },
+        { title: '第三来源', snippet: 'C'.repeat(120) },
+      ],
+    },
+  })
+  await new Promise((r) => setTimeout(r, 10))
+
+  assert.equal(writes.length, 1, 'research 工具必须触发反哺')
+  const w = writes[0]
+  assert.ok(w.text.length <= 200)
+  const body = w.text.replace(/^搜索「[^」]*」：/, '')
+  const parts = body.split('；')
+  assert.ok(parts.length >= 2, 'answer 与 source 摘要必须分段')
+  for (const part of parts) assert.ok(part.length <= 80, `单条摘要 ${part.length} 字超 80：${part}`)
+})

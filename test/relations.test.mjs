@@ -120,6 +120,8 @@ test('1 跳扩散：只沿 topic/reference，conf 过门；mutex 与 supersede �
     assert.equal(ids.includes(mutex), false)
     assert.equal(ids.includes(old), false)
     assert.equal(out[0].hops, 1)
+    // search.js 的扩散分要乘这条边置信，expandOneHop 必须把它带出来。
+    assert.equal(Number(out[0].via_conf), 0.7)
     const strict = expandOneHop(db, { seeds: [{ id: seed }], minConf: 0.95, identity: ident })
     assert.equal(strict.length, 0)
   } finally { closeDb(db) }
