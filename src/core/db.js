@@ -9,6 +9,7 @@
  */
 import { mkdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
+import { homedir } from 'node:os'
 import { DatabaseSync } from 'node:sqlite'
 import { ensureSchema } from './schema.js'
 
@@ -23,7 +24,7 @@ const BUSY_TIMEOUT_MS = 5000
  */
 export function openDb(dataDir, { readOnly = false } = {}) {
   const raw = String(dataDir ?? '').trim()
-  const dir = raw ? resolve(raw) : join(process.env.DSH_HOME || process.cwd(), 'whale-memory')
+  const dir = raw ? resolve(raw) : join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'whale-memory')
 
   if (!readOnly) mkdirSync(dir, { recursive: true })
 

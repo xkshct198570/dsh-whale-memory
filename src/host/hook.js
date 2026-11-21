@@ -9,6 +9,7 @@
  * dispose 时中止在途、清缓存、返回空文本；任何失败只记日志，绝不抛。
  */
 import { resolveIdentity } from './identity.js'
+import { bool, num } from './config-values.js'
 
 export const CONTEXT_NAME = 'whale-memory:recall'
 export const CONTEXT_ORDER = 100
@@ -55,14 +56,14 @@ export function installHook(ctx, { backend, config, getIdentityCfg = () => confi
   const inflight = new Set()
   let disposed = false
 
-  const timeoutMs = Number(config?.recall?.timeoutMs || 2000)
+  const timeoutMs = num(config?.recall?.timeoutMs, 2000)
 
   const onPreStep = async (payload, next) => {
     const decision = await next()
     try {
       if (disposed) return decision
       if (!decision || decision.kind !== 'enter') return decision
-      if (config?.recall?.enabled === false) return decision
+      if (!bool(config?.recall?.enabled, true)) return decision
       const agent = payload?.agent
       const sessionId = agent?.session?.id
       if (!sessionId) return decision
@@ -83,7 +84,8 @@ export function installHook(ctx, { backend, config, getIdentityCfg = () => confi
         const started = Date.now()
         const result = await backend.recall({
           query,
-          maxHits: Number(config?.recall?.maxHits ?? 5),
+          maxHits: num(config?.recall?.maxHits, 5),
+          minRel: num(config?.recall?.minRel, 0.34),
           identity: ident.identity,
         }, ac.signal)
         if (result && typeof result.prefix === 'string' && result.prefix) {

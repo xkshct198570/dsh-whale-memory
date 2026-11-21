@@ -9,6 +9,7 @@ import { createRoutes, PREFIX } from './src/host/routes.js'
 import { installHook } from './src/host/hook.js'
 import { createBackend } from './src/core/backend.js'
 import { Config } from './src/host/config.js'
+import { bool } from './src/host/config-values.js'
 
 export { Config }
 export const inject = ['webServer', 'systemPrompt']
@@ -19,7 +20,7 @@ export function apply(ctx, config) {
   const backend = createBackend(config?.backend, {
     log,
     dataDir: config?.dataDir || '',
-    useWorker: config?.advanced?.worker !== false,
+    useWorker: bool(config?.advanced?.worker, true),
   })
 
   // 外部角色插件可选的"身份提示"：A 只存 role_id/workspace/user_id，不理解角色语义。

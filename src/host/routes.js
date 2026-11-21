@@ -9,6 +9,7 @@
 import { Buffer } from 'node:buffer'
 import { clamp, isLoopback, readJson, sendJson } from './http-kit.js'
 import { resolveIdentity } from './identity.js'
+import { bool, num, value } from './config-values.js'
 
 const PREFIX = '/whale-memory/api'
 
@@ -37,7 +38,7 @@ function sendMethodNotAllowed(res, allow) {
 
 /** @param {{ config: any, backend: any, log?: (s:string)=>void }} deps */
 export function createRoutes({ config, backend, getIdentityCfg = () => config?.identity, ctx, log = () => {} }) {
-  const allowRemote = Boolean(config?.panel?.allowRemote)
+  const allowRemote = bool(config?.panel?.allowRemote, false)
 
   return async function handle(req, res) {
     const addr = req.socket?.remoteAddress
@@ -316,11 +317,18 @@ export function createRoutes({ config, backend, getIdentityCfg = () => config?.i
 /** 配置回显只给面板需要的字段，不把内部对象原样吐出。 */
 function redact(config) {
   return {
-    backend: { mode: config?.backend?.mode, url: config?.backend?.url, timeoutMs: config?.backend?.timeoutMs },
+    backend: { mode: value(config?.backend?.mode, 'local'), url: value(config?.backend?.url, ''), timeoutMs: num(config?.backend?.timeoutMs, 3000) },
     identity: { ...config?.identity },
-    recall: { ...config?.recall },
-    panel: { allowRemote: config?.panel?.allowRemote, pollMs: config?.panel?.pollMs },
-    advanced: { logLevel: config?.advanced?.logLevel },
+    recall: {
+      enabled: bool(config?.recall?.enabled, true),
+      maxHits: num(config?.recall?.maxHits, 5),
+      charBudget: num(config?.recall?.charBudget, 1500),
+      minRel: num(config?.recall?.minRel, 0.34),
+      timeoutMs: num(config?.recall?.timeoutMs, 2000),
+    },
+    write: { enabled: bool(config?.write?.enabled, true), reviewMode: value(config?.write?.reviewMode, 'shadow') },
+    panel: { allowRemote: bool(config?.panel?.allowRemote, false), pollMs: num(config?.panel?.pollMs, 60000) },
+    advanced: { logLevel: value(config?.advanced?.logLevel, 'warn'), worker: bool(config?.advanced?.worker, true) },
   }
 }
 
