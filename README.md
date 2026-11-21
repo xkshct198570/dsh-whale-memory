@@ -13,5 +13,5 @@
 - 默认本地 `node:sqlite`，零运行时第三方依赖；外部服务是可选后端。
 - 检索/打分在 `worker_threads` 中执行，主线程不跑大批量 SQL。
 - 记忆身份按 `user_id / role_id / workspace` 三元隔离；本包不注入人设、不做对话，只认身份键。
-- 网页端人设由 `dsh-persona-hub` 注入；切换角色时后者只向本包发 `role_id/workspace` 提示。
+- 本包只认身份键（`user_id / role_id / workspace`）；角色资产与网页端展示由独立插件负责，切换时只向本包发身份提示。
 - 面板 API 默认只接受回环请求。
