@@ -1,15 +1,40 @@
 /**
- * dsh-whale-memory Host 半（S1 骨架）。
+ * dsh-whale-memory Host 入口（S1）。
  *
- * 为什么这里只有自证日志：S1 只负责"包能装、行能挂、client 能注册"，
- * 记忆核心与路由按施工计划书 S2 起接线；提前塞半成品会违反"零封存死代码"。
+ * 职责边界（厂长令）：只做记忆的记与查；角色/人设/对话属于独立插件，本包零引用。
+ * S1 已接线：Config + 只读路由（stats/recent/search/recall-test）+ 召回注入 hook；
+ * 本地记忆核心在 S2，面板五页签在 S3。
  */
-export const inject = []
+import { createRoutes, PREFIX } from './src/host/routes.js'
+import { installHook } from './src/host/hook.js'
+import { createBackend } from './src/core/backend.js'
+import { Config } from './src/host/config.js'
 
-/** 挂载自证：DSH 重启后 grep 这一行即可确认 Host 半已加载。 */
-export function apply(ctx) {
+export { Config }
+export const inject = ['webServer', 'systemPrompt']
+
+const log = (line) => { try { console.log(line) } catch { /* log 永远不是故障点 */ } }
+
+export function apply(ctx, config) {
+  const backend = createBackend(config?.backend, { log })
+
+  // 外部角色插件可选的"身份提示"：A 只存 role_id/workspace/user_id，不理解角色语义。
+  let identityHint = null
+  const getIdentityCfg = () => (identityHint ? { ...config?.identity, ...identityHint } : config?.identity)
+  ctx.provide('whaleMemory', {
+    setIdentityHint(hint) { identityHint = hint && typeof hint === 'object' ? hint : null },
+    clearIdentityHint() { identityHint = null },
+  })
+
+  const handler = createRoutes({ config, backend, getIdentityCfg, log })
+
+  ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: PREFIX, handler }), 'whale-memory: routes')
+
+  let hook = null
   ctx.effect(() => {
-    console.log('[dsh-whale-memory] skeleton armed (S1)')
-    return () => console.log('[dsh-whale-memory] skeleton disposed (S1)')
-  }, 'whale-memory: skeleton')
+    hook = installHook(ctx, { backend, config, getIdentityCfg, log })
+    return () => hook?.dispose()
+  }, 'whale-memory: recall hook')
+
+  log(`[whale-memory] armed mode=${config?.backend?.mode || 'local'} backendReady=${Boolean(backend.ready)} hook=on`)
 }
