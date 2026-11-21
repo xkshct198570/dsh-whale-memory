@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Whale Memory",
+    "description": "Local long-term memory: nodes, recall and audit; local SQLite by default, optional external service."
+  }
+}

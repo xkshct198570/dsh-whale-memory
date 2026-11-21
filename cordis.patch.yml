@@ -1,0 +1,5 @@
+# S1 骨架：bundle 只插入本包一行；config 由 Config schema 兜底默认值。
+- insert:
+    - id: whale-memory
+      name: dsh-whale-memory
+      config: {}
