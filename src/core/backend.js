@@ -28,7 +28,7 @@ import { HybridBackend } from './hybrid.js'
 
 const NODE_EXPORT_FIELDS = [
   'id', 'role_id', 'user_id', 'workspace', 'text', 'level', 'memory_type', 'source', 'status',
-  'tags', 'context_note', 'weight', 'hits', 'last_hit_at', 'vector_state',
+  'tags', 'context_note', 'weight', 'pinned', 'hits', 'last_hit_at', 'vector_state',
   'created_at', 'updated_at', 'valid_at', 'invalid_at', 'expired_at', 'superseded_by',
   'origin', 'trace_id', 'text_hash',
 ]
@@ -50,12 +50,13 @@ const ERROR_DETAIL_LIMIT = 20
 /**
  * 导入 INSERT：显式列出全部可保真字段（v1 导入写死 active/''/1/0/none 会让
  * superseded/archived/stale 在 export→import 后复活）。
+ * v3 起补 `pinned`：规则置顶是节点属性，导出/导入必须往返（旧 JSONL 缺列按 0）。
  */
 const IMPORT_INSERT_SQL = `INSERT INTO nodes
   (id,text,text_hash,text_bigrams,level,memory_type,source,status,role_id,user_id,workspace,tags,
-   context_note,weight,hits,last_hit_at,vector_state,origin,trace_id,valid_at,invalid_at,expired_at,
+   context_note,weight,pinned,hits,last_hit_at,vector_state,origin,trace_id,valid_at,invalid_at,expired_at,
    superseded_by,created_at,updated_at)
-  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
 
 /** 枚举回落。 @param {unknown} value @param {Set<string>} allowed @param {string} fallback */
 function pickEnum(value, allowed, fallback) {
@@ -230,6 +231,8 @@ function planImportRows(row, identity, { ts, seq }) {
     status: pickEnum(row?.status, NODE_STATUS, 'active'),
     context_note: String(row?.context_note ?? '').slice(0, 200),
     weight: finiteOr(row?.weight, 1),
+    // v3：置顶只接受 1/true；旧 JSONL 缺列按 0（不因导入把候选/事实意外顶上去）。
+    pinned: row?.pinned === 1 || row?.pinned === true ? 1 : 0,
     hits: Math.max(0, Math.floor(finiteOr(row?.hits, 0))),
     last_hit_at: timeOrNull(row?.last_hit_at),
     vector_state: pickEnum(row?.vector_state, VECTOR_STATES, 'none'),
@@ -316,7 +319,7 @@ function landImportRows(db, items, { insert, exists, dryRun = false }) {
         node.id, node.text, node.text_hash, node.text_bigrams,
         node.level, node.memory_type, node.source, node.status,
         node.role_id, node.user_id, node.workspace, node.tags,
-        node.context_note, node.weight, node.hits, node.last_hit_at,
+        node.context_note, node.weight, node.pinned, node.hits, node.last_hit_at,
         node.vector_state, node.origin, node.trace_id,
         node.valid_at, node.invalid_at, node.expired_at, node.superseded_by,
         node.created_at, node.updated_at,
@@ -663,6 +666,8 @@ export class LocalBackend {
       origin: String(q?.origin || 'panel'),
       level: q?.level || 'normal',
       memory_type: q?.memory_type || 'semantic',
+      // v3：规则置顶随事件下传（writer 落库；默认 0，不改变既有写入口行为）。
+      pinned: q?.pinned === 1 || q?.pinned === true ? 1 : 0,
       expired_at: Number.isFinite(Number(q?.expired_at)) ? Number(q.expired_at) : undefined,
     }
     const res = await this._writer().enqueue(event)
@@ -791,6 +796,30 @@ export class LocalBackend {
       `SELECT ${NODE_EXPORT_FIELDS.join(',')} FROM nodes${filter.sql} ORDER BY created_at, id`,
     ).all(...filter.params)
     return rows.map((r) => JSON.stringify(r)).join('\n') + (rows.length ? '\n' : '')
+  }
+
+  /**
+   * 置顶规则（schema v3；R4 每会话首次注入的数据入口）。
+   *
+   * 口径：
+   * - 只取 `status='active' AND pinned=1`：退役（superseded）与归档规则不得再注入。
+   * - 身份/作用域走 `whereOf` 的 `(列='' OR 列=?)`：规则默认共享（''），可整条限定工作区；
+   *   `''` 始终可见，所以共享规则在任何会话都会带上。
+   * - 排序 weight（显式/高置信优先）→ updated_at（最近改动优先）→ created_at，结果稳定可测。
+   * - 上限只做硬保护（1..100），预算裁剪（条数/字符）由 R4 的注入层负责，这里不静默丢。
+   *
+   * @param {Identity|null|undefined} identity 会话身份
+   * @param {{ limit?: number }} [opts]
+   * @returns {Promise<object[]>} 节点行（字段同导出，含 pinned）
+   */
+  async pinnedRules(identity, { limit = 20 } = {}) {
+    const db = this._db()
+    const max = Math.max(1, Math.min(100, Number(limit) || 20))
+    const where = whereOf(identity, [["status='active'", []], ['pinned=1', []]])
+    return db.prepare(
+      `SELECT ${NODE_EXPORT_FIELDS.join(',')} FROM nodes${where.sql}
+       ORDER BY weight DESC, updated_at DESC, created_at DESC LIMIT ?`,
+    ).all(...where.params, max)
   }
 
   /**
@@ -1247,6 +1276,11 @@ export class HttpBackend {
   }
 
   async stats(opts = {}) { return this.request('/stats', callOpts(opts)) }
+  /**
+   * 置顶规则在外部协议里没有端点：规则语义只存在于本地库（R1 设计）。
+   * 返回 null 让 Hybrid 回退本地真源；直接调用方拿到 null 即"无规则"。
+   */
+  async pinnedRules() { return null }
   async recent(limit, opts = {}) {
     const { signal, ...rest } = callOpts(opts)
     return this.request(`/recent?limit=${encodeURIComponent(limit)}`, { signal, ...rest })

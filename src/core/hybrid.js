@@ -227,6 +227,22 @@ export class HybridBackend {
     return remote || this.local.recall(q, opts)
   }
 
+  /**
+   * 置顶规则只读本地真源：外部记忆服务协议里没有规则/置顶语义（R1 设计），
+   * 远端即便有 stats 也不参与注入，避免"远端空表把本地规则清空"。
+   * @param {{userId?:string, roleId?:string, workspace?:string}} identity
+   * @param {{limit?:number}} [opts]
+   */
+  async pinnedRules(identity, opts = {}) {
+    if (typeof this.local.pinnedRules !== 'function') return []
+    try {
+      return await this.local.pinnedRules(identity, opts)
+    } catch (err) {
+      this.log(`[whale-memory] pinnedRules fail-open: ${err?.message || err}`)
+      return []
+    }
+  }
+
   /** 采纳回写回到上次 recall 的同一侧；远端实现没有该接口时退回本地（返回 ok:false，不抛）。 */
   markRecallUsed(recallId, used = true) {
     if (this._lastRecall === 'http' && typeof this.http?.markRecallUsed === 'function') {

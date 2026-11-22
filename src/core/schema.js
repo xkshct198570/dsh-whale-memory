@@ -1,8 +1,13 @@
 /**
- * schema v2（数据层唯一真源）：DDL 全量、幂等。
+ * schema v3（数据层唯一真源）：DDL 全量、幂等。
  *
  * 设计约束（与架构书 §4.1/§4.2 一致）：
  * - 加法演进：v1 之后只允许 ALTER TABLE ADD COLUMN / 新建表，禁改既有列语义。
+ * - v3（2026-11-22，规则置顶）：nodes 只加 `pinned INTEGER NOT NULL DEFAULT 0` 一列 + 索引；
+ *   不重建表、不动 FTS。规则仍是 nodes 行（level=core / memory_type=procedural /
+ *   origin=rule:<key>），pinned=1 表示每会话首次注入。为什么加列而不是另开表：
+ *   置顶是节点自身的属性，跨表 JOIN 会让导出/导入/面板/检索全部多一层，且规则与事实
+ *   的边界已经能由既有列表达（架构书 §3.2）。
  * - v2 只做一件事：writes 增加 payload TEXT，保存影子候选的决策载荷（等级/类型/tags/来源/双时态/
  *   shadowOf/targetId）。为什么必须落库：影子模式下 nodes 一行不写，审核 accept 时若只能拿到
  *   after_text，就只能硬编码 normal/semantic/self，等于把"当时为什么这样判"丢掉了。
@@ -19,11 +24,16 @@
  * 任何写路径都不得绕过触发器直接改 FTS。
  */
 
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
 
-/** v2 对既有表的加法列：[表, 列, 类型]。迁移与 DDL 必须保持一致。 */
+/**
+ * 对既有表的加法列：[表, 列, 类型]。迁移与 DDL 必须保持一致。
+ * v1→v2：writes.payload（影子候选决策载荷）。
+ * v2→v3：nodes.pinned（规则置顶标记）。
+ */
 const ADDITIVE_COLUMNS = [
   ['writes', 'payload', 'TEXT'],
+  ['nodes', 'pinned', 'INTEGER NOT NULL DEFAULT 0'],
 ]
 
 export const DDL = `
@@ -56,6 +66,7 @@ CREATE TABLE IF NOT EXISTS nodes (
                 CHECK (length(context_note) <= 200),  -- 演化注记硬顶
   weight        REAL NOT NULL DEFAULT 1.0,
   hits          INTEGER NOT NULL DEFAULT 0,
+  pinned        INTEGER NOT NULL DEFAULT 0,          -- v3：规则置顶（每会话首次注入）
   last_hit_at   REAL,
   vector_state  TEXT NOT NULL DEFAULT 'none'
                 CHECK (vector_state IN ('none','pending','ready','failed')),
@@ -199,6 +210,12 @@ CREATE TABLE IF NOT EXISTS metrics (
 );
 `
 
+/**
+ * v3 索引单独建、且在迁移补列之后：旧库（v2）没有 pinned 列，
+ * 若把 idx_nodes_pinned 写进 DDL，`db.exec(DDL)` 会在 ALTER 之前先建索引而报 no such column。
+ */
+const PINNED_INDEX_SQL = 'CREATE INDEX IF NOT EXISTS idx_nodes_pinned ON nodes(pinned, status)'
+
 const UPSERT_META = 'INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
 
 /**
@@ -232,6 +249,7 @@ export function ensureSchema(db) {
     throw new Error(`schema_incompatible: db version ${current} > code version ${SCHEMA_VERSION}`)
   }
   migrateAdditiveColumns(db)
+  db.exec(PINNED_INDEX_SQL)
   db.prepare(UPSERT_META).run('schema_version', String(SCHEMA_VERSION))
   return { version: SCHEMA_VERSION }
 }

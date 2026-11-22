@@ -825,6 +825,8 @@ function validAtOf(event, ts) {
 function insertNodeRow(db, event, text, { ts, validAt, source, origin, level, memoryType, expiredAt }) {
   const ident = normalizeIdentity(event?.identity)
   const hash = contentHash(text)
+  // v3：规则置顶随事件下传；只有显式 1/true 才算置顶（导入/旧调用方默认 0）。
+  const pinned = event?.pinned === 1 || event?.pinned === true ? 1 : 0
   // id 由"毫秒时间 + hash 前 10 位"组成；同文本写进不同身份/分区可能落在同一毫秒，
   // 此时仅靠 hash 会撞主键。保持 id 形状不变（既有契约/面板正则），冲突时把毫秒数 +1 找空位。
   let at = Date.now()
@@ -835,11 +837,11 @@ function insertNodeRow(db, event, text, { ts, validAt, source, origin, level, me
   }
   db.prepare(`INSERT INTO nodes
     (id,text,text_hash,text_bigrams,level,memory_type,source,status,role_id,user_id,workspace,tags,
-     context_note,weight,hits,vector_state,origin,trace_id,valid_at,expired_at,created_at,updated_at)
-    VALUES (?,?,?,?,?,?,?,'active',?,?,?,?,?,1,0,'none',?,?,?,?,?,?)`).run(
+     context_note,weight,pinned,hits,vector_state,origin,trace_id,valid_at,expired_at,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,'active',?,?,?,?,?,1,?,0,'none',?,?,?,?,?,?)`).run(
     id, text, hash, bigrams(text), level, memoryType, source,
     ident.roleId, ident.userId, ident.workspace,
-    JSON.stringify(normalizeTags(event?.tags)), '',
+    JSON.stringify(normalizeTags(event?.tags)), '', pinned,
     origin, String(event?.traceId ?? ''),
     validAt, expiredAt, ts, ts,
   )
@@ -965,7 +967,8 @@ export function processEvent(db, event, config = {}) {
       if (action === 'SUPERSEDE') {
         // 旧值必须在 UPDATE 之前读：evolution 的 old_value 是"改之前"，不能拿新行反推。
         const before = db.prepare('SELECT status, text FROM nodes WHERE id=?').get(targetId) || {}
-        db.prepare(`UPDATE nodes SET status='superseded', invalid_at=?, expired_at=?, superseded_by=?, updated_at=?
+        // v3：规则退役必须同时取消置顶——superseded 的规则若 pinned 还留着，注入层会继续带它。
+        db.prepare(`UPDATE nodes SET status='superseded', pinned=0, invalid_at=?, expired_at=?, superseded_by=?, updated_at=?
           WHERE id=?`).run(ts, ts, newId, ts, targetId)
         linkSupersede(db, targetId, newId)
         // 所有改动留痕（§7.2）：状态迁移一条；正文被新事实替换时再补一条 text。
@@ -1064,7 +1067,8 @@ function acceptCandidate(db, row, text, payload, shadowOf, writeId) {
     const target = targetId ? db.prepare('SELECT id,status,text FROM nodes WHERE id=?').get(targetId) : null
     if (!target) return { ok: false, error: 'target_not_found' }
     const newId = insert()
-    db.prepare(`UPDATE nodes SET status='superseded', invalid_at=?, expired_at=?, superseded_by=?, updated_at=?
+    // 影子候选 accept 后的取代同样要让旧规则退顶（与 auto 路径一致）。
+    db.prepare(`UPDATE nodes SET status='superseded', pinned=0, invalid_at=?, expired_at=?, superseded_by=?, updated_at=?
       WHERE id=?`).run(ts, ts, newId, ts, targetId)
     linkSupersede(db, targetId, newId)
     // 影子候选 accept 后的取代与 auto 模式同构：状态迁移 + 正文替换都要留痕。
