@@ -578,3 +578,9 @@ test('设置页引用的 settings.* 键三语齐全（防拼错）', () => {
     }
   }
 })
+
+test('手动同步方向跟随 sync.mode（off 时按钮仍双向，不误当禁用手动）', () => {
+  assert.match(CLIENT, /setSyncDir\(modeDir === 'push' \|\| modeDir === 'pull' \|\| modeDir === 'both' \? modeDir : 'both'\)/, '未从 /config.sync.mode 初始化同步方向')
+  assert.match(CLIENT, /direction: syncDir, dryRun: true/, '预演未使用 syncDir')
+  assert.match(CLIENT, /direction: syncDir, dryRun: false, confirm: true/, '实跑未使用 syncDir')
+})
