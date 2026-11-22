@@ -192,15 +192,17 @@ test('git 状态条三态文案 + 安装指引含 brew/apt/winget/下载/快照�
   assert.ok(guide.includes("t('rules.gitGuideDownload')"), '安装指引缺少下载文案')
 })
 
-test('待确认区软降级：/rules/proposals 失败=空态，不报红', () => {
-  assert.ok(CLIENT.includes("callJson('/rules/proposals')"), '缺少提案请求')
+test('待确认区：404 软降级空态，其它失败给卡片内错误态与重试', () => {
+  assert.ok(CLIENT.includes("callJson('/rules/proposals?status=pending')"), '缺少提案请求')
   const view = sliceFrom('function RulesView(props) {', 'function RulesGitBar(props) {')
-  assert.match(view, /\.catch\(\(\) => \{\s*if \(alive\) setProposals\(\{ status: 'empty', items: \[\] \}\)/, '提案失败未软降级为 empty')
-  assert.ok(!view.includes("setProposals({ status: 'error'"), '提案失败被当成页面错误')
+  assert.ok(view.includes("err.code === 'not_found' || err.status === 404"), '404 未软降级为空态')
+  assert.ok(view.includes("setProposals({ status: 'empty', items: [] })"), '404 未回到空态')
+  assert.ok(view.includes("setProposals({ status: 'error', items: [], err })"), '非 404 失败未给错误态')
   const card = sliceFrom('function RulesProposalsCard(props) {', 'function RulesTable(props) {')
   assert.ok(card.includes("t('rules.proposalsEmpty')"), '缺少待确认空态文案')
-  assert.ok(!card.includes('css.error'), '待确认区不应报红')
+  assert.ok(card.includes("t('rules.proposalError')"), '缺少提案读取错误文案')
   assert.ok(card.includes("t('rules.proposalsTitle'"), '缺少「待确认 N 条」标题')
+  assert.ok(card.includes('onRetry'), '提案错误态缺少重试入口')
 })
 
 test('所有写操作二次确认，回滚/编辑 R3b 前 disabled + 说明', () => {
