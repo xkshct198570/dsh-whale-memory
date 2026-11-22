@@ -34,8 +34,9 @@ import { readJson, sendJson } from './http-kit.js'
 import { value } from './config-values.js'
 import { detectGit, gitRequired, refreshGit } from './git-detector.js'
 import {
-  DIFF_LINE_LIMIT, computeManifest, defaultRuleRoot, diffLines, ensureRuleRepo, gitLog,
-  isValidRuleKey, listRules, readHistory, readRule, resolveRevision, revertRule, updateRule,
+  DIFF_LINE_LIMIT, computeManifest, createRule, defaultRuleRoot, diffLines, ensureRuleRepo, gitLog,
+  isValidRuleKey, listRules, reactivateRule, readHistory, readRule, resolveRevision, retireRule,
+  revertRule, updateRule,
 } from '../core/rule-store.js'
 import { importLegacyRule, mirrorRules, mirrorStatus } from '../core/rule-mirror.js'
 import {
@@ -714,6 +715,177 @@ export function revertPayload({
 }
 
 /**
+ * 请求体身份归一（面板显式给了 identity 就用它，否则读扁平 userId/roleId/workspace）。
+ * 只做截断，不做身份推导：面板没有会话 header，推导在 identity-source。
+ * @param {object} body
+ * @returns {{userId:string,roleId:string,workspace:string}}
+ */
+function identityOf(body) {
+  const src = body?.identity && typeof body.identity === 'object' ? body.identity : body
+  return {
+    userId: textOf(src?.userId).slice(0, 128),
+    roleId: textOf(src?.roleId).slice(0, 64),
+    workspace: textOf(src?.workspace).slice(0, 64),
+  }
+}
+
+/** 写后处理视图（与 update/revert 同形状：面板只写一套渲染）。 */
+function postView(post) {
+  return {
+    mirror: post.mirror ? { ok: Boolean(post.mirror.ok), mirrored: post.mirror.mirrored ?? null } : null,
+    agents: post.agents
+      ? {
+        ok: Boolean(post.agents.ok),
+        code: textOf(post.agents.code),
+        changed: post.agents.changed ?? null,
+        count: Number(post.agents.count) || 0,
+      }
+      : null,
+  }
+}
+
+/**
+ * 新建规则（面板直写）：与 apply/update 同一写闸门（rules_disabled / git_required）。
+ *
+ * 二次确认由 client 负责——服务端只执行守卫，不弹窗。写后照例镜像/渲染/审计
+ * （writes.reason=rule_create），失败不回滚文件：它们可重试，回滚反而丢掉已写好的真源。
+ *
+ * @param {{root?:string,config?:any,backend?:any,body?:object,detect?:Function,
+ *   mirror?:Function,renderAgents?:Function,git?:boolean,exec?:Function,
+ *   log?:Function,now?:number}} args
+ * @returns {object}
+ */
+export function createPayload({
+  root = '', config = {}, backend = null, body = {}, detect = detectGit,
+  mirror = null, renderAgents = null, git = true, exec = null, log = () => {}, now = Date.now(),
+} = {}) {
+  const guard = writeGuard(config, detect)
+  if (!guard.ok) return { ok: false, error: guard.error, git: guard.git }
+  const dir = root || resolveRulesRoot(config)
+  const draft = body?.draft && typeof body.draft === 'object' && !Array.isArray(body.draft) ? body.draft : null
+  if (!draft) return { ok: false, error: 'invalid_draft', detail: { reason: 'draft_must_be_object' } }
+  const identity = identityOf(body)
+  const created = createRule({
+    root: dir,
+    draft,
+    identity,
+    traceId: textOf(body?.traceId),
+    now,
+  }, { git, exec })
+  if (!created.ok) {
+    return { ok: false, error: textOf(created.error) || 'invalid_rule', detail: created.detail }
+  }
+  const key = textOf(created.key)
+  const post = applyPostSteps({ dir, config, backend, mirror, renderAgents, log })
+  const audit = auditRuleChange({
+    backend,
+    reason: 'rule_create',
+    key,
+    beforeText: '',
+    afterText: textOf(created.rule.text),
+    commit: created.commit,
+    mirrorResult: post.mirror,
+    agentsResult: post.agents,
+    traceId: textOf(body?.traceId),
+    identity,
+    log,
+    extra: {
+      number: created.number,
+      type: created.type,
+      origin: created.origin,
+      created: created.rule?.front?.created,
+    },
+  })
+  return {
+    ok: true,
+    dir,
+    key,
+    number: created.number,
+    type: created.type,
+    rule: ruleView(created.rule),
+    // 与 update/revert 契约一致：`commit` 是提交消息字符串，结构化细节在 commitInfo。
+    commit: textOf(created.commit?.message),
+    commitInfo: created.commit,
+    version: Number(created.version) || 1,
+    ...postView(post),
+    audit: { ok: audit.ok, ...(audit.ok ? {} : { error: audit.error }) },
+  }
+}
+
+/**
+ * 停用/恢复规则（`mode:'retire'|'reactivate'`，默认 retire）。
+ *
+ * 停用只改 status（文件/编号/正文/历史全保留）：编号永不复用，所以 manifest 的 nextNumber 不因
+ * 停用回退；镜像侧 pinned 归 0 由 rule-mirror 按 status 投影，本层只负责触发。
+ * 已 retired 再停用 → `already_retired`；未 retired 恢复 → `not_retired`（幂等动作要显式报"没动"）。
+ *
+ * @param {{root?:string,config?:any,backend?:any,body?:object,detect?:Function,
+ *   mirror?:Function,renderAgents?:Function,git?:boolean,exec?:Function,
+ *   log?:Function,now?:number}} args
+ * @returns {object}
+ */
+export function deletePayload({
+  root = '', config = {}, backend = null, body = {}, detect = detectGit,
+  mirror = null, renderAgents = null, git = true, exec = null, log = () => {}, now = Date.now(),
+} = {}) {
+  const guard = writeGuard(config, detect)
+  if (!guard.ok) return { ok: false, error: guard.error, git: guard.git }
+  const dir = root || resolveRulesRoot(config)
+  const key = textOf(body?.key).trim()
+  if (!isValidRuleKey(key)) return { ok: false, error: 'invalid_key' }
+  const mode = textOf(body?.mode).trim() || 'retire'
+  if (mode !== 'retire' && mode !== 'reactivate') {
+    return { ok: false, error: 'invalid_mode', detail: { mode, allowed: ['retire', 'reactivate'] } }
+  }
+  const before = readRule(dir, key)
+  if (!before.ok) return { ok: false, error: before.error, detail: before.detail }
+  // 与 update 同口径：首次写前建好规则仓/首个 commit（新目录否则提交不上）。
+  const ensured = ensureRuleRepo({ root: dir, git: git !== false, ...(exec ? { exec } : {}) })
+  if (!ensured.ok) return { ok: false, error: 'ensure_failed', detail: ensured.error }
+  const changed = mode === 'retire'
+    ? retireRule({ root: dir, key, identity: identityOf(body), traceId: textOf(body?.traceId), now }, { git, exec })
+    : reactivateRule({ root: dir, key, identity: identityOf(body), traceId: textOf(body?.traceId), now }, { git, exec })
+  if (!changed.ok) {
+    return { ok: false, error: changed.error, detail: changed.detail, status: textOf(changed.status) }
+  }
+  const post = applyPostSteps({ dir, config, backend, mirror, renderAgents, log })
+  const audit = auditRuleChange({
+    backend,
+    reason: mode === 'retire' ? 'rule_retire' : 'rule_reactivate',
+    key,
+    beforeText: textOf(before.rule.text),
+    afterText: textOf(changed.rule.text),
+    commit: changed.commit,
+    mirrorResult: post.mirror,
+    agentsResult: post.agents,
+    traceId: textOf(body?.traceId),
+    identity: identityOf(body),
+    log,
+    extra: {
+      mode,
+      fromVersion: changed.previousVersion,
+      toVersion: changed.version,
+      changed: changed.changed,
+    },
+  })
+  return {
+    ok: true,
+    dir,
+    key,
+    mode,
+    status: textOf(changed.status || changed.rule?.front?.status),
+    changed: changed.changed !== false,
+    rule: ruleView(changed.rule),
+    commit: textOf(changed.commit?.message),
+    commitInfo: changed.commit,
+    version: changed.version,
+    previousVersion: changed.previousVersion,
+    ...postView(post),
+    audit: { ok: audit.ok, ...(audit.ok ? {} : { error: audit.error }) },
+  }
+}
+
+/**
  * 拒绝候选（写冷却 + status=rejected）。
  * @param {{root?:string,config?:any,body?:object,log?:Function,now?:number}} args
  * @returns {object}
@@ -826,10 +998,13 @@ function statusForError(code) {
   if (code === 'proposal_not_found' || code === 'rule_not_found' || code === 'rev_not_found') return 404
   if (code === 'rules_disabled' || code === 'git_required') return 403
   if (code === 'proposal_not_pending' || code === 'rule_locked') return 409
+  // 幂等动作的"没动"是冲突语义：已停用再停用 / 未停用却恢复 / 同 key 重建，都不该按 400 报。
+  if (code === 'already_retired' || code === 'not_retired' || code === 'duplicate_rule') return 409
   if (code === 'diff_too_large') return 413
   if (code === 'rule_guard_failed' || code === 'needs_manual' || code === 'llm_unavailable'
     || code === 'llm_unparseable' || code === 'llm_error' || code === 'commit_failed'
-    || code === 'write_failed' || code === 'affected_write_failed' || code === 'invalid_rule') return 422
+    || code === 'write_failed' || code === 'affected_write_failed' || code === 'invalid_rule'
+    || code === 'invalid_draft') return 422
   if (code === 'invalid_json' || code === 'payload_too_large') return 400
   return 400
 }
@@ -860,6 +1035,8 @@ export async function handleRules({
   const versionsPath = `${RULES_PREFIX}/rules/versions`
   const updatePath = `${RULES_PREFIX}/rules/update`
   const revertPath = `${RULES_PREFIX}/rules/revert`
+  const createPath = `${RULES_PREFIX}/rules/create`
+  const deletePath = `${RULES_PREFIX}/rules/delete`
 
   if (p === listPath) {
     if (req.method !== 'GET') { sendMethodNotAllowed(res, 'GET'); return true }
@@ -927,6 +1104,38 @@ export async function handleRules({
     const body = await readJson(req)
     if (!body.ok) { sendJson(res, body.status, { ok: false, error: body.error }); return true }
     const payload = revertPayload({
+      config,
+      backend,
+      body: body.value,
+      detect,
+      git,
+      log,
+    })
+    sendJson(res, payload.ok ? 200 : statusForError(textOf(payload.error)), payload)
+    return true
+  }
+
+  if (p === createPath) {
+    if (req.method !== 'POST') { sendMethodNotAllowed(res, 'POST'); return true }
+    const body = await readJson(req)
+    if (!body.ok) { sendJson(res, body.status, { ok: false, error: body.error }); return true }
+    const payload = createPayload({
+      config,
+      backend,
+      body: body.value,
+      detect,
+      git,
+      log,
+    })
+    sendJson(res, payload.ok ? 200 : statusForError(textOf(payload.error)), payload)
+    return true
+  }
+
+  if (p === deletePath) {
+    if (req.method !== 'POST') { sendMethodNotAllowed(res, 'POST'); return true }
+    const body = await readJson(req)
+    if (!body.ok) { sendJson(res, body.status, { ok: false, error: body.error }); return true }
+    const payload = deletePayload({
       config,
       backend,
       body: body.value,

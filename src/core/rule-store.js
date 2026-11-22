@@ -25,7 +25,7 @@ import * as nodeFs from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { detectSignals } from './rules.js'
+import { detectSignals, normalizeRuleText, ruleKeyOf } from './rules.js'
 
 /** 已知 front matter 字段（顺序即序列化顺序）。未知字段一律报错，不静默丢弃。 */
 export const RULE_FIELDS = Object.freeze([
@@ -40,6 +40,21 @@ export const RULE_PRIORITIES = Object.freeze(['P0', 'P1', 'P2', 'P3'])
 export const RULE_STATUSES = Object.freeze(['active', 'retired', 'superseded', 'proposal'])
 /** 空号永不复用：6 是历史保留号，任何类型都不得占用。 */
 export const RESERVED_NUMBERS = Object.freeze([6])
+/**
+ * 无编号铁律（台账「安全·密钥纪律」行）：它不属于 1–17 编号体系，key 固定、number=0。
+ * 只放行这一个 key——number=0 一旦泛化，编号唯一性/nextNumber 就会失去"正整数"这个判据。
+ */
+export const UNNUMBERED_RULE_KEYS = Object.freeze(['iron-rule-safety'])
+
+/**
+ * 是否是无编号规则（key 在放行名单内**且** number 恰为 0）。
+ * 编号相关逻辑（numbers Map/manifest/nextNumber）都靠它跳过：无编号不占号、不参与唯一性冲突。
+ * @param {object} front @returns {boolean}
+ */
+export function isUnnumberedRule(front) {
+  const f = front && typeof front === 'object' ? front : {}
+  return UNNUMBERED_RULE_KEYS.includes(String(f.key ?? '').trim()) && Number(f.number) === 0
+}
 
 export const RULE_BODY_MAX = 500
 export const HISTORY_KEEP = 20
@@ -340,8 +355,12 @@ export function validateRule(front, text, opts = {}) {
 
   if (!KEY_RE.test(String(f.key ?? ''))) push('invalid_key', 'key', 'key 必须是 1–64 位小写字母/数字/._-')
   if (!RULE_TYPES.includes(f.type)) push('invalid_type', 'type', `type 必须是 ${RULE_TYPES.join('|')}`)
-  if (!Number.isInteger(f.number) || f.number <= 0) push('invalid_number', 'number', 'number 必须是正整数')
-  else if (RESERVED_NUMBERS.includes(f.number)) push('number_reserved', 'number', `编号 ${f.number} 是保留空号，永不复用`)
+  // 无编号铁律（安全行）是唯一允许 number=0 的规则；其余任何 key 都必须是正整数。
+  if (isUnnumberedRule(f)) {
+    // number=0 合法：不占号、不参与唯一性（numbers Map 里也不会出现 0）。
+  } else if (!Number.isInteger(f.number) || f.number <= 0) {
+    push('invalid_number', 'number', 'number 必须是正整数（仅允许 iron-rule-safety 为 0）')
+  } else if (RESERVED_NUMBERS.includes(f.number)) push('number_reserved', 'number', `编号 ${f.number} 是保留空号，永不复用`)
   if (!RULE_PRIORITIES.includes(String(f.priority ?? '').toUpperCase())) {
     push('invalid_priority', 'priority', `priority 必须是 ${RULE_PRIORITIES.join('|')}`)
   }
@@ -620,11 +639,14 @@ export function listRules(root) {
     const normalized = normalizeRuleDoc(parsed.front, parsed.text)
     const check = validateRule(normalized.front, normalized.text, { numbers })
     if (!check.ok) { errors.push({ file, error: 'invalid_rule', detail: check.errors }); continue }
-    if (numbers.has(normalized.front.number)) {
+    if (Number.isInteger(normalized.front.number) && normalized.front.number > 0 && numbers.has(normalized.front.number)) {
       errors.push({ file, error: 'duplicate_number', detail: { number: normalized.front.number } })
       continue
     }
-    numbers.set(normalized.front.number, normalized.front.key)
+    // 无编号规则（number=0）不占号：不进 numbers，也就不会与任何规则撞号。
+    if (Number.isInteger(normalized.front.number) && normalized.front.number > 0) {
+      numbers.set(normalized.front.number, normalized.front.key)
+    }
     rules.push({ ...normalized, bodyStart: parsed.bodyStart, file })
   }
   rules.sort((a, b) => a.front.number - b.front.number || a.front.key.localeCompare(b.front.key))
@@ -665,6 +687,7 @@ export function writeRule(root, input, opts = {}) {
     const numbers = new Map()
     for (const doc of existing.rules) {
       if (doc.front.key === normalized.front.key) continue
+      if (!(Number.isInteger(doc.front.number) && doc.front.number > 0)) continue
       numbers.set(doc.front.number, doc.front.key)
     }
     const check = validateRule(normalized.front, normalized.text, { numbers })
@@ -751,6 +774,209 @@ export function deleteRule(root, key, opts = {}) {
   const saved = writeRule(base, next, opts)
   if (!saved.ok) return saved
   return { ok: true, retired: true, rule: saved.rule }
+}
+
+// ---------------------------------------------------------------------------
+// 新建 / 停用 / 恢复（面板直写，不经提案决策流水线）
+// ---------------------------------------------------------------------------
+
+/**
+ * 新建规则可接受的 draft 字段白名单。
+ *
+ * 刻意**不含** key/type 之外的元数据（number/created/version/origin/status）：编号是"永不复用"的
+ * 全局资源、created 是历史锚点、origin 是归属审计，都必须由仓储分配/盖章，不能由面板随便写。
+ * 也不含 modality——模态从正文推断，避免"正文说禁止、front 写 must"的自相矛盾。
+ */
+export const CREATE_DRAFT_FIELDS = Object.freeze([
+  'text', 'type', 'priority', 'scope', 'role', 'conditions', 'exceptions', 'action', 'object',
+])
+export const CREATE_RULE_TYPES = Object.freeze(['iron-rule', 'rule'])
+
+/**
+ * 模态推断（新建规则用）：与 rule-reconcile.js 的 `modalityOf` 同一口径。
+ *
+ * 为什么不 import：rule-reconcile 反向 import 本模块的常量（RESERVED_NUMBERS/RULE_BODY_MAX 等），
+ * 再互相 import 就成环。这里复制三条正则，**两处必须同改**（有单测 `createRule：模态从正文推断` 盯着）。
+ */
+const MANUAL_NEG_RE = /(禁止|不得|不许|不准|不能|不必|无需|不用|毋须|切勿|勿|不要|别再|别用|别把|别删|别改|别(?!人|的|处|致|样)|严禁|避免|never|must not|do not|don't)/i
+const MANUAL_ONLY_RE = /(只能|只准|只允许|仅能|仅允许|只用|只保留|只读|只做|只接受|只支持|只(?:用|留|存|删|选|取|做|算|跑|走|看|读|写|发|收|要|能|须|需|有|是|可|会|应|得|让|把|给|对|向|从|在|为|于))/
+const MANUAL_EXCEPT_RE = /除(?:了)?[^，,。；;]{1,40}外/
+
+/** @param {string} text @returns {'must'|'must_not'|'only'|'except'} */
+function manualModalityOf(text) {
+  const s = String(text ?? '')
+  if (MANUAL_NEG_RE.test(s)) return 'must_not'
+  if (MANUAL_EXCEPT_RE.test(s)) return 'except'
+  if (MANUAL_ONLY_RE.test(s)) return 'only'
+  return 'must'
+}
+
+/** 旧编号永不回收：所有规则（含 retired/archived）的编号都算占用。 */
+function occupiedNumbers(rules) {
+  const numbers = new Set()
+  for (const doc of Array.isArray(rules) ? rules : []) {
+    const n = doc?.front ? Number(doc.front.number) : Number(doc?.number)
+    if (Number.isInteger(n) && n > 0) numbers.add(n)
+  }
+  return numbers
+}
+
+/**
+ * 新建一条规则（面板直写路径，**不经过** writer 决策/提案流水线）。
+ *
+ * 身份分配（仓储盖章，面板不可指定）：
+ * - `number = nextRuleNumber(已有编号)`：空号 6 不复用，已有 1–17 时从 18 起；
+ * - `key`：iron-rule → `iron-rule-<number>`；rule → `rule-<domain>-<hash8>`（domain 从正文推断，
+ *   hash8 = 归一化正文 sha256 前 8 位）；
+ * - `origin = manual:<userId|''>`、`version = 1`、`created/updated = 今天`、`status = active`。
+ *
+ * 失败语义：形状问题 → `invalid_draft`（未知字段/空正文/类型非法/数组非法）；内容问题 →
+ * `invalid_rule` + validateRule 的错误数组（正文超 500/非祈使/隐私/铁律模糊词…）；撞已有 key →
+ * `duplicate_rule`（同 key 覆盖会吞掉别人的规则正文，必须显式拒绝，改用 update/revert 通道）。
+ * 以上全部在**写文件之前**判定，失败不留半成品、不烧编号。
+ *
+ * 单 commit：先写文件（`git:false`）再一次性 `rule: create <key> (#n)`，与默认播种同理——
+ * 一条规则的落盘应当只有一个提交点。
+ *
+ * @param {{root?:string, draft?:object, identity?:object, traceId?:string, now?:number}} args
+ *   identity/traceId 只为与路由/审计同签名（本模块不写 DB）。
+ * @param {{fs?:typeof nodeFs, git?:boolean, exec?:Function}} [opts]
+ * @returns {{ok:boolean, rule?:object, path?:string, key?:string, number?:number,
+ *   type?:string, version?:number, commit?:object|null, error?:string, detail?:any}}
+ */
+export function createRule({ root = '', draft = {}, identity = {}, traceId = '', now = Date.now() } = {}, opts = {}) {
+  const fs = opts.fs || nodeFs
+  const base = baseDir(root)
+  if (!draft || typeof draft !== 'object' || Array.isArray(draft)) {
+    return { ok: false, error: 'invalid_draft', detail: { reason: 'draft_must_be_object' } }
+  }
+  const unknown = Object.keys(draft).filter((field) => !CREATE_DRAFT_FIELDS.includes(field))
+  if (unknown.length) {
+    return { ok: false, error: 'invalid_draft', detail: { reason: 'unknown_field', fields: unknown } }
+  }
+  const type = String(draft.type ?? 'rule').trim() || 'rule'
+  if (!CREATE_RULE_TYPES.includes(type)) {
+    return { ok: false, error: 'invalid_draft', detail: { reason: 'invalid_type', type, allowed: CREATE_RULE_TYPES } }
+  }
+  const text = String(draft.text ?? '').trim()
+  if (!text || !normalizeRuleText(text)) {
+    return { ok: false, error: 'invalid_draft', detail: { reason: 'empty_text' } }
+  }
+  const chars = Array.from(text).length
+  if (chars > RULE_BODY_MAX) {
+    return {
+      ok: false,
+      error: 'invalid_rule',
+      detail: [{ code: 'body_too_long', field: null, message: `正文 ${chars} 字，超过硬顶 ${RULE_BODY_MAX}` }],
+    }
+  }
+  for (const field of ['conditions', 'exceptions']) {
+    if (draft[field] === undefined) continue
+    if (!Array.isArray(draft[field])) {
+      return { ok: false, error: 'invalid_draft', detail: { reason: `${field}_must_be_array`, field } }
+    }
+  }
+
+  const listed = listRules(base)
+  const number = nextRuleNumber(occupiedNumbers(listed.rules))
+  // `rule:<domain>-<hash8>` → `rule-<domain>-<hash8>`（面板/文件里的 key 形状）。
+  const key = type === 'iron-rule' ? `iron-rule-${number}` : ruleKeyOf(text).replace(/^rule:/, 'rule-')
+  if (!isValidRuleKey(key)) return { ok: false, error: 'invalid_draft', detail: { reason: 'invalid_key', key } }
+  if (listed.rules.some((doc) => String(doc.front.key) === key)) {
+    return { ok: false, error: 'duplicate_rule', detail: { key, reason: 'key_exists' } }
+  }
+
+  const userId = String(identity?.userId ?? '').slice(0, 128)
+  const conditions = Array.isArray(draft.conditions)
+    ? draft.conditions.map((item) => String(item ?? '').trim()).filter(Boolean)
+    : []
+  const exceptions = Array.isArray(draft.exceptions)
+    ? draft.exceptions.map((item) => String(item ?? '').trim()).filter(Boolean)
+    : []
+  const date = dateOf(now)
+  const front = {
+    key,
+    type,
+    number,
+    priority: String(draft.priority ?? (type === 'iron-rule' ? 'P0' : 'P1')).trim().toUpperCase(),
+    scope: String(draft.scope ?? 'global').trim() || 'global',
+    role: String(draft.role ?? '').trim(),
+    modality: manualModalityOf(text),
+    action: String(draft.action ?? '').trim(),
+    object: String(draft.object ?? '').trim(),
+    conditions,
+    exceptions,
+    status: 'active',
+    merged_into: '',
+    superseded_by: '',
+    created: date,
+    updated: date,
+    version: 1,
+    origin: `manual:${userId}`,
+  }
+
+  // 仓就绪（含 git init）：单 commit 需要一个已存在的仓库；缺 git 只降级（ensureRuleRepo 不抛）。
+  if (opts.git !== false) {
+    const ensured = ensureRuleRepo({ root: base, git: true, fs, ...(opts.exec ? { exec: opts.exec } : {}) })
+    if (!ensured.ok) return { ok: false, error: 'ensure_failed', detail: { root: base, error: ensured.error } }
+  }
+
+  // git:false：文件 + manifest 由 writeRule 一次做完，提交由下面这一条统一出。
+  const written = writeRule(base, { front, text }, { git: false, fs })
+  if (!written.ok) return { ok: false, error: written.error || 'write_failed', detail: written.detail }
+
+  const commit = commitRuleChange(base, `rule: create ${key} (#${number})`, opts)
+  return {
+    ok: true,
+    rule: written.rule,
+    path: written.path,
+    key,
+    number,
+    type,
+    version: 1,
+    origin: front.origin,
+    commit,
+  }
+}
+
+/**
+ * 停用一条规则（复用 R5 `updateRule`，patch `{status:'retired'}`）。
+ *
+ * 停用 = 保留文件/编号/正文/历史，只把 status 置 retired：pinned 镜像因此归 0（rule-mirror 按
+ * status 投影），但编号继续占位——**编号永不复用**，manifest 的 nextNumber 不因停用回退。
+ *
+ * @param {{root?:string, key:string, identity?:object, traceId?:string, now?:number}} args
+ * @param {{fs?:typeof nodeFs, git?:boolean, exec?:Function}} [opts]
+ * @returns {{ok:boolean, rule?:object, status?:string, retired?:boolean, changed?:boolean,
+ *   commit?:object|null, version?:number, previousVersion?:number, error?:string, detail?:any}}
+ */
+export function retireRule({ root = '', key, identity = {}, traceId = '', now = Date.now() } = {}, opts = {}) {
+  const got = readRule(baseDir(root), key)
+  if (!got.ok) return { ok: false, error: got.error, detail: got.detail }
+  if (String(got.rule.front.status) === 'retired') {
+    return { ok: false, error: 'already_retired', rule: got.rule, status: 'retired' }
+  }
+  const updated = updateRule({ root, key, patch: { status: 'retired' }, identity, traceId, now }, opts)
+  if (!updated.ok) return updated
+  return { ...updated, status: 'retired', retired: true }
+}
+
+/**
+ * 恢复一条已停用规则（patch `{status:'active'}`；不新建文件、不改编号/正文/版本历史）。
+ * @param {{root?:string, key:string, identity?:object, traceId?:string, now?:number}} args
+ * @param {{fs?:typeof nodeFs, git?:boolean, exec?:Function}} [opts]
+ * @returns {{ok:boolean, rule?:object, status?:string, reactivated?:boolean, changed?:boolean,
+ *   commit?:object|null, version?:number, previousVersion?:number, error?:string, detail?:any}}
+ */
+export function reactivateRule({ root = '', key, identity = {}, traceId = '', now = Date.now() } = {}, opts = {}) {
+  const got = readRule(baseDir(root), key)
+  if (!got.ok) return { ok: false, error: got.error, detail: got.detail }
+  if (String(got.rule.front.status) !== 'retired') {
+    return { ok: false, error: 'not_retired', rule: got.rule, status: String(got.rule.front.status) }
+  }
+  const updated = updateRule({ root, key, patch: { status: 'active' }, identity, traceId, now }, opts)
+  if (!updated.ok) return updated
+  return { ...updated, status: 'active', reactivated: true }
 }
 
 /**
@@ -1024,6 +1250,7 @@ export function updateRule({ root = '', key, patch, now = Date.now() } = {}, opt
   const numbers = new Map()
   for (const other of listRules(base).rules) {
     if (String(other.front.key) === String(key)) continue
+    if (!(Number.isInteger(other.front.number) && other.front.number > 0)) continue
     numbers.set(other.front.number, other.front.key)
   }
   const check = validateRule(nextDoc.front, nextDoc.text, { numbers })
@@ -1114,6 +1341,7 @@ export function revertRule({ root = '', key, rev, now = Date.now() } = {}, opts 
   const numbers = new Map()
   for (const other of listRules(base).rules) {
     if (String(other.front.key) === String(key)) continue
+    if (!(Number.isInteger(other.front.number) && other.front.number > 0)) continue
     numbers.set(other.front.number, other.front.key)
   }
   const check = validateRule(nextFront, snap.text, { numbers })
@@ -1175,18 +1403,25 @@ export function nextRuleNumber(numbers) {
 
 /**
  * 由规则列表计算 manifest 视图（纯函数，GET 列表用；不写盘）。
+ *
+ * 编号口径：只有正整数编号参与 `nextNumber`/`total`；无编号铁律（安全行，number=0）单列
+ * `unnumbered` 计数——它存在、要被列表/镜像渲染，但**不占号**，否则 nextNumber 会被压回 1。
+ *
  * @param {Array<object>} rules listRules 的 rules
- * @returns {{nextNumber:number,total:number,byStatus:Record<string,number>}}
+ * @returns {{nextNumber:number,total:number,unnumbered:number,byStatus:Record<string,number>}}
  */
 export function computeManifest(rules) {
   const byStatus = {}
   const numbers = []
+  let unnumbered = 0
   for (const doc of Array.isArray(rules) ? rules : []) {
     const status = String(doc?.front?.status || 'unknown')
     byStatus[status] = (byStatus[status] || 0) + 1
-    if (Number.isInteger(doc?.front?.number)) numbers.push(doc.front.number)
+    const n = Number(doc?.front?.number)
+    if (Number.isInteger(n) && n > 0) numbers.push(n)
+    else if (isUnnumberedRule(doc?.front)) unnumbered += 1
   }
-  return { nextNumber: nextRuleNumber(numbers), total: numbers.length, byStatus }
+  return { nextNumber: nextRuleNumber(numbers), total: numbers.length, unnumbered, byStatus }
 }
 
 /**
@@ -1260,6 +1495,25 @@ export function isGitRepo(dir, opts = {}) {
   const r = runGit(dir, ['rev-parse', '--is-inside-work-tree'], opts)
   if (!r.ok) return r
   return { ok: r.out.trim() === 'true' }
+}
+
+/**
+ * 只建仓（`git init -q`），**不提交**。
+ *
+ * 为什么需要它：默认播种要"整批默认规则只出一个 commit"，但 `ensureRuleRepo` 建仓时会顺手
+ * 提交一次 `rules: init repository`（里面只有 README/manifest），history 会多一条噪音。
+ * 先 init、再写文件、最后统一 commit，首启就是**一个**提交且包含全部默认规则。
+ *
+ * @param {string} dir
+ * @param {{exec?:Function}} [opts]
+ * @returns {{ok:boolean, initialized?:boolean, error?:string}} initialized=false 表示本来就有仓库
+ */
+export function initRuleRepo(dir, opts = {}) {
+  const repo = isGitRepo(dir, opts)
+  if (repo.ok) return { ok: true, initialized: false }
+  const init = runGit(dir, ['init', '-q'], opts)
+  if (!init.ok) return { ok: false, error: init.error }
+  return { ok: true, initialized: true }
 }
 
 /**
@@ -1356,7 +1610,8 @@ export function ensureRuleRepo(opts = {}) {
       ].join('\n'), 'utf8')
     }
     const ignore = join(root, '.gitignore')
-    if (!existsSyncSafe(ignore, fs)) fs.writeFileSync(ignore, '*.tmp-*\n.locks/\n', 'utf8')
+    // `.seeded.json` 是默认播种标记（本机状态）：进 git 会让换机后"已播种"，新机永远不长默认规则。
+    if (!existsSyncSafe(ignore, fs)) fs.writeFileSync(ignore, '*.tmp-*\n.locks/\n.seeded.json\n', 'utf8')
     regenerateManifest(root, { fs })
   } catch (err) {
     return { ok: false, error: String(err?.message || err) }

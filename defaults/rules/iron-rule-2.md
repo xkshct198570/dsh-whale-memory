@@ -1,0 +1,22 @@
+---
+key: iron-rule-2
+type: iron-rule
+number: 2
+priority: P0
+scope: global
+role: ""
+modality: must_not
+action: 内嵌领域特定逻辑
+object: 主流程文件
+conditions: []
+exceptions: []
+status: active
+merged_into: ""
+superseded_by: ""
+created: 2026-11-22
+updated: 2026-11-22
+version: 1
+origin: default:iron-rule-2
+---
+
+通用能力必须抽独立 Util（如 core/text-guard.mjs）；主流程文件禁止出现领域特定正则、分支表、特例清单，出现即算内嵌，不论行数多少；同一逻辑出现第 2 处必须抽 Util。

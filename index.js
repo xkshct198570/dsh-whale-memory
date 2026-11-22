@@ -16,6 +16,7 @@ import { installReflectScheduler } from './src/core/reflect.js'
 import { installKeeper } from './src/core/keeper.js'
 import { installOutboxWatchdog } from './src/core/hybrid.js'
 import { defaultRuleRoot, listRules } from './src/core/rule-store.js'
+import { seedDefaultRules } from './src/core/rule-defaults.js'
 import { mirrorRules } from './src/core/rule-mirror.js'
 import { agentsPathOf, renderAgentsDigest } from './src/core/rule-render.js'
 import { bool, num } from './src/host/config-values.js'
@@ -228,6 +229,18 @@ export function apply(ctx, config) {
     const dir = String(config?.rules?.dir || '').trim() || defaultRuleRoot()
     const timer = setTimeout(() => {
       try {
+        // 首次播种默认铁律（幂等）：marker 是判据，用户删/停用后重启不会重播；
+        // 失败只记日志——播种坏掉不能挡住下面镜像/摘要的自愈。
+        try {
+          const seeded = seedDefaultRules({ root: dir, log })
+          if (seeded && seeded.ok === false) {
+            log(`[whale-memory] rules seed skipped: ${seeded.error || 'error'}${seeded.skippedInvalid ? ` (invalid=${seeded.skippedInvalid})` : ''}`)
+          } else if (seeded && seeded.seeded) {
+            log(`[whale-memory] rules seeded defaults: ${seeded.seeded} (invalid=${seeded.skippedInvalid || 0})`)
+          }
+        } catch (err) {
+          log(`[whale-memory] rules seed fail-open: ${err?.message || err}`)
+        }
         const listed = listRules(dir)
         if (!listed?.ok || !Array.isArray(listed.rules) || listed.rules.length === 0) return
         const mirror = mirrorRules({ backend: backendProxy, rules: listed.rules, log })

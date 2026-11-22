@@ -17,6 +17,7 @@
     "src/host",
     "src/core",
     "src/core/workers",
+    "defaults",
     "lib/client.js",
     "cordis.patch.yml",
     "locale/*.json",
