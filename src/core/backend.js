@@ -334,9 +334,12 @@ function landImportRows(db, items, { insert, exists, dryRun = false }) {
 
 export class LocalBackend {
   /**
-   * @param {{ dataDir?: string, useWorker?: boolean, log?: (s:string)=>void, timeoutMs?: number }} [opts]
+   * @param {{ dataDir?: string, useWorker?: boolean, log?: (s:string)=>void, timeoutMs?: number,
+   *   config?: object|Function, getLlm?: () => any, getSelection?: () => object }} [opts]
+   *   getLlm/getSelection：判定器（write.judge='llm'）用的模型入口，由 index.js 透传；
+   *   缺省时队列按 rules 跑（单测/直连不需要宿主模型）。
    */
-  constructor({ dataDir = '', useWorker = true, log = () => {}, timeoutMs = 1200, config = null } = {}) {
+  constructor({ dataDir = '', useWorker = true, log = () => {}, timeoutMs = 1200, config = null, getLlm = null, getSelection = null } = {}) {
     this.dataDir = dataDir
     this.mode = 'local'
     this.log = log
@@ -346,6 +349,9 @@ export class LocalBackend {
     this.dbPath = ''
     this.worker = null
     this.closed = false
+    // 判定器取模型是延迟的（每条事件才调一次 getter）：不持有 llm 实例，避免插件 dispose 后引用旧对象。
+    this.getLlm = typeof getLlm === 'function' ? getLlm : null
+    this.getSelection = typeof getSelection === 'function' ? getSelection : null
     // 写入决策要读实时配置（shadow/auto 面板可改），因此持 getter 而不是快照。
     // 无配置（单测/直连）默认 auto：旧行为不变；生产由 index.js 注入实时配置（默认 shadow）。
     this._config = config
@@ -403,7 +409,13 @@ export class LocalBackend {
   _writer() {
     if (this.closed) throw new Error('backend_disposed')
     if (!this.writeQueue) {
-      this.writeQueue = createWriteQueue({ store: this, config: this._config, log: this.log })
+      this.writeQueue = createWriteQueue({
+        store: this,
+        config: this._config,
+        log: this.log,
+        getLlm: this.getLlm,
+        getSelection: this.getSelection,
+      })
     }
     return this.writeQueue
   }
@@ -1286,9 +1298,10 @@ export class HttpBackend {
  * hybrid 不再当纯 Http 返回：读走 HTTP 失败回本地，写必须落本地并排队同步。
  *
  * @param {{ mode?: string, url?: string, timeoutMs?: number }} cfg backend 配置段
- * @param {{ token?: string, log?: Function, dataDir?: string, useWorker?: boolean, config?: object|Function }} [extra]
+ * @param {{ token?: string, log?: Function, dataDir?: string, useWorker?: boolean, config?: object|Function,
+ *   getLlm?: () => any, getSelection?: () => object }} [extra]
  *   config 为完整配置（或 getter）：hybrid 读 `sync.httpTimeoutMs`（默认 800ms），
- *   LocalBackend 读 `write.*`，二者同源。
+ *   LocalBackend 读 `write.*`，二者同源；getLlm/getSelection 供 `write.judge='llm'` 的判定器取模型。
  */
 export function createBackend(cfg, extra = {}) {
   if (cfg?.mode === 'http') {
@@ -1312,6 +1325,8 @@ export function createBackend(cfg, extra = {}) {
       timeoutMs: cfg?.timeoutMs || 1200,
       log: extra.log,
       config: extra.config,
+      getLlm: extra.getLlm,
+      getSelection: extra.getSelection,
     })
     const http = new HttpBackend({
       baseUrl: cfg.url || '',
@@ -1327,5 +1342,7 @@ export function createBackend(cfg, extra = {}) {
     timeoutMs: cfg?.timeoutMs || 1200,
     log: extra.log,
     config: extra.config,
+    getLlm: extra.getLlm,
+    getSelection: extra.getSelection,
   })
 }

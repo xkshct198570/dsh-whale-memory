@@ -122,6 +122,9 @@ export function apply(ctx, config) {
     dataDir: config?.dataDir || '',
     useWorker: bool(config?.advanced?.worker, true),
     config: () => config,
+    // 判定器（write.judge='llm'）取模型：延迟到每条事件才调 getter，缺省时队列按 rules 跑。
+    getLlm: () => ctx.get('llm'),
+    getSelection: () => ctx.get('agentDefaultModel')?.currentSelection?.(),
   })
   const backendRef = { current: backend }
   const backendProxy = createBackendProxy(backendRef)

@@ -27,11 +27,16 @@
 import { now } from './db.js'
 import { bigrams, contentHash, normalize, similarity } from './tokenize.js'
 import { linkMutex, linkSupersede, normalizeTags } from './relations.js'
+import { buildJudgePrompt, mapCandidates, parseJudgeOutput } from './judge.js'
 
 /** 脱敏占位符（隐私命中一律替换成它，长度稳定、可被检索到"这里被脱敏过"）。 */
 const MASK = '[已脱敏]'
 /** 每批任务数（写连接上保持短事务，避免长阻塞）。 */
 const BATCH = 20
+/** 判定器候选上限：只问最新的 N 条（提示词体积/token 成本的硬闸门，候选再多也只截最新）。 */
+const JUDGE_CANDIDATE_LIMIT = 12
+/** 判定器模型硬超时：单条超 2s 即回落规则，不拖住整批写入。 */
+const JUDGE_TIMEOUT_MS = 2000
 /** 冲突/合并候选上限（单身份）。 */
 const CANDIDATE_LIMIT = 300
 /** MERGE 相似度下限。 */
@@ -405,6 +410,27 @@ function isProtectedTarget(row, options) {
 }
 
 /**
+ * 同身份分区的 active 候选（相似合并/冲突判定的同一份口径）。
+ *
+ * 为什么抽成导出函数：判定器（judge=llm）必须在 DB 事务外先拿到候选去问模型，
+ * 再让 decideWrite 按裁决落库；两处各写一条 SELECT 迟早口径漂移（一处分区/状态写错，
+ * 判定器就会对另一批节点裁决）。顺序固定 created_at DESC（最新优先，判定器编号也用这个顺序）。
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {{ identity?: object }} event
+ * @returns {Array<{ id: string, text: string, level: string, memory_type: string,
+ *   source: string, valid_at: number|null, invalid_at: number|null }>}
+ */
+export function findCandidates(db, event) {
+  const ident = normalizeIdentity(event?.identity)
+  return db.prepare(
+    `SELECT id,text,level,memory_type,source,valid_at,invalid_at FROM nodes
+     WHERE status='active' AND user_id=? AND role_id=? AND workspace=?
+     ORDER BY created_at DESC LIMIT ?`,
+  ).all(ident.userId, ident.roleId, ident.workspace, CANDIDATE_LIMIT)
+}
+
+/**
  * 决策主流程（严格按架构书 §6.2 顺序，见文件头说明）。
  *
  * @param {import('node:sqlite').DatabaseSync} db 已打开且 ensureSchema 过的连接
@@ -415,7 +441,7 @@ function isProtectedTarget(row, options) {
  * @returns {{ action: string, reason: string, nodeId?: string, targetId?: string,
  *   beforeText?: string, afterText?: string, mode?: string, shadowOf?: string }}
  */
-export function decideWrite(db, event, opts = {}) {
+function decideByRules(db, event, opts = {}) {
   const options = resolveOptions(opts)
   const ident = normalizeIdentity(event?.identity)
 
@@ -500,11 +526,7 @@ export function decideWrite(db, event, opts = {}) {
     }
   }
 
-  const candidates = db.prepare(
-    `SELECT id,text,level,memory_type,source,valid_at,invalid_at FROM nodes
-     WHERE status='active' AND user_id=? AND role_id=? AND workspace=?
-     ORDER BY created_at DESC LIMIT ?`,
-  ).all(ident.userId, ident.roleId, ident.workspace, CANDIDATE_LIMIT)
+  const candidates = findCandidates(db, event)
 
   // 6. 相似合并：只有"信息只增不减"才合并，否则交给冲突/新增
   let mergeRow = null
@@ -575,6 +597,94 @@ export function decideWrite(db, event, opts = {}) {
 
   // 8. 其余 → ADD
   return settle({ action: 'ADD', reason: 'new', afterText: text }, options, { text, redacted })
+}
+
+/** 判定器可覆盖的动作（与 processEvent 的既有落库分支一一对应；REVIEW/CANDIDATE 由影子/保护面派生）。 */
+const JUDGE_ACTIONS = new Set(['ADD', 'MERGE', 'SUPERSEDE', 'NOOP'])
+
+/**
+ * 判定器裁决 → 等价的规则决策（不重新找候选：模型已按候选裁决，这里只复核目标仍然可用）。
+ *
+ * 三道闸缺一不可：
+ * - 目标必须仍 active（模型调用期间别的 job 可能已把它取代/归档）；
+ * - 必须同身份分区可见（跨 user/role/workspace 的节点不许被裁决命中，否则是越权改写）；
+ * - 非受保护面（owner/core/procedural 的正文只能人工审核，模型说了也不算）。
+ * 任一不过返回 error → 调用方回落规则，reason 带 `judge_fallback:<why>`。
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {object} event
+ * @param {{ ok: true, targetId?: string|null, action?: string }} verdict
+ * @param {object} options resolveOptions 结果
+ * @param {{ afterText?: string, reason?: string }} base 规则决策（取已脱敏正文）
+ * @returns {{ decision?: object, error?: string }}
+ */
+function judgeDecision(db, event, verdict, options, base) {
+  const action = String(verdict?.action ?? '').trim().toUpperCase()
+  if (!JUDGE_ACTIONS.has(action)) return { error: 'judge_fallback:bad_action' }
+  const text = String(base?.afterText ?? '')
+  const redacted = String(base?.reason ?? '').includes('privacy:redacted')
+  if (action === 'ADD') {
+    return { decision: settle({ action: 'ADD', reason: 'judge_add', afterText: text }, options, { text, redacted }) }
+  }
+  const targetId = isBlank(verdict?.targetId) ? '' : String(verdict.targetId)
+  if (!targetId) return { error: 'judge_fallback:target_missing' }
+  const ident = normalizeIdentity(event?.identity)
+  const row = db.prepare(
+    "SELECT id,text,level,memory_type,source FROM nodes WHERE id=? AND status='active' AND user_id=? AND role_id=? AND workspace=? LIMIT 1",
+  ).get(targetId, ident.userId, ident.roleId, ident.workspace)
+  if (!row) return { error: 'judge_fallback:target_unavailable' }
+  if (isProtectedTarget(row, options)) return { error: 'judge_fallback:protected_target' }
+  return {
+    decision: settle({
+      action,
+      reason: `judge_${action.toLowerCase()}`,
+      targetId: String(row.id),
+      beforeText: String(row.text ?? ''),
+      afterText: text,
+    }, options, { text, redacted }),
+  }
+}
+
+/**
+ * 决策入口：规则先跑（文本合法性 → 隐私 → 配额 → 同 origin → 同文 → 相似 → 冲突 → 新增），
+ * 判定器裁决只在规则通过前置闸之后覆盖语义判断这一层。
+ *
+ * 为什么规则先跑而不是让模型接管全流程：脱敏/配额/同 origin 复写是安全与记账口径，
+ * 模型不能绕过；REJECT 时判定器连覆盖的机会都没有（非法文本/超额不会因为模型说 ADD 就落库）。
+ * 没有任何裁决（judgeVerdict 缺省）时与旧行为逐字节相同。
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {{ text?: string, traceId?: string, identity?: object, tags?: string[], level?: string,
+ *   memory_type?: string, expired_at?: number, source?: string, origin?: string,
+ *   __judgeVerdict?: object }} event
+ * @param {{ mode?: 'shadow'|'auto', maxChars?: number, dailyCap?: number, protect?: boolean,
+ *   redact?: boolean, judgeVerdict?: { ok: boolean, targetId?: string|null, action?: string,
+ *   error?: string } }} [opts]
+ * @returns {{ action: string, reason: string, targetId?: string, beforeText?: string,
+ *   afterText?: string, mode?: string, shadowOf?: string,
+ *   judge?: { used: boolean, action?: string, targetId?: string|null, error?: string } }}
+ */
+export function decideWrite(db, event, opts = {}) {
+  const plainOpts = plain(opts) || {}
+  const verdict = plain(plainOpts.judgeVerdict ?? event?.__judgeVerdict)
+  const base = decideByRules(db, event, opts)
+  if (!verdict) return base
+  if (base.action === 'REJECT') return { ...base, judge: { used: false, error: 'judge_fallback:rejected' } }
+  if (plain(verdict)?.ok !== true) {
+    const why = String(plain(verdict)?.error || 'invalid_verdict')
+    return { ...base, judge: { used: false, error: why } }
+  }
+  const options = resolveOptions(opts)
+  const applied = judgeDecision(db, event, plain(verdict), options, base)
+  if (!applied.decision) return { ...base, judge: { used: false, error: applied.error } }
+  return {
+    ...applied.decision,
+    judge: {
+      used: true,
+      action: String(applied.decision.shadowOf || applied.decision.action),
+      targetId: applied.decision.targetId ? String(applied.decision.targetId) : null,
+    },
+  }
 }
 
 /**
@@ -781,7 +891,7 @@ export function processEvent(db, event, config = {}) {
 
   if (action === 'REJECT') {
     recordWrite(db, event, { ...decision, nodeId: null })
-    return { ok: false, action, reason: String(decision.reason ?? '') }
+    return { ok: false, action, reason: String(decision.reason ?? ''), ...(decision.judge ? { judge: decision.judge } : {}) }
   }
 
   const targetId = decision.targetId ? String(decision.targetId) : ''
@@ -866,7 +976,13 @@ export function processEvent(db, event, config = {}) {
   }
 
   recordWrite(db, event, { ...decision, nodeId })
-  return { ok: true, id: nodeId ?? undefined, action, reason: String(decision.reason ?? '') }
+  return {
+    ok: true,
+    id: nodeId ?? undefined,
+    action,
+    reason: String(decision.reason ?? ''),
+    ...(decision.judge ? { judge: decision.judge } : {}),
+  }
 }
 
 /**
@@ -961,25 +1077,83 @@ function acceptCandidate(db, row, text, payload, shadowOf, writeId) {
 }
 
 /**
+ * 判定器模型调用：照 reflect.js 的 stream 收集口径（text-delta/block-end），
+ * 外加 2s AbortController 硬超时（模型卡住不能拖住整批写入）。
+ *
+ * 非导出：只有队列用；测试通过 fake llm 端到端覆盖（见 writer.test.mjs）。
+ *
+ * @param {{ stream: Function }} llm
+ * @param {{ provider?: string, model?: string } | null} selection
+ * @param {string} prompt
+ * @param {string} modelOverride write.model（非空即覆盖默认模型）
+ * @returns {Promise<{ ok: boolean, text?: string, error?: string }>}
+ */
+function collectJudgeText(llm, selection, prompt, modelOverride) {
+  const provider = selection?.provider
+  const model = modelOverride || selection?.model
+  if (!provider || !model) return Promise.resolve({ ok: false, error: 'no_model' })
+  return new Promise((resolve) => {
+    const controller = new AbortController()
+    let settled = false
+    const finish = (out) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(out)
+    }
+    const timer = setTimeout(() => {
+      try { controller.abort() } catch { /* 已结束的 stream 再 abort 无害 */ }
+      finish({ ok: false, error: 'timeout' })
+    }, JUDGE_TIMEOUT_MS)
+    if (typeof timer.unref === 'function') timer.unref()
+    void (async () => {
+      let text = ''
+      try {
+        for await (const chunk of llm.stream({
+          provider,
+          model,
+          temperature: 0,
+          maxTokens: 200,
+          messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
+          signal: controller.signal,
+        })) {
+          if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') text += chunk.text
+          if (chunk?.type === 'block-end' && chunk.block?.type === 'text') text += String(chunk.block.text || '')
+        }
+        finish({ ok: true, text })
+      } catch {
+        finish({ ok: false, error: 'llm_error' })
+      }
+    })()
+  })
+}
+
+/**
  * 持久化写入队列（铁律 3：进程重启后不丢事件）。
  *
  * 为什么用 jobs 表而不是内存数组：事件入队即落盘，进程重启后 enqueue 的 Promise 自然消失，
  * 但 job 还在；下次 createWriteQueue 把遗留 running 复位 queued，drain 继续跑完。
  *
+ * 判定器（judge=llm）：每条 job 处理前，在 DB 事务外取候选 → 无候选直接 ADD（不调模型）→
+ * 有候选且 llm/selection 可用才问模型；解析失败/超时/模型缺失一律带 `judge_fallback:<why>`
+ * 回落规则。模型调用从不进事务、单条失败只影响该条（job 仍按规则落库），整批照跑。
+ *
  * @param {{
  *   store: { withDb: <T>(fn: (db: import('node:sqlite').DatabaseSync) => T) => T },
- *   config?: object,
+ *   config?: object|Function,
  *   log?: (line: string) => void,
+ *   getLlm?: (() => any) | null,
+ *   getSelection?: (() => { provider?: string, model?: string } | null) | null,
  * }} args
  * @returns {{
- *   enqueue: (event: object) => Promise<{ ok: boolean, id?: string, action: string, reason: string, duplicate?: boolean }>,
+ *   enqueue: (event: object) => Promise<{ ok: boolean, id?: string, action: string, reason: string, duplicate?: boolean, judge?: object }>,
  *   drain: () => Promise<{ processed: number }>,
  *   review: (id: number|string, decision: 'accept'|'reject', reason?: string) => { ok: boolean, id?: string, error?: string },
  *   pending: () => number,
  *   dispose: () => void,
  * }}
  */
-export function createWriteQueue({ store, config, log = () => {} } = {}) {
+export function createWriteQueue({ store, config, log = () => {}, getLlm = null, getSelection = null } = {}) {
   if (!store || typeof store.withDb !== 'function') throw new TypeError('createWriteQueue: store.withDb required')
   const cfg = config || {}
   // config 可以是 getter：面板改 shadow/auto 后必须即时生效，不能在构造时冻结。
@@ -997,6 +1171,46 @@ export function createWriteQueue({ store, config, log = () => {} } = {}) {
   const waiters = new Map()
   let draining = null
   let closed = false
+
+  /** judge=llm 开关（兼容 Ref 与扁平 config；读不到一律按 rules）。 */
+  const judgeEnabled = (live) => {
+    try {
+      const c = plain(live)
+      const w = plain(c?.write)
+      return String(plain(w?.judge ?? '') || '') === 'llm'
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * 判定器裁决（模型调用绝不进 DB 事务：先 onDb 同步取候选，再在事务外问模型）。
+   * 无候选返回 null（调用方直接走规则 ADD，不花模型钱）；其余失败返回 ok:false 的裁决，
+   * 由 decideWrite 回落规则并在结果里带 `judge_fallback:<why>`。
+   */
+  async function judgeEvent(event, live) {
+    const fallback = (why) => ({ ok: false, error: `judge_fallback:${why}` })
+    let candidates
+    try {
+      candidates = onDb((db) => findCandidates(db, event))
+    } catch {
+      return fallback('candidates_unavailable')
+    }
+    if (!Array.isArray(candidates) || candidates.length === 0) return null
+    const llm = typeof getLlm === 'function' ? getLlm() : null
+    if (!llm || typeof llm.stream !== 'function') return fallback('llm_unavailable')
+    const selection = typeof getSelection === 'function' ? getSelection() : null
+    const writeSection = plain(plain(live)?.write)
+    const modelOverride = String(plain(writeSection?.model) ?? '')
+    if (!selection?.provider || (!selection?.model && !modelOverride)) return fallback('no_model')
+    const text = normalize(String(event?.text ?? ''))
+    const { map, lines } = mapCandidates(candidates.slice(0, JUDGE_CANDIDATE_LIMIT))
+    const out = await collectJudgeText(llm, selection, buildJudgePrompt(text, lines), modelOverride)
+    if (!out.ok) return fallback(out.error || 'llm_error')
+    const parsed = parseJudgeOutput(out.text, map)
+    if (!parsed.ok) return fallback(parsed.error)
+    return { ok: true, targetId: parsed.targetId, action: parsed.action, reason: parsed.reason }
+  }
 
   /** 单批处理：置 running → processEvent → done/failed，单条失败不打断整批。 */
   async function runDrain() {
@@ -1019,11 +1233,29 @@ export function createWriteQueue({ store, config, log = () => {} } = {}) {
         let event = {}
         try { event = JSON.parse(String(job.payload ?? '{}')) } catch { event = {} }
         let result
+        let verdict = null
         try {
           onDb((db) => db.prepare("UPDATE jobs SET state='running', attempts=attempts+1, updated_at=? WHERE id=?")
             .run(now(), jobId))
-          result = onDb((db) => processEvent(db, event, liveConfig()))
-          const payload = JSON.stringify({ ...event, result: { action: result.action, id: result.id ?? null } })
+          const live = liveConfig()
+          if (judgeEnabled(live)) {
+            try {
+              verdict = await judgeEvent(event, live)
+            } catch (err) {
+              verdict = { ok: false, error: `judge_fallback:${String(err?.message || err)}` }
+            }
+          }
+          const targetEvent = verdict ? { ...event, __judgeVerdict: verdict } : event
+          result = onDb((db) => processEvent(db, targetEvent, live))
+          if (result?.judge?.used) {
+            log(`[whale-memory] judge used=true action=${result.judge.action} target=${result.judge.targetId ?? '-'}`)
+          } else if (verdict) {
+            log(`[whale-memory] judge fallback reason=${result?.judge?.error || verdict.error || 'unknown'}`)
+          }
+          const payload = JSON.stringify({
+            ...event,
+            result: { action: result.action, id: result.id ?? null, ...(result.judge ? { judge: result.judge } : {}) },
+          })
           onDb((db) => db.prepare("UPDATE jobs SET state='done', payload=?, last_error=NULL, updated_at=? WHERE id=?")
             .run(payload, now(), jobId))
         } catch (err) {
