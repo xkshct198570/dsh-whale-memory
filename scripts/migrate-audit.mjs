@@ -13,7 +13,7 @@
  * - Python 库只读打开，任何模式都不写；
  * - dry-run（默认）下插件库也只读打开，且明确打印「未写库」；
  * - 只有 `--apply` 才写插件库；写之前默认先 `wal_checkpoint(TRUNCATE)` 再
- *   `VACUUM INTO data/backup/whale-<ts>.db`，备份最多保留 5 份；
+ *   `VACUUM INTO <plugin-db 目录>/backup/whale-<ts>.db`，备份最多保留 5 份；
  * - 边迁移只写 `etype='similar' / source='manual'`，Python 的 etype/source 不复制；
  *   supersede/mutex 行跳过（Python 侧没有可依赖的类型语义），报告里写明。
  *
@@ -82,8 +82,8 @@ export function parseArgs(argv = []) {
     apply: false,
     applyEdges: false,
     backup: true,
-    backupDir: join(REPO_ROOT, 'data', 'backup'),
-    report: join(REPO_ROOT, 'data', 'backup', `migrate-audit-${stamp}.md`),
+    backupDir: '', // 空=跟随 --plugin-db 所在目录的 backup/（不写进代码仓）
+    report: '', // 空=同 backupDir 下 migrate-audit-<ts>.md
     queries: FIXTURE_PATH,
     topN: DEFAULT_TOPN,
     json: false,
@@ -137,6 +137,10 @@ export function parseArgs(argv = []) {
   if (opts.applyEdges && !opts.apply) throw new Error('--apply-edges 必须与 --apply 一起用（dry-run 不写库）')
   opts.pythonDb = expandPath(opts.pythonDb)
   opts.pluginDb = expandPath(opts.pluginDb)
+  // 备份/报告默认落在插件库同目录的 backup/（$DSH_HOME/whale-memory/backup），
+  // 不写进代码仓：仓内 data/ 不是用户数据目录，迁移产物不该变成未跟踪文件。
+  if (!opts.backupDir) opts.backupDir = join(dirname(opts.pluginDb), 'backup')
+  if (!opts.report) opts.report = join(opts.backupDir, `migrate-audit-${stamp}.md`)
   opts.backupDir = expandPath(opts.backupDir)
   return opts
 }
@@ -1161,7 +1165,7 @@ function helpText() {
   --apply-edges        与 --apply 同用，把 memory_edges 迁成插件 similar/manual 边
   --dry-run            显式只读（默认行为）
   --backup / --no-backup  apply 时是否先 checkpoint + VACUUM INTO（默认 --backup）
-  --backup-dir <dir>   备份目录（默认 <repo>/data/backup，最多保留 ${MAX_BACKUPS} 份）
+  --backup-dir <dir>   备份目录（默认 <plugin-db 所在目录>/backup，最多保留 ${MAX_BACKUPS} 份）
   --report <path>      报告路径（.md/.json 同基名；'-' 表示只打 stdout，不落文件）
   --queries <path>     双读查询集（默认 test/fixtures/eval.json）
   --topn <1..50>       插件 search 条数（默认 ${DEFAULT_TOPN}；Python 侧固定 LIMIT 50）

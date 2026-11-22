@@ -39,7 +39,7 @@ node scripts/migrate-audit.mjs
 
 - Python 库和插件库都**只读打开**，不会写任何一张表；
 - 控制台打印摘要，明确显示 `dry-run（未写库）`；
-- 在 `data/backup/` 下生成两份同基名报告：
+- 在插件库同目录的 `backup/`（默认 `~/.dsh/whale-memory/backup`）下生成同基名的 .md/.json 报告：
   - `migrate-audit-<时间戳>.md`（人读）
   - `migrate-audit-<时间戳>.json`（机检）
 
@@ -101,11 +101,11 @@ node scripts/migrate-audit.mjs --apply --apply-edges
 
 1. 打开插件库（Python 库仍然只读）；
 2. `PRAGMA wal_checkpoint(TRUNCATE)`；
-3. `VACUUM INTO data/backup/whale-<时间戳>.db`；
+3. `VACUUM INTO <插件库目录>/backup/whale-<时间戳>.db`；
 4. 备份成功后，才在事务里写边；
 5. 输出摘要 + Markdown/JSON 报告。
 
-备份目录默认是仓库下 `data/backup/`，最多保留 **5** 份 `whale-*.db`，更旧的自动清理。
+备份目录默认是插件库同目录的 `backup/`（`~/.dsh/whale-memory/backup`），最多保留 **5** 份 `whale-*.db`，更旧的自动清理。
 要换目录：
 
 ```bash
@@ -167,10 +167,10 @@ sqlite3 -readonly ~/.dsh/whale-memory/memory.db \
 任何一步出问题，按下面回滚：
 
 1. 停掉插件/宿主的记忆写入（DSH 需要手动重启，不要自动拉起）；
-2. 找到 apply 时的备份：报告里的「备份文件」，或 `data/backup/whale-<时间戳>.db`；
+2. 找到 apply 时的备份：报告里的「备份文件」，或 `<插件库目录>/backup/whale-<时间戳>.db`；
 3. 用备份覆盖插件库：
    ```bash
-   cp data/backup/whale-<时间戳>.db ~/.dsh/whale-memory/memory.db
+   cp ~/.dsh/whale-memory/backup/whale-<时间戳>.db ~/.dsh/whale-memory/memory.db
    ```
 4. 删除可能残留的同名 WAL/SHM：
    ```bash
