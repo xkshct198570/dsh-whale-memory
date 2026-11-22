@@ -227,20 +227,20 @@ export function apply(ctx, config) {
     if (bool(config?.rules?.enabled, true) === false) return () => {}
     if (bool(config?.rules?.mirrorAuto, true) === false) return () => {}
     const dir = String(config?.rules?.dir || '').trim() || defaultRuleRoot()
+    // 首次播种默认铁律放在定时器**之前**：面板第一屏就要看到默认铁律（1.2s 后播种会让首开空列表）。
+    // marker 是判据，用户删/停用后重启不会重播；失败只记日志，不挡镜像/摘要自愈。
+    try {
+      const seeded = seedDefaultRules({ root: dir, log })
+      if (seeded && seeded.ok === false) {
+        log(`[whale-memory] rules seed skipped: ${seeded.error || 'error'}${seeded.skippedInvalid ? ` (invalid=${seeded.skippedInvalid})` : ''}`)
+      } else if (seeded && seeded.seeded) {
+        log(`[whale-memory] rules seeded defaults: ${seeded.seeded} (invalid=${seeded.skippedInvalid || 0})`)
+      }
+    } catch (err) {
+      log(`[whale-memory] rules seed fail-open: ${err?.message || err}`)
+    }
     const timer = setTimeout(() => {
       try {
-        // 首次播种默认铁律（幂等）：marker 是判据，用户删/停用后重启不会重播；
-        // 失败只记日志——播种坏掉不能挡住下面镜像/摘要的自愈。
-        try {
-          const seeded = seedDefaultRules({ root: dir, log })
-          if (seeded && seeded.ok === false) {
-            log(`[whale-memory] rules seed skipped: ${seeded.error || 'error'}${seeded.skippedInvalid ? ` (invalid=${seeded.skippedInvalid})` : ''}`)
-          } else if (seeded && seeded.seeded) {
-            log(`[whale-memory] rules seeded defaults: ${seeded.seeded} (invalid=${seeded.skippedInvalid || 0})`)
-          }
-        } catch (err) {
-          log(`[whale-memory] rules seed fail-open: ${err?.message || err}`)
-        }
         const listed = listRules(dir)
         if (!listed?.ok || !Array.isArray(listed.rules) || listed.rules.length === 0) return
         const mirror = mirrorRules({ backend: backendProxy, rules: listed.rules, log })

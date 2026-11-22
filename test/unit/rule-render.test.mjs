@@ -97,6 +97,8 @@ test('rulesDigestContent：只收 global+active 铁律，按编号排序，正�
 
 test('rulesDigestContent：标题取 action，缺省退正文首句；作用域规则只注入不进摘要', () => {
   assert.equal(titleOfRule({ action: '删源文件' }, '正文'), '删源文件')
+  assert.equal(titleOfRule({ action: '删源文件', modality: 'must_not' }, '正文'), '禁止删源文件')
+  assert.equal(titleOfRule({ action: '存放凭据', modality: 'only' }, '正文'), '只准存放凭据')
   assert.equal(titleOfRule({}, '文档删除前先核路径。'), '文档删除前先核路径')
   // 作用域规则在摘要里没有一行（R3b 口径：摘要只负责 global，作用域规则靠注入可见）。
   const got = rulesDigestContent([doc({ key: 'iron-rule-13', number: 13, scope: 'role:reviewer', action: '只审不施工' })])

@@ -71,9 +71,14 @@ function splitDoc(doc) {
 export function titleOfRule(front, body) {
   const action = trimmed(front?.action)
   const object = trimmed(front?.object)
+  const modality = trimmed(front?.modality)
   // 结构化标题优先：action 单独一个动词（「删」）当标题太贫，action+object 才是人读得懂的短名。
-  if (action && object) return `${action}${object}`.slice(0, 80)
-  if (action) return action.slice(0, 80)
+  const base = action && object ? `${action}${object}` : action
+  // 模态必须体现在标题里：否则「禁止 X」会读成「X」，「只准 X」会读成「X」（真机 AGENTS 摘要实测）。
+  if (base) {
+    const titled = modality === 'must_not' ? `禁止${base}` : modality === 'only' ? `只准${base}` : base
+    return titled.slice(0, 80)
+  }
   const heading = textOf(body).split('\n').map((line) => line.trim()).find((line) => line.startsWith('#'))
   if (heading) return heading.replace(/^#+\s*/, '').slice(0, 80)
   return (textOf(body).split(/[。；;\n]/).map((s) => s.trim()).filter(Boolean)[0] || '').slice(0, 80)
