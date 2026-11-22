@@ -87,10 +87,24 @@ export const Config = z.object({
     dryRun: z.boolean().default(true).volatile(),
   }).default({}),
 
+  // 规则仓储（R3a）：文件是真源，DB 镜像只做召回入口。
+  // dir 空 = `$DSH_HOME/rules`；enabled/llm 与 recall 同口径标为运行时可变。
+  rules: z.object({
+    enabled: z.boolean().default(true).volatile(),
+    dir: z.string().default(''),
+    requireGit: z.boolean().default(false),
+    askMode: z.union(['panel+chat', 'panel', 'off']).default('panel+chat'),
+    llm: z.boolean().default(false).volatile(),
+    maxProposals: z.natural().min(1).max(200).default(20),
+    guardStrict: z.boolean().default(true),
+    mirrorAuto: z.boolean().default(true),
+    askCooldownDays: z.natural().min(0).max(3650).default(30),
+  }).default({}),
+
   panel: z.object({
     allowRemote: z.boolean().default(false).volatile(),
     pollMs: z.natural().min(5000).max(600000).default(60000).volatile(),
-    tab: z.union(['overview', 'memory', 'recall', 'writes', 'settings']).default('overview'),
+    tab: z.union(['overview', 'memory', 'rules', 'recall', 'writes', 'settings']).default('overview'),
   }).default({}),
 
   advanced: z.object({

@@ -1,0 +1,984 @@
+/**
+ * 规则仓储（R3a）：文件是真源，DB 只是镜像。
+ *
+ * 职责：
+ * - 规则目录（默认 `$DSH_HOME/rules`，可参数覆盖）的初始化、规则文件读写、manifest 生成；
+ * - 严格 YAML 子集 front matter 的解析/序列化与 schema 校验（不引依赖、不猜格式）；
+ * - 原子写 + 写入前历史快照（每 key 保留 20 份）+ 回滚；
+ * - git 只做本地 add/commit/log/show/revert，**绝不联网**（不 fetch/push/pull）。
+ *
+ * 边界：
+ * - 本模块不认识 DB、不认识 HTTP、不调模型；镜像在 rule-mirror.js，路由在 rules-routes.js。
+ * - 只允许 node 内置模块。校验口径复用 rules.js 的 detectSignals（隐私/模糊/祈使判定），
+ *   避免"规则引擎一套口径、仓储又一套"。
+ *
+ * Why 文件优先：规则需要人可读、可 diff、可回滚；数据库列改一次就要迁移，规则正文却要
+ * 被 owner 反复手改。文件 + git 才是可审计的真源，manifest/history 都是生成物。
+ */
+import { execFileSync } from 'node:child_process'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
+import * as nodeFs from 'node:fs'
+import { randomBytes } from 'node:crypto'
+import { homedir } from 'node:os'
+import { join, resolve } from 'node:path'
+import { detectSignals } from './rules.js'
+
+/** 已知 front matter 字段（顺序即序列化顺序）。未知字段一律报错，不静默丢弃。 */
+export const RULE_FIELDS = Object.freeze([
+  'key', 'type', 'number', 'priority', 'scope', 'role', 'modality', 'action', 'object',
+  'conditions', 'exceptions', 'status', 'merged_into', 'superseded_by', 'created',
+  'updated', 'version', 'origin',
+])
+
+export const RULE_TYPES = Object.freeze(['iron-rule', 'rule', 'rule-candidate'])
+export const RULE_MODALITIES = Object.freeze(['must', 'must_not', 'only', 'except'])
+export const RULE_PRIORITIES = Object.freeze(['P0', 'P1', 'P2'])
+export const RULE_STATUSES = Object.freeze(['active', 'retired', 'superseded', 'proposal'])
+/** 空号永不复用：6 是历史保留号，任何类型都不得占用。 */
+export const RESERVED_NUMBERS = Object.freeze([6])
+
+export const RULE_BODY_MAX = 500
+export const HISTORY_KEEP = 20
+export const MANIFEST_FILE = 'manifest.json'
+export const RULE_DIRS = Object.freeze(['proposals', 'history'])
+/** 跨进程同 key 串行锁目录（生成物，不进 git）。 */
+export const LOCK_DIR = '.locks'
+const GIT_TIMEOUT_MS = 5000
+const GIT_IDENT = Object.freeze(['-c', 'user.name=dsh-whale-memory', '-c', 'user.email=rules@local'])
+
+const KEY_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/
+
+/** key 白名单（同时充当文件/锁路径安全闸；对外导出供路由/镜像复用）。 */
+export function isValidRuleKey(key) {
+  return KEY_RE.test(String(key ?? ''))
+}
+const DATE_RE = /^\d{4}-\d{2}-\d{2}(?:[T ][0-9:.+Z-]+)?$/
+const VAGUE_RE = /(尽量|最好|尽可能|大概|也许|可能)/
+const REASON_RE = /(因为|由于|理由是)/
+const EXCEPTION_RE = /[；;，,]?\s*例外\s*[：:]\s*([^。；;\n]+)/
+
+// ---------------------------------------------------------------------------
+// 路径与默认根
+// ---------------------------------------------------------------------------
+
+/**
+ * 默认规则根：`$DSH_HOME/rules`，未设 DSH_HOME 时 `~/.dsh/rules`。
+ * @param {{ env?: Record<string, string|undefined>, home?: string }} [opts]
+ * @returns {string}
+ */
+export function defaultRuleRoot(opts = {}) {
+  const env = opts.env || process.env
+  const home = opts.home || homedir()
+  const dshHome = String(env.DSH_HOME || '').trim()
+  return dshHome ? join(resolve(dshHome), 'rules') : join(home, '.dsh', 'rules')
+}
+
+/** @param {string} [root] @returns {string} */
+function baseDir(root) {
+  const raw = String(root ?? '').trim()
+  return raw ? resolve(raw) : defaultRuleRoot()
+}
+
+/** 规则文件落点：候选进 proposals/，正式规则在根目录。 */
+function rulePath(root, front) {
+  const dir = front?.type === 'rule-candidate' ? join(root, 'proposals') : root
+  return join(dir, `${front.key}.md`)
+}
+
+// ---------------------------------------------------------------------------
+// YAML 子集：解析
+// ---------------------------------------------------------------------------
+
+/** @param {string} raw @param {number} lineNo @returns {{ok:boolean,value?:any,error?:string}} */
+function parseValue(raw, lineNo) {
+  const s = String(raw ?? '').trim()
+  if (!s) return { ok: true, value: null }
+  if (s.startsWith('[')) {
+    if (!s.endsWith(']')) return { ok: false, error: `unclosed_array:${lineNo}` }
+    const inner = s.slice(1, -1).trim()
+    if (!inner) return { ok: true, value: [] }
+    const parts = splitTopLevel(inner)
+    const out = []
+    for (const part of parts) {
+      const got = parseValue(part, lineNo)
+      if (!got.ok) return got
+      out.push(got.value)
+    }
+    return { ok: true, value: out }
+  }
+  if (s.startsWith('"')) {
+    if (!s.endsWith('"') || s.length < 2) return { ok: false, error: `unclosed_quote:${lineNo}` }
+    try {
+      return { ok: true, value: JSON.parse(s) }
+    } catch {
+      return { ok: false, error: `bad_quote:${lineNo}` }
+    }
+  }
+  if (s.startsWith("'")) {
+    if (!s.endsWith("'") || s.length < 2) return { ok: false, error: `unclosed_quote:${lineNo}` }
+    return { ok: true, value: s.slice(1, -1).replace(/''/g, "'") }
+  }
+  const lower = s.toLowerCase()
+  if (lower === 'null' || s === '~') return { ok: true, value: null }
+  if (lower === 'true') return { ok: true, value: true }
+  if (lower === 'false') return { ok: true, value: false }
+  if (/^-?\d+$/.test(s)) return { ok: true, value: Number(s) }
+  if (/^-?\d+\.\d+$/.test(s)) return { ok: true, value: Number(s) }
+  return { ok: true, value: s }
+}
+
+/** 行内数组按顶层逗号切（引号里的逗号不切）。 */
+function splitTopLevel(inner) {
+  const out = []
+  let buf = ''
+  let quote = ''
+  for (let i = 0; i < inner.length; i += 1) {
+    const ch = inner[i]
+    if (quote) {
+      buf += ch
+      if (ch === quote && inner[i - 1] !== '\\') quote = ''
+      continue
+    }
+    if (ch === '"' || ch === "'") { quote = ch; buf += ch; continue }
+    if (ch === ',') { out.push(buf.trim()); buf = ''; continue }
+    buf += ch
+  }
+  if (buf.trim()) out.push(buf.trim())
+  return out
+}
+
+/**
+ * 解析规则文件（front matter + 正文）。
+ * 失败返回 `{ok:false,error}`，不抛；错误带行号/字段名，便于面板直接展示。
+ *
+ * @param {string} source 文件全文
+ * @returns {{ok:boolean,front?:object,text?:string,bodyStart?:number,error?:string}}
+ */
+export function parseRuleDocument(source) {
+  const text = String(source ?? '').replace(/^\uFEFF/, '').replace(/\r\n/g, '\n')
+  const lines = text.split('\n')
+  if (lines[0]?.trim() !== '---') return { ok: false, error: 'front_matter_missing' }
+  let end = -1
+  for (let i = 1; i < lines.length; i += 1) {
+    if (lines[i].trim() === '---') { end = i; break }
+  }
+  if (end < 0) return { ok: false, error: 'front_matter_unclosed' }
+
+  /** @type {Record<string, any>} */
+  const front = {}
+  for (let i = 1; i < end; i += 1) {
+    const raw = lines[i]
+    const trimmed = raw.trim()
+    if (!trimmed || trimmed.startsWith('#')) continue // 注释不是字段，避免手写文件被误判未知字段
+    const m = raw.match(/^([a-z][a-z0-9_]*):(?:\s*(.*))?$/)
+    if (!m) return { ok: false, error: `invalid_line:${i + 1}` }
+    const field = m[1]
+    if (Object.prototype.hasOwnProperty.call(front, field)) return { ok: false, error: `duplicate_field:${field}` }
+    const got = parseValue(m[2], i + 1)
+    if (!got.ok) return { ok: false, error: got.error }
+    front[field] = got.value
+  }
+
+  let bodyLines = lines.slice(end + 1)
+  let skippedBlank = 0
+  // 规范格式是 `---` 后空一行；手写文件可能没有空行，两种都吃。
+  while (bodyLines.length > 1 && bodyLines[0].trim() === '') {
+    bodyLines = bodyLines.slice(1)
+    skippedBlank += 1
+  }
+  const body = bodyLines.join('\n').replace(/\n+$/, '')
+  const headerLen = lines.slice(0, end + 1).reduce((sum, line) => sum + line.length + 1, 0)
+  return { ok: true, front, text: body, bodyStart: headerLen + skippedBlank }
+}
+
+// ---------------------------------------------------------------------------
+// YAML 子集：序列化
+// ---------------------------------------------------------------------------
+
+/** 简单标量不加引号（可读性）；其余走 JSON 双引号，保证可逆。 */
+function encodeScalar(value) {
+  if (value === null || value === undefined) return 'null'
+  if (typeof value === 'boolean') return String(value)
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new Error('non_finite_number')
+    return String(value)
+  }
+  const s = String(value)
+  if (!s) return '""'
+  const lower = s.toLowerCase()
+  if (lower === 'null' || lower === 'true' || lower === 'false' || lower === '~') return JSON.stringify(s)
+  if (/^-?\d+(?:\.\d+)?$/.test(s)) return JSON.stringify(s)
+  if (/^[\p{L}\p{N}][\p{L}\p{N}._@:/\\-]*$/u.test(s)) return s
+  return JSON.stringify(s)
+}
+
+function encodeValue(value) {
+  if (Array.isArray(value)) return `[${value.map((item) => encodeScalar(item)).join(', ')}]`
+  return encodeScalar(value)
+}
+
+/**
+ * 序列化规则文件。未知字段直接报错（与解析/校验同一白名单）。
+ * @param {{front:object,text?:string,body?:string}} doc
+ * @returns {{ok:boolean,text?:string,error?:string}}
+ */
+export function serializeRuleDocument(doc) {
+  const front = doc?.front && typeof doc.front === 'object' ? doc.front : doc
+  if (!front || typeof front !== 'object') return { ok: false, error: 'invalid_front' }
+  const body = String(doc?.text ?? doc?.body ?? '')
+  const unknown = Object.keys(front).filter((key) => !RULE_FIELDS.includes(key))
+  if (unknown.length) return { ok: false, error: `unknown_field:${unknown.join(',')}` }
+  const lines = ['---']
+  for (const field of RULE_FIELDS) {
+    if (!Object.prototype.hasOwnProperty.call(front, field)) continue
+    let encoded
+    try {
+      encoded = encodeValue(front[field])
+    } catch (err) {
+      return { ok: false, error: `bad_value:${field}:${err?.message || err}` }
+    }
+    lines.push(`${field}: ${encoded}`)
+  }
+  lines.push('---', '')
+  return { ok: true, text: `${lines.join('\n')}\n${body}\n` }
+}
+
+// ---------------------------------------------------------------------------
+// 归一化与校验
+// ---------------------------------------------------------------------------
+
+function today() {
+  return new Date().toISOString().slice(0, 10)
+}
+
+/** 补默认值（不改入参）；序列化前必须调用，避免文件里少字段导致每处各猜一遍。 */
+export function normalizeRuleDoc(front, text) {
+  // 刻意保留未知字段：normalize 不能当白名单（否则 validate 永远看不到拼错的字段）。
+  // 序列化与校验各自拒绝未知字段，形成两道闸。
+  const f = front && typeof front === 'object' ? { ...front } : {}
+  const out = { ...f }
+  const type = String(out.type ?? '').trim()
+  out.key = String(out.key ?? '').trim()
+  out.type = type
+  out.number = out.number === undefined || out.number === null || out.number === '' ? null : Number(out.number)
+  out.priority = String(out.priority ?? 'P1').trim().toUpperCase()
+  out.scope = String(out.scope ?? 'global').trim() || 'global'
+  out.role = String(out.role ?? '').trim()
+  out.modality = String(out.modality ?? 'must').trim()
+  out.action = String(out.action ?? '').trim()
+  out.object = String(out.object ?? '').trim()
+  out.conditions = Array.isArray(out.conditions) ? out.conditions.map((x) => String(x ?? '').trim()).filter(Boolean) : []
+  out.exceptions = Array.isArray(out.exceptions) ? out.exceptions.map((x) => String(x ?? '').trim()).filter(Boolean) : []
+  out.status = String(out.status ?? (type === 'rule-candidate' ? 'proposal' : 'active')).trim()
+  out.merged_into = String(out.merged_into ?? '').trim()
+  out.superseded_by = String(out.superseded_by ?? '').trim()
+  out.created = String(out.created ?? today()).trim()
+  out.updated = String(out.updated ?? today()).trim()
+  out.version = out.version === undefined || out.version === null || out.version === '' ? 1 : Number(out.version)
+  out.origin = String(out.origin ?? '').trim()
+  return { front: out, text: String(text ?? '') }
+}
+
+/** @param {string} scope @returns {string|null} 错误码，null=合法。 */
+function scopeError(scope) {
+  const s = String(scope ?? '')
+  if (s === 'global') return null
+  if (s.startsWith('workspace:')) {
+    const p = s.slice('workspace:'.length).trim()
+    if (!p) return 'scope_workspace_empty'
+    if (!(p.startsWith('/') || /^[A-Za-z]:[\\/]/.test(p))) return 'scope_workspace_relative'
+    return null
+  }
+  if (s.startsWith('role:')) {
+    const role = s.slice('role:'.length).trim()
+    if (!role || /\s/.test(role) || role.length > 64) return 'scope_role_invalid'
+    return null
+  }
+  return 'scope_invalid'
+}
+
+function charsOf(text) {
+  return Array.from(String(text ?? '')).length
+}
+
+/**
+ * 校验一条规则（front + 正文）。
+ *
+ * 失败返回错误数组而不是第一条：面板要一次展示所有问题，避免"改一个再报下一个"。
+ * numbers 传入 `Map<number,key>`，用于跨文件编号唯一性；更新自身文件时调用方须先剔除自己。
+ *
+ * @param {object} front 已归一化 front
+ * @param {string} text 正文
+ * @param {{numbers?: Map<number,string>}} [opts]
+ * @returns {{ok:boolean,errors:Array<{code:string,field:string|null,message:string}>}}
+ */
+export function validateRule(front, text, opts = {}) {
+  const errors = []
+  const push = (code, field, message) => errors.push({ code, field, message })
+  const f = front && typeof front === 'object' ? front : {}
+
+  const unknown = Object.keys(f).filter((key) => !RULE_FIELDS.includes(key))
+  for (const field of unknown) push('unknown_field', field, `未知字段：${field}`)
+
+  if (!KEY_RE.test(String(f.key ?? ''))) push('invalid_key', 'key', 'key 必须是 1–64 位小写字母/数字/._-')
+  if (!RULE_TYPES.includes(f.type)) push('invalid_type', 'type', `type 必须是 ${RULE_TYPES.join('|')}`)
+  if (!Number.isInteger(f.number) || f.number <= 0) push('invalid_number', 'number', 'number 必须是正整数')
+  else if (RESERVED_NUMBERS.includes(f.number)) push('number_reserved', 'number', `编号 ${f.number} 是保留空号，永不复用`)
+  if (!RULE_PRIORITIES.includes(String(f.priority ?? '').toUpperCase())) {
+    push('invalid_priority', 'priority', `priority 必须是 ${RULE_PRIORITIES.join('|')}`)
+  }
+  const scopeErr = scopeError(f.scope)
+  if (scopeErr) push(scopeErr, 'scope', 'scope 必须是 global|workspace:<绝对路径>|role:<id>')
+  if (!RULE_MODALITIES.includes(f.modality)) push('invalid_modality', 'modality', `modality 必须是 ${RULE_MODALITIES.join('|')}`)
+  if (!RULE_STATUSES.includes(f.status)) push('invalid_status', 'status', `status 必须是 ${RULE_STATUSES.join('|')}`)
+  if (!DATE_RE.test(String(f.created ?? ''))) push('invalid_created', 'created', 'created 必须是 YYYY-MM-DD')
+  if (!DATE_RE.test(String(f.updated ?? ''))) push('invalid_updated', 'updated', 'updated 必须是 YYYY-MM-DD')
+  if (!Number.isInteger(f.version) || f.version < 1) push('invalid_version', 'version', 'version 必须是正整数')
+
+  for (const field of ['conditions', 'exceptions']) {
+    if (!Array.isArray(f[field])) { push(`invalid_${field}`, field, `${field} 必须是字符串数组`); continue }
+    if (f[field].some((item) => typeof item !== 'string' || !item.trim())) {
+      push(`invalid_${field}`, field, `${field} 不允许空项/非字符串`)
+    }
+  }
+
+  const body = String(text ?? '')
+  const chars = charsOf(body)
+  if (chars === 0) push('body_empty', null, '正文不能为空')
+  if (chars > RULE_BODY_MAX) push('body_too_long', null, `正文 ${chars} 字，超过硬顶 ${RULE_BODY_MAX}`)
+
+  const numbers = opts.numbers instanceof Map ? opts.numbers : new Map()
+  if (Number.isInteger(f.number) && numbers.has(f.number) && numbers.get(f.number) !== f.key) {
+    push('duplicate_number', 'number', `编号 ${f.number} 已被 ${numbers.get(f.number)} 占用`)
+  }
+
+  // 隐私口径复用 rules.js：密钥/手机号/身份证/口令命中即拒绝（所有类型）。
+  const signals = detectSignals(body)
+  if (signals.rejectReason === 'privacy') push('privacy', null, '正文含密钥/手机号/身份证等敏感信息')
+  if (!signals.imperative) push('not_imperative', null, '正文必须是指令形态（祈使/显式约束）')
+
+  if (f.type === 'iron-rule') {
+    if (VAGUE_RE.test(body)) push('vague_word', null, '铁律不得含模糊词（尽量/最好/尽可能/大概/也许/可能）')
+    if (REASON_RE.test(body)) push('reason_sentence', null, '铁律不得含理由句（因为/由于/理由是）')
+  }
+
+  return { ok: errors.length === 0, errors }
+}
+
+// ---------------------------------------------------------------------------
+// 原子写 / 历史
+// ---------------------------------------------------------------------------
+
+/**
+ * 原子写：同目录 tmp + rename；失败清理 tmp，旧文件保持原样。
+ * @param {string} file @param {string} text @param {{fs?: typeof nodeFs}} [opts]
+ * @returns {{ok:boolean,error?:string}}
+ */
+export function atomicWriteFile(file, text, opts = {}) {
+  const fs = opts.fs || nodeFs
+  const tmp = `${file}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`
+  try {
+    fs.writeFileSync(tmp, String(text), 'utf8')
+    fs.renameSync(tmp, file)
+    return { ok: true }
+  } catch (err) {
+    try { fs.unlinkSync(tmp) } catch { /* tmp 可能没建出来；清理失败不掩盖原始错误 */ }
+    return { ok: false, error: String(err?.message || err) }
+  }
+}
+
+/** 同步等待（主线程无 await 可用；锁只持有毫秒级，阻塞可接受）。 */
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(1, ms))
+}
+
+/**
+ * 同 key 跨进程互斥：mkdir 是原子的，抢不到就等；崩溃遗留锁超过 staleMs 视为失效。
+ * 为什么必须跨进程：规则目录可能被编辑器/脚本/面板同时写；仅靠 tmp+rename 能保证
+ * 文件不半截，但编号校验、历史快照仍会交错。锁范围只覆盖准备→落盘→manifest。
+ *
+ * @param {string} root @param {string} key
+ * @param {{fs?: typeof nodeFs, timeoutMs?: number, staleMs?: number}} [opts]
+ * @returns {{ok:boolean,release?:Function,error?:string}}
+ */
+export function acquireRuleLock(root, key, opts = {}) {
+  if (!isValidRuleKey(key)) return { ok: false, error: 'invalid_key' }
+  const fs = opts.fs || nodeFs
+  const lockRoot = join(baseDir(root), LOCK_DIR)
+  const lock = join(lockRoot, `${key}.lock`)
+  const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : 3000
+  const staleMs = Number.isFinite(opts.staleMs) ? opts.staleMs : 10000
+  const started = Date.now()
+  try { fs.mkdirSync(lockRoot, { recursive: true }) } catch (err) {
+    return { ok: false, error: `lock_dir_failed:${err?.message || err}` }
+  }
+  for (;;) {
+    try {
+      fs.mkdirSync(lock)
+      return {
+        ok: true,
+        release() {
+          try { fs.rmdirSync(lock) } catch { /* 已被清理/权限变化：不应掩盖写入结果 */ }
+        },
+      }
+    } catch (err) {
+      if (err?.code !== 'EEXIST') return { ok: false, error: `lock_failed:${err?.message || err}` }
+      try {
+        if (Date.now() - fs.statSync(lock).mtimeMs > staleMs) { fs.rmdirSync(lock); continue }
+      } catch { continue } // 锁刚被释放/stat 失败：立刻重试
+      if (Date.now() - started > timeoutMs) return { ok: false, error: 'rule_locked' }
+      sleepSync(10)
+    }
+  }
+}
+
+/** 17 位时间戳（YYYYMMDDHHmmssSSS），与 DB 快照命名口径一致。 */
+function stampNow(d = new Date()) {
+  const p = (n, w = 2) => String(n).padStart(w, '0')
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}${p(d.getMilliseconds(), 3)}`
+}
+
+/** 同一毫秒内多次写入时追加序号，保证快照不互相覆盖。 */
+function uniqueStamp(dir, fs) {
+  const base = stampNow()
+  let stamp = base
+  for (let i = 2; existsSyncSafe(join(dir, `${stamp}.md`), fs); i += 1) stamp = `${base}-${i}`
+  return stamp
+}
+
+function existsSyncSafe(path, fs = nodeFs) {
+  try { return fs.existsSync(path) } catch { return false }
+}
+
+function pruneHistory(dir, fs) {
+  let names
+  try { names = fs.readdirSync(dir).filter((n) => n.endsWith('.md')).sort() } catch { return [] }
+  const removed = []
+  for (const name of names.slice(0, Math.max(0, names.length - HISTORY_KEEP))) {
+    try { fs.unlinkSync(join(dir, name)); removed.push(name) } catch { /* 删不掉就留着，历史多一份比丢一份安全 */ }
+  }
+  return removed
+}
+
+/**
+ * 写入前把旧文件全文快照到 `history/<key>/<ts>.md`，只保留 20 份。
+ * @param {string} root @param {string} key @param {string} content @param {{fs?: typeof nodeFs}} [opts]
+ * @returns {{ok:boolean,rev?:string,error?:string}}
+ */
+export function writeHistorySnapshot(root, key, content, opts = {}) {
+  if (!isValidRuleKey(key)) return { ok: false, error: 'invalid_key' }
+  const fs = opts.fs || nodeFs
+  const dir = join(baseDir(root), 'history', key)
+  try {
+    fs.mkdirSync(dir, { recursive: true })
+    const rev = uniqueStamp(dir, fs)
+    fs.writeFileSync(join(dir, `${rev}.md`), String(content), 'utf8')
+    pruneHistory(dir, fs)
+    return { ok: true, rev }
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) }
+  }
+}
+
+/**
+ * 历史列表（新→旧）。source 取快照 front.origin；解析失败也给空 front，不丢文件记录。
+ * @param {string} root @param {string} key
+ * @returns {{ok:boolean,entries?:Array<{rev:string,ts:string,source:string,text:string}>,error?:string}}
+ */
+export function readHistory(root, key) {
+  if (!isValidRuleKey(key)) return { ok: false, error: 'invalid_key' }
+  const base = baseDir(root)
+  const dir = join(base, 'history', key)
+  let names
+  try { names = readdirSync(dir).filter((n) => n.endsWith('.md')).sort().reverse() } catch (err) {
+    if (err?.code === 'ENOENT') return { ok: true, entries: [] }
+    return { ok: false, error: String(err?.message || err) }
+  }
+  const entries = []
+  for (const name of names) {
+    const rev = name.replace(/\.md$/, '')
+    const parsed = readSnapshotFile(base, key, rev)
+    entries.push({
+      rev,
+      ts: isoOfRev(rev),
+      source: parsed.ok ? String(parsed.rule.front.origin || 'file') : 'file',
+      text: parsed.ok ? parsed.rule.text : '',
+    })
+  }
+  return { ok: true, entries }
+}
+
+function readSnapshotFile(base, key, rev) {
+  const file = join(base, 'history', key, `${rev}.md`)
+  let source
+  try { source = readFileSync(file, 'utf8') } catch (err) {
+    return { ok: false, error: err?.code === 'ENOENT' ? 'snapshot_not_found' : String(err?.message || err) }
+  }
+  const parsed = parseRuleDocument(source)
+  if (!parsed.ok) return { ok: false, error: parsed.error }
+  const normalized = normalizeRuleDoc(parsed.front, parsed.text)
+  return { ok: true, rule: { ...normalized, bodyStart: parsed.bodyStart, file } }
+}
+
+/** 17 位戳 → ISO（失败给空串，历史列表不该因命名异常整列失败）。 */
+function isoOfRev(rev) {
+  const m = String(rev).match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(\d{3})/)
+  if (!m) return ''
+  return `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}.${m[7]}`
+}
+
+/**
+ * 读某个历史快照（不写盘）。
+ * @param {string} root @param {string} key @param {string} rev
+ * @returns {{ok:boolean,rule?:object,error?:string}}
+ */
+export function readSnapshot(root, key, rev) {
+  if (!KEY_RE.test(String(key ?? ''))) return { ok: false, error: 'invalid_key' }
+  if (!/^[0-9-]+$/.test(String(rev ?? ''))) return { ok: false, error: 'invalid_rev' }
+  return readSnapshotFile(baseDir(root), key, rev)
+}
+
+// ---------------------------------------------------------------------------
+// 读写规则
+// ---------------------------------------------------------------------------
+
+function findRuleFile(root, key) {
+  for (const file of [join(root, `${key}.md`), join(root, 'proposals', `${key}.md`)]) {
+    if (existsSync(file)) return file
+  }
+  return ''
+}
+
+/**
+ * 读单条规则（含 front 默认值 + 正文 + 正文起始偏移）。
+ * @param {string} root @param {string} key
+ * @returns {{ok:boolean,rule?:{front:object,text:string,bodyStart:number,file:string},error?:string,detail?:any}}
+ */
+export function readRule(root, key) {
+  const base = baseDir(root)
+  if (!KEY_RE.test(String(key ?? ''))) return { ok: false, error: 'invalid_key' }
+  const file = findRuleFile(base, key)
+  if (!file) return { ok: false, error: 'rule_not_found' }
+  let source
+  try { source = readFileSync(file, 'utf8') } catch (err) { return { ok: false, error: String(err?.message || err) } }
+  const parsed = parseRuleDocument(source)
+  if (!parsed.ok) return { ok: false, error: 'invalid_rule', detail: { parse: parsed.error } }
+  const normalized = normalizeRuleDoc(parsed.front, parsed.text)
+  const check = validateRule(normalized.front, normalized.text, { numbers: new Map() })
+  if (!check.ok) return { ok: false, error: 'invalid_rule', detail: check.errors }
+  return {
+    ok: true,
+    rule: { front: normalized.front, text: normalized.text, bodyStart: parsed.bodyStart, file },
+  }
+}
+
+/**
+ * 列出全部规则（根目录 + proposals/）。
+ * 解析失败的条目进 errors（不吞、不覆盖），合法条目才参与编号/manifest。
+ *
+ * @param {string} root
+ * @returns {{ok:boolean,rules:Array<object>,errors:Array<{file:string,error:string}>}}
+ */
+export function listRules(root) {
+  const base = baseDir(root)
+  const rules = []
+  const errors = []
+  const files = []
+  for (const dir of [base, join(base, 'proposals')]) {
+    let names
+    try { names = readdirSync(dir).filter((n) => n.endsWith('.md')) } catch { continue }
+    files.push(...names.sort().map((name) => ({ dir, name })))
+  }
+  const numbers = new Map()
+  for (const { dir, name } of files) {
+    const file = join(dir, name)
+    if (name.toUpperCase() === 'README.MD') continue
+    let source
+    try { source = readFileSync(file, 'utf8') } catch (err) { errors.push({ file, error: String(err?.message || err) }); continue }
+    const parsed = parseRuleDocument(source)
+    if (!parsed.ok) { errors.push({ file, error: parsed.error }); continue }
+    const normalized = normalizeRuleDoc(parsed.front, parsed.text)
+    const check = validateRule(normalized.front, normalized.text, { numbers })
+    if (!check.ok) { errors.push({ file, error: 'invalid_rule', detail: check.errors }); continue }
+    if (numbers.has(normalized.front.number)) {
+      errors.push({ file, error: 'duplicate_number', detail: { number: normalized.front.number } })
+      continue
+    }
+    numbers.set(normalized.front.number, normalized.front.key)
+    rules.push({ ...normalized, bodyStart: parsed.bodyStart, file })
+  }
+  rules.sort((a, b) => a.front.number - b.front.number || a.front.key.localeCompare(b.front.key))
+  return { ok: true, rules, errors }
+}
+
+/**
+ * 写一条规则：归一化 → 校验 → 历史快照 → 原子写 → manifest → git commit。
+ *
+ * 并发：同 key 的两个同步写入天然串行（Node 单线程 + 唯一 tmp 名）；跨进程 rename 原子，
+ * 最后写入者胜出，但不会出现半文件。
+ *
+ * @param {string} root
+ * @param {{front?:object,text?:string,body?:string}|object} input 可传 `{front,text}` 或扁平 front
+ * @param {{fs?: typeof nodeFs, git?: boolean, exec?: Function}} [opts]
+ * @returns {{ok:boolean,rule?:object,path?:string,history?:string,git?:object,error?:string,detail?:any}}
+ */
+export function writeRule(root, input, opts = {}) {
+  const fs = opts.fs || nodeFs
+  const base = baseDir(root)
+  const rawFront = input?.front && typeof input.front === 'object' ? input.front : input
+  const rawText = input?.text ?? input?.body ?? ''
+  const normalized = normalizeRuleDoc(rawFront, rawText)
+  // 先挡住路径：key 会进目录名/文件名，后面的 ensure（建目录）与锁都不能拿到越界 key。
+  if (!isValidRuleKey(normalized.front.key)) {
+    return { ok: false, error: 'invalid_rule', detail: [{ code: 'invalid_key', field: 'key', message: 'key 非法' }] }
+  }
+
+  // 首次写规则时初始化 git 仓库；git 缺失只降级（ensureRuleRepo 不抛），文件仍可写。
+  const ensured = ensureRuleRepo({ root: base, git: opts.git !== false, fs, exec: opts.exec })
+  if (!ensured.ok) return { ok: false, error: 'ensure_failed', detail: { root: base, error: ensured.error } }
+
+  // 编号校验、历史快照、落盘、manifest 必须在同一把同 key 锁内，否则并发写会撞号/丢快照。
+  const lock = acquireRuleLock(base, normalized.front.key, { fs })
+  if (!lock.ok) return { ok: false, error: lock.error }
+  try {
+    const existing = listRules(base)
+    const numbers = new Map()
+    for (const doc of existing.rules) {
+      if (doc.front.key === normalized.front.key) continue
+      numbers.set(doc.front.number, doc.front.key)
+    }
+    const check = validateRule(normalized.front, normalized.text, { numbers })
+    if (!check.ok) return { ok: false, error: 'invalid_rule', detail: check.errors }
+
+    const serialized = serializeRuleDocument(normalized)
+    if (!serialized.ok) return { ok: false, error: 'serialize_failed', detail: serialized.error }
+
+    const target = rulePath(base, normalized.front)
+    const oldFile = findRuleFile(base, normalized.front.key)
+    let snapshot = null
+    if (oldFile) {
+      let oldText
+      try { oldText = fs.readFileSync(oldFile, 'utf8') } catch (err) {
+        return { ok: false, error: 'snapshot_read_failed', detail: String(err?.message || err) }
+      }
+      snapshot = writeHistorySnapshot(base, normalized.front.key, oldText, { fs })
+      if (!snapshot.ok) return { ok: false, error: 'snapshot_failed', detail: snapshot.error }
+    }
+
+    const written = atomicWriteFile(target, serialized.text, { fs })
+    if (!written.ok) return { ok: false, error: 'write_failed', detail: written.error }
+    if (oldFile && oldFile !== target) {
+      try { fs.unlinkSync(oldFile) } catch (err) {
+        // 两份文件同时存在会让 listRules 报编号冲突；回滚新文件，保持旧状态。
+        try { fs.unlinkSync(target) } catch { /* best effort */ }
+        return { ok: false, error: 'move_failed', detail: String(err?.message || err) }
+      }
+    }
+
+    const manifest = regenerateManifest(base, { fs })
+    if (!manifest.ok) return { ok: false, error: 'manifest_failed', detail: manifest.error }
+
+    let git = null
+    if (opts.git !== false) {
+      git = gitCommit(base, `rules: ${normalized.front.key} v${normalized.front.version}`, { exec: opts.exec })
+    }
+    return {
+      ok: true,
+      rule: {
+        front: normalized.front,
+        text: normalized.text,
+        bodyStart: parseRuleDocument(serialized.text).bodyStart,
+        file: target,
+      },
+      path: target,
+      history: snapshot?.rev || '',
+      manifest: manifest.manifest,
+      git,
+    }
+  } finally {
+    lock.release()
+  }
+}
+
+/**
+ * 删除规则：默认 status=retired 留文件；只有 rule-candidate + force=true 才物理删。
+ * @param {string} root @param {string} key
+ * @param {{force?:boolean,fs?:typeof nodeFs,git?:boolean,exec?:Function}} [opts]
+ * @returns {{ok:boolean,deleted?:boolean,retired?:boolean,rule?:object,error?:string,detail?:any}}
+ */
+export function deleteRule(root, key, opts = {}) {
+  const base = baseDir(root)
+  const fs = opts.fs || nodeFs
+  const got = readRule(base, key)
+  if (!got.ok) return got
+  const doc = got.rule
+  if (opts.force === true && doc.front.type === 'rule-candidate') {
+    let oldText
+    try { oldText = fs.readFileSync(doc.file, 'utf8') } catch (err) { return { ok: false, error: String(err?.message || err) } }
+    const snap = writeHistorySnapshot(base, key, oldText, { fs })
+    if (!snap.ok) return { ok: false, error: 'snapshot_failed', detail: snap.error }
+    try { fs.unlinkSync(doc.file) } catch (err) { return { ok: false, error: 'delete_failed', detail: String(err?.message || err) } }
+    regenerateManifest(base, { fs })
+    if (opts.git !== false) gitCommit(base, `rules: delete candidate ${key}`, { exec: opts.exec })
+    return { ok: true, deleted: true }
+  }
+  const next = normalizeRuleDoc({
+    ...doc.front,
+    status: 'retired',
+    updated: today(),
+    version: Number(doc.front.version) + 1,
+  }, doc.text)
+  const saved = writeRule(base, next, opts)
+  if (!saved.ok) return saved
+  return { ok: true, retired: true, rule: saved.rule }
+}
+
+/**
+ * 按正常写流程回滚到某个历史快照（先校验，再快照当前版本，再落盘）。
+ * @param {string} root @param {string} key @param {string} rev
+ * @param {{fs?:typeof nodeFs,git?:boolean,exec?:Function}} [opts]
+ * @returns {{ok:boolean,rule?:object,rolledBackTo?:string,error?:string,detail?:any}}
+ */
+export function rollbackTo(root, key, rev, opts = {}) {
+  const snap = readSnapshot(root, key, rev)
+  if (!snap.ok) return snap
+  const saved = writeRule(root, snap.rule, opts)
+  if (!saved.ok) return saved
+  return { ...saved, rolledBackTo: rev }
+}
+
+// ---------------------------------------------------------------------------
+// manifest
+// ---------------------------------------------------------------------------
+
+/** 有规则时的下一个编号：max+1，跳过保留空号（6）。 */
+export function nextRuleNumber(numbers) {
+  const list = Array.from(numbers || []).filter((n) => Number.isInteger(n) && n > 0)
+  let next = list.length ? Math.max(...list) + 1 : 1
+  while (RESERVED_NUMBERS.includes(next)) next += 1
+  return next
+}
+
+/**
+ * 由规则列表计算 manifest 视图（纯函数，GET 列表用；不写盘）。
+ * @param {Array<object>} rules listRules 的 rules
+ * @returns {{nextNumber:number,total:number,byStatus:Record<string,number>}}
+ */
+export function computeManifest(rules) {
+  const byStatus = {}
+  const numbers = []
+  for (const doc of Array.isArray(rules) ? rules : []) {
+    const status = String(doc?.front?.status || 'unknown')
+    byStatus[status] = (byStatus[status] || 0) + 1
+    if (Number.isInteger(doc?.front?.number)) numbers.push(doc.front.number)
+  }
+  return { nextNumber: nextRuleNumber(numbers), total: numbers.length, byStatus }
+}
+
+/**
+ * 生成 manifest.json（生成物，勿手改）；内容稳定排序，便于 git diff。
+ * @param {string} root @param {{fs?:typeof nodeFs}} [opts]
+ * @returns {{ok:boolean,manifest?:object,error?:string}}
+ */
+export function regenerateManifest(root, opts = {}) {
+  const fs = opts.fs || nodeFs
+  const base = baseDir(root)
+  const list = listRules(base)
+  const view = computeManifest(list.rules)
+  const manifest = {
+    ...view,
+    keys: list.rules.map((doc) => doc.front.key),
+    updatedAt: new Date().toISOString(),
+  }
+  try {
+    fs.mkdirSync(base, { recursive: true })
+    const written = atomicWriteFile(join(base, MANIFEST_FILE), `${JSON.stringify(manifest, null, 2)}\n`, { fs })
+    if (!written.ok) return { ok: false, error: written.error }
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) }
+  }
+  return { ok: true, manifest }
+}
+
+/** 只读 manifest（缺失/坏 JSON 返回 null，调用方可回退到 computeManifest）。 */
+export function readManifest(root) {
+  try {
+    return JSON.parse(readFileSync(join(baseDir(root), MANIFEST_FILE), 'utf8'))
+  } catch {
+    return null
+  }
+}
+
+// ---------------------------------------------------------------------------
+// git（本地 only）
+// ---------------------------------------------------------------------------
+
+function gitEnv() {
+  return {
+    ...process.env,
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_OPTIONAL_LOCKS: '0',
+  }
+}
+
+/** 统一执行入口：`-C dir` + 固定身份 + `--no-optional-locks` + 5s 超时；不联网。 */
+function runGit(dir, args, opts = {}) {
+  const exec = opts.exec || execFileSync
+  try {
+    const out = exec('git', ['-C', dir, ...GIT_IDENT, '--no-optional-locks', ...args], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: opts.timeoutMs || GIT_TIMEOUT_MS,
+      env: gitEnv(),
+    })
+    return { ok: true, out: String(out ?? '') }
+  } catch (err) {
+    const code = err?.code || err?.status || ''
+    const stderr = String(err?.stderr ?? '')
+    const message = stderr.trim() || String(err?.message || err)
+    if (code === 'ENOENT') return { ok: false, error: 'git_unavailable' }
+    return { ok: false, error: message || 'git_failed', code }
+  }
+}
+
+/** @param {string} dir @returns {{ok:boolean,error?:string}} */
+export function isGitRepo(dir, opts = {}) {
+  const r = runGit(dir, ['rev-parse', '--is-inside-work-tree'], opts)
+  if (!r.ok) return r
+  return { ok: r.out.trim() === 'true' }
+}
+
+/**
+ * add -A + commit；无改动视为成功但不提交（规则写失败不该被空 commit 掩盖）。
+ * @returns {{ok:boolean,committed?:boolean,error?:string}}
+ */
+export function gitCommit(dir, message, opts = {}) {
+  const added = runGit(dir, ['add', '-A'], opts)
+  if (!added.ok) return added
+  const staged = runGit(dir, ['diff', '--cached', '--quiet'], opts)
+  // diff --quiet 有差异时退出码 1；runGit 把非 0 当失败，这里按"有差异"解释。
+  if (!staged.ok && staged.code === 1) {
+    const committed = runGit(dir, ['commit', '-m', String(message || 'rules: update'), '--no-gpg-sign'], opts)
+    if (!committed.ok) return committed
+    return { ok: true, committed: true, out: committed.out }
+  }
+  return { ok: true, committed: false }
+}
+
+/** @returns {{ok:boolean,entries?:Array<{hash:string,subject:string}>,error?:string}} */
+export function gitLog(dir, limit = 20, opts = {}) {
+  const n = Math.max(1, Math.min(200, Number(limit) || 20))
+  const r = runGit(dir, ['log', `-n${n}`, '--pretty=format:%h%x09%s'], opts)
+  if (!r.ok) return r
+  const entries = r.out.split('\n').map((line) => line.trim()).filter(Boolean).map((line) => {
+    const [hash, ...rest] = line.split('\t')
+    return { hash, subject: rest.join('\t') }
+  })
+  return { ok: true, entries }
+}
+
+/**
+ * 展示某个 revision：file 给定时返回该文件在该版本的内容，否则返回 --stat 摘要。
+ * @param {string} dir @param {string} rev @param {{file?:string}} [opts]
+ * @returns {{ok:boolean,text?:string,error?:string}}
+ */
+export function gitShow(dir, rev, opts = {}) {
+  const revision = String(rev ?? '').trim()
+  if (!revision || revision.startsWith('-')) return { ok: false, error: 'invalid_rev' }
+  const args = opts.file
+    ? ['show', `${revision}:${opts.file}`]
+    : ['show', '--stat', '--no-color', '--no-renames', revision]
+  const r = runGit(dir, args, opts)
+  return r.ok ? { ok: true, text: r.out } : r
+}
+
+/** revert --no-edit（冲突时返回错误，不自动解冲突、不联网）。 */
+export function gitRevert(dir, rev, opts = {}) {
+  const revision = String(rev ?? '').trim()
+  if (!revision || revision.startsWith('-')) return { ok: false, error: 'invalid_rev' }
+  const r = runGit(dir, ['revert', '--no-edit', revision], opts)
+  return r.ok ? { ok: true, text: r.out } : r
+}
+
+// ---------------------------------------------------------------------------
+// 仓库初始化
+// ---------------------------------------------------------------------------
+
+/**
+ * 建目录 + README + .gitignore + manifest + git init/首次 commit。
+ * git 缺失/失败只降级返回 `{git:{available:false}}`，不抛——规则文件仍可读写。
+ *
+ * @param {{root?:string,git?:boolean,exec?:Function,fs?:typeof nodeFs}} [opts]
+ * @returns {{ok:boolean,root?:string,git?:{available:boolean,version?:string,initialized?:boolean,committed?:boolean,error?:string},error?:string}}
+ */
+export function ensureRuleRepo(opts = {}) {
+  const fs = opts.fs || nodeFs
+  const root = baseDir(opts.root)
+  try {
+    fs.mkdirSync(root, { recursive: true })
+    for (const dir of RULE_DIRS) fs.mkdirSync(join(root, dir), { recursive: true })
+    const readme = join(root, 'README.md')
+    if (!existsSyncSafe(readme, fs)) {
+      fs.writeFileSync(readme, [
+        '# 规则目录',
+        '',
+        '规则文件是真源；manifest.json 与 history/ 是生成物。',
+        '- 规则：`<key>.md`（front matter + 正文）',
+        '- 候选：`proposals/<key>.md`',
+        '- 历史：`history/<key>/<YYYYMMDDHHmmssSSS>.md`（每个 key 保留 20 份）',
+        '',
+        '只允许本地 git 操作；本目录不联网。',
+        '',
+      ].join('\n'), 'utf8')
+    }
+    const ignore = join(root, '.gitignore')
+    if (!existsSyncSafe(ignore, fs)) fs.writeFileSync(ignore, '*.tmp-*\n.locks/\n', 'utf8')
+    regenerateManifest(root, { fs })
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) }
+  }
+
+  if (opts.git === false) {
+    return { ok: true, root, git: { available: false, error: 'git_disabled' } }
+  }
+
+  const exec = opts.exec || execFileSync
+  let version = ''
+  try {
+    const out = exec('git', ['--version'], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: GIT_TIMEOUT_MS, env: gitEnv(),
+    })
+    version = String(out ?? '').trim()
+  } catch (err) {
+    return {
+      ok: true,
+      root,
+      git: { available: false, error: err?.code === 'ENOENT' ? 'git_unavailable' : String(err?.message || err) },
+    }
+  }
+
+  let initialized = false
+  const repo = isGitRepo(root, { exec })
+  if (!repo.ok) {
+    const init = runGit(root, ['init', '-q'], { exec })
+    if (!init.ok) return { ok: true, root, git: { available: true, version, initialized: false, error: init.error } }
+    initialized = true
+  }
+  // 只在本次新建仓库时做首次 commit；已有仓库的日常改动由 writeRule 提交，
+  // 避免每次 ensure 都插一个空 commit 把规则历史的 diff 打乱。
+  const committed = initialized
+    ? gitCommit(root, 'rules: init repository', { exec })
+    : { ok: true, committed: false }
+  return {
+    ok: true,
+    root,
+    git: {
+      available: true,
+      version,
+      initialized,
+      committed: committed.ok ? Boolean(committed.committed) : false,
+      ...(committed.ok ? {} : { error: committed.error }),
+    },
+  }
+}
+

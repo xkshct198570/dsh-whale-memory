@@ -13,6 +13,7 @@ import { bool, value } from './config-values.js'
 import { Config } from './config.js'
 import { HttpSyncTransport, pullFromGateway, pushToGateway } from '../core/sync.js'
 import { WHALE_PROTOCOL } from '../core/backend.js'
+import { handleRules } from './rules-routes.js'
 
 const PREFIX = '/whale-memory/api'
 
@@ -22,7 +23,7 @@ const PREFIX = '/whale-memory/api'
  */
 export const CONFIG_GROUPS = [
   'backend', 'identity', 'recall', 'write', 'reflect', 'consolidate',
-  'embed', 'privacy', 'edges', 'sync', 'panel', 'advanced',
+  'embed', 'privacy', 'edges', 'sync', 'rules', 'panel', 'advanced',
 ]
 export const CONFIG_KEYS = ['dataDir', ...CONFIG_GROUPS]
 
@@ -682,6 +683,9 @@ export function createRoutes({
         notes: { recall_charBudget: '0 = 关闭注入（与文档 §4 S11 的 0=不限制 冲突，以代码为准）' },
       })
     }
+
+    // 规则只读/管理端点（R3a）：命中即返回 true，未命中继续走 404。
+    if (await handleRules({ req, res, path, config, backend, log })) return undefined
 
     log(`[whale-memory] 404 ${req.method} ${path}`)
     return sendJson(res, 404, { ok: false, error: 'not_found' })
