@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Whale Memory">
+  <defs>
+    <linearGradient id="sea" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1f5f9e" stop-opacity="0.14"/>
+      <stop offset="1" stop-color="#1f5f9e" stop-opacity="0.03"/>
+    </linearGradient>
+    <linearGradient id="body" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2f7fd0"/>
+      <stop offset="1" stop-color="#1b4f87"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="640" height="300" rx="18" fill="url(#sea)"/>
+  <g fill="none" stroke="#5b9bd5" stroke-opacity="0.35" stroke-width="2">
+    <circle cx="470" cy="92" r="7"/>
+    <circle cx="540" cy="140" r="5"/>
+    <circle cx="486" cy="186" r="6"/>
+    <circle cx="566" cy="212" r="4"/>
+    <circle cx="420" cy="146" r="5"/>
+    <path d="M470 92 L540 140 L486 186 L566 212 M486 186 L420 146 L470 92"/>
+  </g>
+  <g fill="#2f7fd0">
+    <circle cx="470" cy="92" r="4"/>
+    <circle cx="540" cy="140" r="3"/>
+    <circle cx="486" cy="186" r="3.5"/>
+    <circle cx="566" cy="212" r="2.5"/>
+    <circle cx="420" cy="146" r="3"/>
+  </g>
+  <g fill="url(#body)">
+    <path d="M96 168c22-34 60-52 106-52 44 0 78 15 96 40 10-9 22-14 34-14 3 0 6 1 7 4 1 3-2 6-6 9-6 4-11 8-14 13 15 12 24 27 24 42 0 27-26 50-63 50h-72c-50 0-92-19-104-47-5-11-6-22-4-33-3-4-5-8-4-12z"/>
+    <path d="M352 196c10 7 20 11 30 12-8 9-20 15-33 15 1-9 2-18 3-27z" fill="#1b4f87"/>
+  </g>
+  <g fill="#eaf3fb">
+    <circle cx="170" cy="150" r="9"/>
+    <circle cx="168" cy="149" r="4" fill="#123a63"/>
+    <path d="M232 132c10-6 22-6 32 0-10 6-22 6-32 0z" fill="#a9d0ef"/>
+  </g>
+  <g fill="none" stroke="#a9d0ef" stroke-width="3" stroke-linecap="round" stroke-opacity="0.8">
+    <path d="M118 204c8 6 16 6 24 0"/>
+    <path d="M146 218c8 6 16 6 24 0"/>
+  </g>
+  <g fill="#ffffff" fill-opacity="0.75">
+    <rect x="398" y="70" width="118" height="10" rx="5"/>
+    <rect x="398" y="92" width="86" height="8" rx="4"/>
+    <rect x="398" y="110" width="104" height="8" rx="4"/>
+    <rect x="398" y="128" width="70" height="8" rx="4"/>
+  </g>
+</svg>

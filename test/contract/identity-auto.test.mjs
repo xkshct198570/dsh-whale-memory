@@ -1,0 +1,147 @@
+/**
+ * 身份 auto（审计 §4 P1）：宿主登录态 userId 的读取、缓存、回落与 source 标记。
+ *
+ * 全部用假 ctx + 假 deepseekAccount，不碰真实登录态/库。
+ */
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import http from 'node:http'
+import { installIdentitySource } from '../../src/host/identity-source.js'
+import { resolveIdentity } from '../../src/host/identity.js'
+import { Config } from '../../src/host/config.js'
+import { createRoutes } from '../../src/host/routes.js'
+
+/** @param {any} account */
+function fakeCtx(account) {
+  const state = { effects: 0 }
+  const ctx = {
+    get(name) { return name === 'deepseekAccount' ? account : undefined },
+    effect(fn) { state.effects += 1; return fn() },
+  }
+  return { ctx, state }
+}
+
+const flush = async () => { await new Promise((resolve) => setImmediate(resolve)) }
+
+test('identity source：auto 用宿主 userId，并缓存（TTL 内不重复读登录态）', async () => {
+  let t = 1_000
+  const account = {
+    calls: 0,
+    async getDeviceIdentity() { this.calls += 1; return { deviceId: 'dev', userId: 'host-user', osVersion: 'linux' } },
+  }
+  const { ctx } = fakeCtx(account)
+  const source = installIdentitySource(ctx, { log: () => {}, now: () => t, ttlMs: 300_000 })
+  // install 已后台刷新一次；await 拿到同一 in-flight 结果。
+  const userId = await source.refresh()
+  assert.equal(userId, 'host-user')
+  assert.equal(source.getUserId(), 'host-user')
+  assert.equal(account.calls, 1)
+
+  t += 299_000
+  assert.equal(source.getUserId(), 'host-user')
+  assert.equal(account.calls, 1, 'TTL 内 getUserId 不得重复读登录态')
+
+  t += 2_000
+  source.getUserId() // 过期 → 后台刷新
+  await flush()
+  assert.equal(account.calls, 2, 'TTL 过期后必须后台重读')
+
+  const ident = resolveIdentity(Config({ identity: { mode: 'auto' } }).identity, null, source.getUserId())
+  assert.equal(ident.ok, true)
+  assert.equal(ident.identity.userId, 'host-user')
+  assert.equal(ident.source, 'host')
+  assert.equal(ident.sources.userId, 'host')
+})
+
+test('identity source：未登录（userId 缺失）/服务缺失/读失败 一律回落空串且不抛', async () => {
+  const logs = []
+  const unsigned = installIdentitySource(fakeCtx({ async getDeviceIdentity() { return { osVersion: 'linux' } } }).ctx, { log: (l) => logs.push(l) })
+  assert.equal(await unsigned.refresh(), '')
+
+  const missing = installIdentitySource(fakeCtx(undefined).ctx, { log: () => {} })
+  assert.equal(await missing.refresh(), '')
+
+  const broken = installIdentitySource(fakeCtx({ async getDeviceIdentity() { throw new Error('boom') } }).ctx, { log: (l) => logs.push(l) })
+  assert.equal(await broken.refresh(), '')
+  assert.equal(broken.getUserId(), '')
+  assert.ok(logs.some((line) => /identity source fail-open/.test(line)))
+})
+
+test('identity source：dispose 后不再返回值，也不触发刷新', async () => {
+  const account = { calls: 0, async getDeviceIdentity() { this.calls += 1; return { userId: 'u1', osVersion: 'linux' } } }
+  const source = installIdentitySource(fakeCtx(account).ctx, { log: () => {} })
+  assert.equal(await source.refresh(), 'u1')
+  source.dispose()
+  assert.equal(source.getUserId(), '')
+  assert.equal(await source.refresh(), '')
+})
+
+test('resolveIdentity auto：userId 优先级 hint > 宿主 > Config > local', () => {
+  const cfg = Config({ identity: { mode: 'auto', userId: 'cfg-user', roleId: 'cfg-role', workspace: 'web' } }).identity
+  assert.equal(resolveIdentity(cfg, null, 'host-user').identity.userId, 'host-user')
+  assert.equal(resolveIdentity(cfg, null, 'host-user').source, 'host')
+  assert.equal(resolveIdentity(cfg, { userId: 'hint-user' }, 'host-user').identity.userId, 'hint-user')
+  assert.equal(resolveIdentity(cfg, { userId: 'hint-user' }, 'host-user').source, 'hint')
+  assert.equal(resolveIdentity(cfg, null, '').identity.userId, 'cfg-user')
+  assert.equal(resolveIdentity(cfg, null, '').source, 'config')
+  assert.equal(resolveIdentity(Config({}).identity, null, '').identity.userId, 'local')
+  assert.equal(resolveIdentity(Config({}).identity, null, '').source, 'default')
+  // 宿主身份不得挤掉 Config 的 role/workspace。
+  const hostOnly = resolveIdentity(cfg, null, 'host-user')
+  assert.equal(hostOnly.identity.roleId, 'cfg-role')
+  assert.equal(hostOnly.identity.workspace, 'web')
+  assert.deepEqual(hostOnly.sources, { userId: 'host', roleId: 'config', workspace: 'config' })
+})
+
+test('resolveIdentity fixed：行为不变，宿主 userId 不参与；缺 userId 仍报 identity_required', () => {
+  const fixed = Config({ identity: { mode: 'fixed', userId: 'u1', roleId: 'r1', workspace: 'w1' } }).identity
+  const ident = resolveIdentity(fixed, null, 'host-user')
+  assert.equal(ident.identity.userId, 'u1')
+  assert.equal(ident.source, 'config')
+
+  const empty = Config({ identity: { mode: 'fixed', userId: '' } }).identity
+  assert.deepEqual(resolveIdentity(empty, null, 'host-user'), { ok: false, error: 'identity_required' })
+})
+
+/** 起一个临时 server；返回 base + close。 */
+async function serve(handler) {
+  const server = http.createServer(handler)
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const { port } = server.address()
+  return { base: `http://127.0.0.1:${port}`, close: () => new Promise((resolve) => server.close(resolve)) }
+}
+
+test('/stats：identity 带 source/workspaceSource 与 migration 只读字段，不泄漏正文', async () => {
+  const seen = []
+  const backend = {
+    async stats() { return { totals: { nodes_total: 3 } } },
+    async search(args) { seen.push(args.identity); return { hits: [], count: 0 } },
+  }
+  const migration = { state: { migratedFrom: 'hub-0.2.0', migratedAt: '2026-01-02T03:04:05.000Z', pending: false } }
+  const config = { identity: { mode: 'auto', workspace: 'web' }, panel: { allowRemote: false } }
+  const handler = createRoutes({ config, backend, getHostUserId: () => 'host-9', migration, log: () => {} })
+  const { base, close } = await serve(handler)
+  try {
+    const res = await fetch(`${base}/whale-memory/api/stats`)
+    const body = await res.json()
+    assert.equal(res.status, 200)
+    assert.equal(body.ok, true)
+    assert.deepEqual(body.identity, {
+      mode: 'auto', userId: 'host-9', roleId: '', workspace: 'web', source: 'host', workspaceSource: 'config',
+    })
+    assert.deepEqual(body.migration, migration.state)
+    assert.equal(JSON.stringify(body).includes('memory text'), false)
+
+    // 搜索请求显式带 workspace 时优先请求值；不带保持 Config。
+    await fetch(`${base}/whale-memory/api/search`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ query: 'x', workspace: 'explicit' }),
+    })
+    await fetch(`${base}/whale-memory/api/search`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ query: 'x' }),
+    })
+    assert.equal(seen[0].workspace, 'explicit')
+    assert.equal(seen[1].workspace, 'web')
+  } finally {
+    await close()
+  }
+})

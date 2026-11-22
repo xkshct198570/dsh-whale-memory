@@ -3,10 +3,11 @@
  *
  * 硬约束：
  * - 状态机 queued → running → done|failed；失败 attempts+1：
- *   attempts<3 回 queued 且 next_at=now+backoffSeconds(attempts)，attempts>=3 落 failed。
+ *   attempts<4 回 queued 且 next_at=now+backoffSeconds(attempts)（60s→300s→1800s），
+ *   attempts>=4 落 failed（§8.1 的 1m→5m→30m 必须真的走得到，见 MAX_ATTEMPTS 注释）。
  * - 单飞：同 kind 同时只 1 个 running（claim 用条件 UPDATE，changes=0 即跳过）。
  * - 全局并发=1：tick/drain 抢不到执行权就立刻让路，不起第二个 job。
- * - 启动补偿：先跑 queued 到期，再跑 attempts<3 的 failed（重置回 queued）；done 永不复跑。
+ * - 启动补偿：先跑 queued 到期，再跑 attempts<4 的 failed（重置回 queued）；done 永不复跑。
  * - 水位闸门：执行前 pressure()；stress 时 job 回 queued、next_at=now+600，
  *   日志只在"进入压力态"打一次（清压后复位，不刷屏）。
  * - 定时器 unref：不拖住 Host 退出；dispose 后 tick 空转（{ran:[],skipped:'disposed'}）。
@@ -17,24 +18,24 @@
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { memoryPressure } from '../host/memory-guard.js'
-import { bool } from '../host/config-values.js'
+import { bool, num, value } from '../host/config-values.js'
 import { METRIC_DEFS, computeMetrics, writeMetricsRows } from './metrics.js'
 import { parseTags, rebuildTagEdges, upsertEdge } from './relations.js'
 
 /** 允许的作业类型（enqueue/register 校验用；与 schema jobs.kind 语义一致）。 */
 export const JOB_KINDS = ['consolidate', 'reflect', 'write', 'vector', 'archive', 'report']
 
-/** 失败重试退避（秒）：0→0（首跑不等）、1→60、2→300、3+→1800。 */
-const BACKOFF_SECONDS = [0, 60, 300]
+/** 失败重试退避（秒）：§8.1 的 1m→5m→30m；attempts=0 是首跑不等，3 起封顶 30m。 */
+const BACKOFF_SECONDS = [0, 60, 300, 1800]
 export function backoffSeconds(attempts) {
   const n = Math.max(0, Math.floor(Number(attempts) || 0))
-  return n >= 3 ? 1800 : BACKOFF_SECONDS[n]
+  return BACKOFF_SECONDS[Math.min(n, BACKOFF_SECONDS.length - 1)]
 }
 
 /** 压力态下 job 回 queued 的延后秒数。 */
 const PRESSURE_DEFER_SECONDS = 600
-/** 最多 3 次失败后不再自动跑。 */
-const MAX_ATTEMPTS = 3
+/** 最多 4 次失败后不再自动跑：1 次重排后按 60s/300s/1800s 再试三次（§8.1 1m→5m→30m）。 */
+const MAX_ATTEMPTS = 4
 /** vector 每次最多处理的 pending 条数。 */
 const VECTOR_BATCH = 32
 /** claim 时一次最多看多少候选（同 kind 被占用时继续找别的）。 */
@@ -110,7 +111,7 @@ export function createKeeper({
     return Number(info?.changes || 0) > 0
   }
 
-  /** 挑一条可跑 job：先 queued 到期，再 attempts<3 的 failed（重置后跑）。 */
+  /** 挑一条可跑 job：先 queued 到期，再 attempts<MAX_ATTEMPTS 的 failed（重置后跑）。 */
   function pickAndClaim() {
     return store.withDb((db) => {
       const queued = db.prepare(`SELECT * FROM jobs
@@ -595,18 +596,35 @@ function installDefaultHandlers(keeper, deps) {
     })
   })
 
-  keeper.register('archive', async () => {
-    const days = Number(config?.privacy?.retentionDays || 0)
+  keeper.register('archive', async (payload = {}) => {
+    // retentionDays 走 config-values.num 解包：字段现在是普通 number，但同一段配置里还有
+    // .volatile() 的 Ref（如 redact）；一旦它也变成 Ref，裸 Number() 会恒 NaN→0 = 静默关掉清理。
+    const days = num(config?.privacy?.retentionDays, 0)
     if (!(days > 0)) return { skipped: 'retention_disabled' }
     const cutoff = nowSec() - days * 86400
+    // 分区口径：物理删除是破坏性动作，默认只清"本机配置的身份分区"（config.identity），
+    // 不碰别人的分区；payload.identity 可显式指定（同步/测试用）。
+    // 身份三元组全是 .volatile() Ref，必须经 value() 解包，否则恒空 = 静默退化成全局清理。
+    const configuredIdentity = {
+      userId: value(config?.identity?.userId, ''),
+      roleId: value(config?.identity?.roleId, ''),
+      workspace: value(config?.identity?.workspace, ''),
+    }
+    // payload.identity 显式给对象时以它为准（同步/测试）；给 `{}` 表示"恢复全局清理"。
+    // 注意破坏性语义：默认口径从旧版"全库清理"改为"配置身份分区清理"，共享('')内容不删。
+    const requested = payload?.identity && typeof payload.identity === 'object' ? payload.identity : null
+    const scope = archiveScope(requested || configuredIdentity)
     return store.withDb((db) => {
       db.exec('BEGIN IMMEDIATE')
       let deleted = 0
       try {
-        const info = db.prepare(`DELETE FROM nodes WHERE status='archived' AND updated_at < ?`).run(cutoff)
+        const info = db.prepare(`DELETE FROM nodes WHERE status='archived' AND updated_at < ?${scope.sql}`)
+          .run(cutoff, ...scope.params)
         deleted = Number(info?.changes || 0)
         db.prepare(`INSERT INTO writes (ts,trace_id,action,node_id,reason,mode)
-          VALUES (?,?,'ARCHIVE',NULL,?,'auto')`).run(nowSec(), '', `retention_days=${days}; cutoff=${cutoff}; deleted=${deleted}`)
+          VALUES (?,?,'ARCHIVE',NULL,?,'auto')`).run(
+          nowSec(), '', `retention_days=${days}; cutoff=${cutoff}; deleted=${deleted}${scope.note}`,
+        )
         db.exec('COMMIT')
       } catch (err) {
         try { db.exec('ROLLBACK') } catch { /* noop */ }
@@ -747,6 +765,30 @@ export function recoverRunningJobs(store, log = () => {}) {
   ).run(Date.now() / 1000))?.changes || 0)
   if (changed > 0) log(`[whale-memory] keeper recovered ${changed} stale running job(s)`)
   return changed
+}
+
+/**
+ * 归档清理的分区条件（破坏性删除专用）。
+ *
+ * 与读路径的 `列='' OR 列=值` 口径**故意不同**：读是把共享内容也让你看见，
+ * 删是拿着一个分区的配置去物理删库——共享('')内容不属于任何单一分区，
+ * 不能因为 A 的保留策略被连带删掉。所以这里只做严格相等，且空字段不参与。
+ *
+ * @param {{ userId?: unknown, roleId?: unknown, workspace?: unknown } | null | undefined} identity
+ * @returns {{ sql: string, params: string[], note: string }}
+ */
+export function archiveScope(identity) {
+  if (!identity || typeof identity !== 'object') return { sql: '', params: [], note: '; scope=all' }
+  const clauses = []
+  const params = []
+  for (const [col, raw] of [['user_id', identity.userId], ['role_id', identity.roleId], ['workspace', identity.workspace]]) {
+    const text = typeof raw === 'string' ? raw : String(raw ?? '')
+    if (!text) continue
+    clauses.push(`${col} = ?`)
+    params.push(text)
+  }
+  if (clauses.length === 0) return { sql: '', params: [], note: '; scope=all' }
+  return { sql: ` AND ${clauses.join(' AND ')}`, params, note: `; scope=${params.join('/')}` }
 }
 
 /**

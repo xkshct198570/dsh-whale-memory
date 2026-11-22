@@ -10,14 +10,20 @@ import { installHook } from './src/host/hook.js'
 import { createBackend } from './src/core/backend.js'
 import { Config } from './src/host/config.js'
 import { installSearchFeed } from './src/host/search-feed.js'
+import { installIdentitySource } from './src/host/identity-source.js'
+import { installConfigMigration } from './src/host/config-migration.js'
 import { installReflectScheduler } from './src/core/reflect.js'
 import { installKeeper } from './src/core/keeper.js'
+import { installOutboxWatchdog } from './src/core/hybrid.js'
 import { bool, num } from './src/host/config-values.js'
 
 export { Config }
 export const inject = ['webServer', 'systemPrompt']
 
 const log = (line) => { try { console.log(line) } catch { /* log 永远不是故障点 */ } }
+
+/** 外部服务凭证的环境变量名（密钥只走 credentials/env，不进 Config）。 */
+const BACKEND_TOKEN_ENV = 'WHALE_MEMORY_TOKEN'
 
 /**
  * backend 代理：registerBackend() 换实现后，路由/keeper/hook 立刻取到 current，
@@ -120,9 +126,43 @@ export function apply(ctx, config) {
   const backendRef = { current: backend }
   const backendProxy = createBackendProxy(backendRef)
 
+  // 外部服务 Bearer：凭证服务异步解析（密钥不进 Config），失败静默回落 env。
+  ctx.effect(() => {
+    let disposed = false
+    const load = async () => {
+      let token = ''
+      try {
+        const credentials = ctx.get?.('credentials')
+        if (credentials && typeof credentials.resolve === 'function') {
+          const resolved = await credentials.resolve(BACKEND_TOKEN_ENV)
+          token = String(resolved?.value || '')
+        }
+      } catch { /* 凭证服务是可选依赖：读不到就回落 env */ }
+      if (!token) token = String(process.env[BACKEND_TOKEN_ENV] || '')
+      if (disposed || !token) return
+      const applied = typeof backendRef.current?.setToken === 'function' ? backendRef.current.setToken(token) : { ok: false }
+      log(`[whale-memory] backend token ${applied?.ok ? 'applied' : 'ignored'}`)
+    }
+    load().catch(() => { /* 不阻断插件启动 */ })
+    return () => { disposed = true }
+  }, 'whale-memory: backend token')
+
+  // hybrid 双轨：本地真源 + 远端副本；outbox 由看门狗续跑（进程重启后从 queued 继续）。
+  if (config?.backend?.mode === 'hybrid') {
+    installOutboxWatchdog({ backend: backendProxy, config, ctx, log })
+  }
+
   // 外部角色插件可选的"身份提示"：A 只存 role_id/workspace/user_id，不理解角色语义。
   const identityState = { hint: null }
   const getIdentityCfg = () => (identityState.hint ? { ...config?.identity, ...identityState.hint } : config?.identity)
+  const getIdentityHint = () => identityState.hint
+
+  // 身份 auto：宿主登录态 userId（5min TTL，getter 同步返回，永不阻塞召回）。
+  const identitySource = installIdentitySource(ctx, { log })
+  const getHostUserId = () => identitySource.getUserId()
+
+  // 首启旧配置迁移（架构书 §10.3）：后台跑，失败只记日志；状态给 /stats 只读展示。
+  const migration = installConfigMigration(ctx, { backend: backendProxy, log })
 
   let hook = null
   createWhaleMemoryService({ ctx, backendRef, getHook: () => hook, identityState, log })
@@ -161,7 +201,7 @@ export function apply(ctx, config) {
 
   installSearchFeed(ctx, { backend: backendProxy, config, log })
 
-  const handler = createRoutes({ config, backend: backendProxy, getIdentityCfg, ctx, reflect, log })
+  const handler = createRoutes({ config, backend: backendProxy, getIdentityCfg, getIdentityHint, getHostUserId, migration, ctx, reflect, log })
 
   ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: PREFIX, handler }), 'whale-memory: routes')
 
@@ -170,7 +210,7 @@ export function apply(ctx, config) {
   ctx.effect(() => () => { reflect.dispose(); backend.dispose?.() }, 'whale-memory: backend')
 
   ctx.effect(() => {
-    hook = installHook(ctx, { backend: backendProxy, config, getIdentityCfg, log })
+    hook = installHook(ctx, { backend: backendProxy, config, getIdentityCfg, getIdentityHint, getHostUserId, log })
     return () => hook?.dispose()
   }, 'whale-memory: recall hook')
 

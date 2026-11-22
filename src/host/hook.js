@@ -8,8 +8,8 @@
  * 生命周期硬线（P-4）：整个安装包在 ctx.effect 内；每次请求带 AbortController；
  * dispose 时中止在途、清缓存、返回空文本；任何失败只记日志，绝不抛。
  */
-import { resolveIdentity } from './identity.js'
-import { bool, num } from './config-values.js'
+import { deriveWorkspace, resolveIdentity } from './identity.js'
+import { bool, num, value } from './config-values.js'
 import { judgeReply } from '../core/adoption.js'
 
 export const CONTEXT_NAME = 'whale-memory:recall'
@@ -51,10 +51,17 @@ function readCached(cache, sessionId) {
 
 /**
  * @param {any} ctx
- * @param {{ backend: any, config: any, log?: (s:string)=>void }} deps
+ * @param {{ backend: any, config: any, getIdentityCfg?: () => any, getIdentityHint?: () => any,
+ *   getHostUserId?: () => string, log?: (s:string)=>void }} deps
  * @returns {{ cache: Map<string,{text:string,exp:number}>, dispose: () => void }}
  */
-export function installHook(ctx, { backend, config, getIdentityCfg = () => config?.identity, log = () => {} }) {
+export function installHook(ctx, {
+  backend, config,
+  getIdentityCfg = () => config?.identity,
+  getIdentityHint = () => null,
+  getHostUserId = () => '',
+  log = () => {},
+}) {
   const cache = new Map()
   const inflight = new Set()
   /**
@@ -68,6 +75,14 @@ export function installHook(ctx, { backend, config, getIdentityCfg = () => confi
   let disposed = false
 
   const timeoutMs = num(config?.recall?.timeoutMs, 2000)
+  /**
+   * 注入层级（volatile 数组 ⇒ Ref，必须每次现取）：undefined 表示"配置里没有这一项"，
+   * 交给 backend 不过滤（旧调用方兼容）；数组就原样下传（空数组=不注入）。
+   */
+  const injectLevels = () => {
+    const raw = value(config?.recall?.injectLevels, undefined)
+    return Array.isArray(raw) ? raw.map((x) => String(x)) : undefined
+  }
 
   /** 结算一次待判定注入：有引用证据才回写 used，无证据保持 0（未采纳）。 */
   const settle = (sid) => {
@@ -110,7 +125,11 @@ export function installHook(ctx, { backend, config, getIdentityCfg = () => confi
       if (!query) return decision
 
       cache.delete(String(sessionId))
-      const ident = resolveIdentity(getIdentityCfg())
+      // 身份 auto：宿主 userId（5min 缓存，getter 同步返回）+ 会话 cwd 派生的 workspace。
+      // workspace 只在 Config 为空时生效（现网 'web' 非空 ⇒ 召回结果不变）。
+      const hostUserId = typeof getHostUserId === 'function' ? String(getHostUserId() || '') : ''
+      const sessionWorkspace = deriveWorkspace(agent?.session?.header)
+      const ident = resolveIdentity(getIdentityCfg(), getIdentityHint(), hostUserId, sessionWorkspace)
       if (!ident.ok) return decision
 
       // 上一步的回复已完整落进 assistant-stream：进入新步前先结算，别让证据过期被下一轮覆盖。
@@ -129,6 +148,10 @@ export function installHook(ctx, { backend, config, getIdentityCfg = () => confi
           charBudget: num(config?.recall?.charBudget, 1500),
           intentBudget: bool(config?.recall?.intentBudget, true),
           minRel: num(config?.recall?.minRel, 0.34),
+          // 注入开关（审计 P1-1 假开关）：面板里的 injectLevels/showSources 必须真传到 backend，
+          // 只在面板改字而 backend 不接，就是"写着能调、实际没实现"。
+          injectLevels: injectLevels(),
+          showSources: bool(config?.recall?.showSources, true),
           diffusion: bool(config?.edges?.diffusion, true),
           minConf: num(config?.edges?.minConf, 0.6),
           identity: ident.identity,

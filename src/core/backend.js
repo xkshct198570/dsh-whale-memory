@@ -20,8 +20,9 @@ import { applyNeighborNotes, relationStats } from './relations.js'
 import { computeMetrics } from './metrics.js'
 import { memoryPressure } from '../host/memory-guard.js'
 import { bool } from '../host/config-values.js'
-import { createWriteQueue, recordWrite } from './writer.js'
+import { createWriteQueue, recordEvolution, recordWrite, withTx } from './writer.js'
 import { DbWorkerClient } from './workers/client.js'
+import { HybridBackend } from './hybrid.js'
 
 /** @typedef {{ userId: string, roleId: string, workspace: string }} Identity */
 
@@ -122,6 +123,46 @@ function identityFilter(identity) {
     params.push(value)
   }
   return { sql: clauses.length ? ` WHERE ${clauses.join(' AND ')}` : '', params }
+}
+
+/**
+ * 完整 WHERE：身份条件 + 额外条件（全部 AND）。列名属于 nodes 表本身（不做别名）。
+ *
+ * why 不直接拼字符串：身份条件是安全闸，额外条件（id/action/source）是业务过滤，
+ * 两者混写时最容易漏参数占位，导致"查询全表"这种静默越权。
+ *
+ * @param {Identity|null|undefined} identity
+ * @param {Array<[string, unknown[]]>} [extra] 每项 `[SQL 片段, 参数数组]`
+ * @returns {{ sql: string, params: string[] }}
+ */
+function whereOf(identity, extra = []) {
+  const filter = identityFilter(identity)
+  const parts = []
+  const params = []
+  if (filter.sql) {
+    parts.push(filter.sql.slice(' WHERE '.length))
+    params.push(...filter.params)
+  }
+  for (const [sql, args] of extra) {
+    parts.push(sql)
+    params.push(...(args || []))
+  }
+  return { sql: parts.length ? ` WHERE ${parts.join(' AND ')}` : '', params }
+}
+
+/** edges/evolution 的双端可见条件：两端都在可见集合内才算本分区的边/演化。
+ * @param {Identity|null|undefined} identity
+ * @returns {{ sql: string, params: string[], active: boolean }}
+ */
+function bothEndsVisible(identity) {
+  const filter = identityFilter(identity)
+  if (!filter.sql) return { sql: '', params: [], active: false }
+  const vis = `SELECT id FROM nodes${filter.sql}`
+  return {
+    sql: `(from_id IN (${vis}) AND to_id IN (${vis}))`,
+    params: [...filter.params, ...filter.params],
+    active: true,
+  }
 }
 
 /**
@@ -297,6 +338,7 @@ export class LocalBackend {
    */
   constructor({ dataDir = '', useWorker = true, log = () => {}, timeoutMs = 1200, config = null } = {}) {
     this.dataDir = dataDir
+    this.mode = 'local'
     this.log = log
     this.useWorker = useWorker !== false
     this.timeoutMs = timeoutMs
@@ -428,11 +470,17 @@ export class LocalBackend {
     }
   }
 
-  async recent(limit = 3) {
+  /**
+   * 最近召回摘要（面板首页）：按身份过滤，避免首页把别人分区的查询词显示出来。
+   * @param {number} [limit] 1..10
+   * @param {{ identity?: Identity }} [opts]
+   */
+  async recent(limit = 3, opts = {}) {
     const db = this._db()
+    const where = whereOf(opts?.identity)
     const rows = db.prepare(
-      'SELECT ts,query,hit_ids,chars,injected,elapsed_ms FROM recalls ORDER BY ts DESC LIMIT ?',
-    ).all(Math.max(1, Math.min(10, Number(limit) || 3)))
+      `SELECT ts,query,hit_ids,chars,injected,elapsed_ms FROM recalls${where.sql} ORDER BY ts DESC LIMIT ?`,
+    ).all(...where.params, Math.max(1, Math.min(10, Number(limit) || 3)))
     return { items: rows.map((r) => ({
       ts: r.ts, query: String(r.query || ''), hits: hitIdsCount(r.hit_ids), chars: r.chars,
       injected: Boolean(r.injected), elapsed_ms: r.elapsed_ms,
@@ -468,8 +516,13 @@ export class LocalBackend {
    * 的样本，等于用幸存者偏差给自己打分。预算为 0 也要落一行，否则"按意图关掉注入"
    * 和"根本没有记忆"在数据里长得一样。
    *
+   * 注入开关（审计 P1-1 假开关）：
+   * - `injectLevels`：只注入这些等级的节点（空数组=不注入）；不传=不过滤（旧调用方行为不变）。
+   * - `showSources`：true（默认）时每行带 `[core/owner]` 来源标记，false 时只留正文。
+   *
    * @param {{ query:string, maxHits:number, identity:Identity, minRel?:number,
-   *   source?:string, traceId?:string, charBudget?:number, intentBudget?:boolean }} q
+   *   source?:string, traceId?:string, charBudget?:number, intentBudget?:boolean,
+   *   injectLevels?:string[], showSources?:boolean }} q
    */
   async recall(q, signal) {
     const started = Date.now()
@@ -519,10 +572,20 @@ export class LocalBackend {
       diffusion: q?.diffusion, minConf: q?.minConf,
     }, signal)
     const searched = Array.isArray(result?.hits) ? result.hits : []
-    const trimmed = trimHits(searched, budget)
+    // 等级过滤必须在预算裁剪之前：先砍掉不该注入的层级，再让预算决定注入多少条。
+    // 空数组是显式"一个等级都不要"（面板全不勾），不是"不过滤"；不传才是不过滤。
+    const levels = Array.isArray(q?.injectLevels) ? new Set(q.injectLevels.map((x) => String(x))) : null
+    const allowed = levels ? searched.filter((h) => levels.has(String(h?.level ?? ''))) : searched
+    const trimmed = trimHits(allowed, budget)
     const hits = trimmed.hits
+    const showSources = q?.showSources !== false
+    /**
+     * 每行来源标记 `[level/source]`：让人一眼看出这条记忆的分量与出处（§4.3）。
+     * showSources=false 时完全不写标记——面板关掉开关就要真的看不见。
+     */
+    const markOf = (h) => `[${String(h?.level || 'normal')}/${String(h?.source || 'self')}] `
     const prefix = hits.length
-      ? '【你想到的旧事】\n' + hits.map((h) => `- ${String(h.text || '').trim()}`).join('\n')
+      ? '【你想到的旧事】\n' + hits.map((h) => `- ${showSources ? markOf(h) : ''}${String(h.text || '').trim()}`).join('\n')
       : ''
     const recallId = audit({
       hitIds: searched.map((h) => h.id),
@@ -532,6 +595,8 @@ export class LocalBackend {
     return {
       ok: true, prefix, chars: prefix.length, hits: hits.length,
       intent: budget.intent, dropped: trimmed.dropped, clipped: trimmed.clipped,
+      // 被等级开关挡掉的数量：面板"命中但未注入"从此能区分"层级不收"与"预算不够"。
+      level_filtered: searched.length - allowed.length,
       // 采纳信号的判定素材：只给**最终注入**的节点（被预算裁掉的节点不该产生采纳）。
       recallId,
       injectedNodes: hits.map((h) => ({ id: String(h?.id ?? ''), text: String(h?.text ?? '') })),
@@ -716,27 +781,59 @@ export class LocalBackend {
     return rows.map((r) => JSON.stringify(r)).join('\n') + (rows.length ? '\n' : '')
   }
 
-  /** @param {{ identity:Identity, limit:number, offset:number }} q */
+  /**
+   * 节点分页（面板「记忆」页）：列表与 total 都按身份过滤（与 export 同口径）。
+   * why total 也要过滤：列表过滤而总数不过滤时，面板会显示"本区 2 条 / 共 40 条"，
+   * 既暴露了别人分区的规模，也让翻页逻辑把空页当成还有数据。
+   *
+   * @param {{ identity?:Identity, limit?:number, offset?:number }} q
+   */
   async nodes(q = {}) {
     const db = this._db()
     const limit = Math.max(1, Math.min(100, Number(q.limit) || 20))
     const offset = Math.max(0, Number(q.offset) || 0)
-    const total = Number(db.prepare('SELECT count(*) AS n FROM nodes').get()?.n || 0)
-    const rows = db.prepare(`SELECT ${NODE_EXPORT_FIELDS.join(',')} FROM nodes ORDER BY created_at DESC LIMIT ? OFFSET ?`).all(limit, offset)
+    const where = whereOf(q?.identity)
+    const total = Number(db.prepare(`SELECT count(*) AS n FROM nodes${where.sql}`).get(...where.params)?.n || 0)
+    const rows = db.prepare(`SELECT ${NODE_EXPORT_FIELDS.join(',')} FROM nodes${where.sql} ORDER BY created_at DESC LIMIT ? OFFSET ?`)
+      .all(...where.params, limit, offset)
     return { items: rows, total }
   }
 
-  /** 单节点详情：面板抽屉用。 */
-  async getNode(id) {
+  /**
+   * 单节点详情（面板抽屉）：不属本身份的节点一律按 node_not_found 处理。
+   * why 不返回 403：存在性本身就是信息（"某 id 有记忆"），跨身份探测不该有反馈。
+   * @param {string} id
+   * @param {{ identity?:Identity }} [opts]
+   */
+  async getNode(id, opts = {}) {
     const db = this._db()
-    const row = db.prepare(`SELECT ${NODE_EXPORT_FIELDS.join(',')} FROM nodes WHERE id=?`).get(String(id || ''))
+    const where = whereOf(opts?.identity, [['id=?', [String(id || '')]]])
+    const row = db.prepare(`SELECT ${NODE_EXPORT_FIELDS.join(',')} FROM nodes${where.sql}`).get(...where.params)
     return row ? { ok: true, node: row } : { ok: false, error: 'node_not_found' }
   }
 
-  /** 面板编辑/归档：只改白名单字段，重算 hash/bigrams。 */
-  async updateNode(id, patch = {}) {
+  /**
+   * 面板编辑/归档：只改白名单字段，重算 hash/bigrams，并把改动完整留痕。
+   *
+   * 三条硬约束（审计 P0-3 / A3）：
+   * - 事务内先读旧行：旧值既用于身份校验，也是审计的 before_text（事后读会被改后的值骗）。
+   * - 受保护目标（source=owner / level=core / memory_type=procedural）只允许改非正文状态，
+   *   改正文或改等级返回 protected_target；面板不能绕过保护把规则改成别的意思。
+   * - status=superseded 必须带 superseded_by，否则 superseded_by_required —— 防止留下
+   *   "已失效但不知道被谁取代"的半残数据。
+   * - 普通目标的每个字段改动写一条 writes（EDIT/ARCHIVE）+ 一条 evolution（旧值/新值）。
+   *
+   * @param {string} id
+   * @param {{ text?:string, status?:string, level?:string, tags?:string[], superseded_by?:string }} patch
+   * @param {{ identity?:Identity, traceId?:string, mode?:'manual'|'sync' }} [opts]
+   *   mode 只影响 writes.mode（面板人工 vs 同步冲突标记），便于审计区分改动来源。
+   * @returns {{ ok: boolean, id?: string, error?: string }}
+   */
+  async updateNode(id, patch = {}, opts = {}) {
     const db = this._db()
-    const row = db.prepare('SELECT * FROM nodes WHERE id=?').get(String(id || ''))
+    const target = String(id || '')
+    const where = whereOf(opts?.identity, [['id=?', [target]]])
+    const row = db.prepare(`SELECT * FROM nodes${where.sql}`).get(...where.params)
     if (!row) return { ok: false, error: 'node_not_found' }
     const text = patch.text === undefined ? row.text : normalize(String(patch.text))
     if (!text || text.length > 500) return { ok: false, error: 'invalid_text' }
@@ -745,36 +842,98 @@ export class LocalBackend {
     const level = patch.level === undefined ? row.level : String(patch.level)
     if (!['core', 'important', 'normal'].includes(level)) return { ok: false, error: 'invalid_level' }
     const tags = patch.tags === undefined ? row.tags : JSON.stringify(Array.isArray(patch.tags) ? patch.tags : [])
-    const hash = contentHash(text)
-    db.prepare('UPDATE nodes SET text=?,text_hash=?,text_bigrams=?,status=?,level=?,tags=?,updated_at=? WHERE id=?')
-      .run(text, hash, bigrams(text), status, level, tags, now(), String(id))
-    return { ok: true, id: String(id) }
+    const supersededBy = patch.superseded_by === undefined || patch.superseded_by === null
+      ? row.superseded_by
+      : String(patch.superseded_by).trim().slice(0, 128)
+    if (status === 'superseded' && !supersededBy) return { ok: false, error: 'superseded_by_required' }
+    // 离开 superseded 时指针必须清空：留下"谁是继任者"而状态是 active，就是半残数据。
+    const nextPointer = status === 'superseded' ? supersededBy : null
+
+    const textChanged = text !== row.text
+    const levelChanged = level !== row.level
+    const protectedTarget = String(row.source || '') === 'owner'
+      || String(row.level || '') === 'core'
+      || String(row.memory_type || '') === 'procedural'
+    if (protectedTarget && (textChanged || levelChanged)) return { ok: false, error: 'protected_target' }
+
+    const statusChanged = status !== row.status
+    const tagsChanged = tags !== row.tags
+    const pointerChanged = String(nextPointer ?? '') !== String(row.superseded_by ?? '')
+    const ts = now()
+    const traceId = String(opts?.traceId || '').slice(0, 64)
+    const mode = opts?.mode === 'sync' ? 'sync' : 'manual'
+
+    return withTx(db, () => {
+      if (textChanged || statusChanged || levelChanged || tagsChanged || pointerChanged) {
+        db.prepare(`UPDATE nodes SET text=?,text_hash=?,text_bigrams=?,status=?,level=?,tags=?,superseded_by=?,updated_at=?
+          WHERE id=?`).run(
+          text, contentHash(text), bigrams(text), status, level, tags, nextPointer, ts, target,
+        )
+      }
+      /** 一个字段的改动 = 一条 writes + 一条 evolution（面板「写入」页与「演化」页同源）。 */
+      const audit = (action, field, oldValue, newValue, reason) => {
+        db.prepare(`INSERT INTO writes
+          (ts,trace_id,action,node_id,reason,before_text,after_text,mode,user_id,role_id,workspace)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(
+          ts, traceId, action, target, reason,
+          String(row.text ?? ''), field === 'text' ? String(newValue ?? '') : String(row.text ?? ''),
+          mode, String(row.user_id ?? ''), String(row.role_id ?? ''), String(row.workspace ?? ''),
+        )
+        recordEvolution(db, { ts, fromId: target, toId: target, field, oldValue, newValue, traceId })
+      }
+      if (textChanged) audit('EDIT', 'text', row.text, text, 'manual_edit')
+      if (statusChanged) audit('ARCHIVE', 'status', row.status, status, 'manual_archive')
+      if (levelChanged) audit('EDIT', 'level', row.level, level, 'manual_level')
+      if (tagsChanged) audit('EDIT', 'tags', row.tags, tags, 'manual_tags')
+      if (pointerChanged) audit('EDIT', 'superseded_by', row.superseded_by ?? '', nextPointer ?? '', 'manual_supersede')
+      return { ok: true, id: target }
+    })
   }
 
-  /** 最近写入审计（只读）；action 过滤用于面板只看 shadow 候选。 */
-  async writes(limit = 20, action = '') {
+  /**
+   * 最近写入审计（只读）；action 过滤用于面板只看 shadow 候选。
+   * @param {number} [limit]
+   * @param {string} [action]
+   * @param {{ identity?:Identity }} [opts]
+   */
+  async writes(limit = 20, action = '', opts = {}) {
     const db = this._db()
     const lim = Math.max(1, Math.min(100, Number(limit) || 20))
-    const rows = action
-      ? db.prepare('SELECT id,ts,trace_id,action,node_id,reason,before_text,after_text,mode,user_id,role_id,workspace FROM writes WHERE action=? ORDER BY ts DESC LIMIT ?').all(String(action), lim)
-      : db.prepare('SELECT id,ts,trace_id,action,node_id,reason,before_text,after_text,mode,user_id,role_id,workspace FROM writes ORDER BY ts DESC LIMIT ?').all(lim)
+    const where = whereOf(opts?.identity, action ? [['action=?', [String(action)]]] : [])
+    const rows = db.prepare(`SELECT id,ts,trace_id,action,node_id,reason,before_text,after_text,mode,user_id,role_id,workspace
+      FROM writes${where.sql} ORDER BY ts DESC LIMIT ?`).all(...where.params, lim)
     return { items: rows }
   }
 
-  /** 关系统计 + 最近边（面板 /edges）。 */
-  async edges(limit = 50) {
+  /**
+   * 关系统计 + 最近边（面板 /edges）：两端都在本身份可见集合内才算数。
+   * edges 表没有隔离列，可见性只能经 nodes 判定；统计与明细必须同口径，否则总数与列表打架。
+   * @param {number} [limit]
+   * @param {{ identity?:Identity }} [opts]
+   */
+  async edges(limit = 50, opts = {}) {
     const db = this._db()
-    const stat = relationStats(db)
-    const items = db.prepare('SELECT id,from_id,to_id,etype,source,conf,weight,created_at FROM edges ORDER BY id DESC LIMIT ?')
-      .all(Math.max(1, Math.min(100, Number(limit) || 50)))
+    const ends = bothEndsVisible(opts?.identity)
+    const whereSql = ends.active ? ` WHERE ${ends.sql}` : ''
+    const stat = relationStats(db, opts?.identity)
+    const items = db.prepare(`SELECT id,from_id,to_id,etype,source,conf,weight,created_at FROM edges${whereSql}
+      ORDER BY id DESC LIMIT ?`).all(...ends.params, Math.max(1, Math.min(100, Number(limit) || 50)))
     return { ok: true, ...stat, items }
   }
 
-  /** 演化审计（面板 /evolution）。 */
-  async evolution(limit = 50) {
+  /**
+   * 演化审计（面板 /evolution）：按被改节点（to_id）所属身份过滤。
+   * 两端都要求可见：跨分区的边/注记不该在别人的审计页出现（哪怕只是节点 id）。
+   * @param {number} [limit]
+   * @param {{ identity?:Identity }} [opts]
+   */
+  async evolution(limit = 50, opts = {}) {
     const db = this._db()
     const lim = Math.max(1, Math.min(100, Number(limit) || 50))
-    const items = db.prepare('SELECT id,ts,from_id,to_id,field,old_value,new_value,trace_id FROM evolution ORDER BY id DESC LIMIT ?').all(lim)
+    const ends = bothEndsVisible(opts?.identity)
+    const whereSql = ends.active ? ` WHERE ${ends.sql}` : ''
+    const items = db.prepare(`SELECT id,ts,from_id,to_id,field,old_value,new_value,trace_id FROM evolution${whereSql}
+      ORDER BY id DESC LIMIT ?`).all(...ends.params, lim)
     return { ok: true, items }
   }
 
@@ -783,9 +942,10 @@ export class LocalBackend {
    *
    * 过滤参数全部走 SQL 占位符；filter 只认白名单（zero/unused），
    * 未知值按"不过滤"处理——面板多传一个键不能把整页查空。
+   * 身份条件（opts.identity）与其它条件同层 AND，避免"过滤把人过滤掉了但统计没过滤"。
    *
    * @param {number} [limit] 1..100（越界夹取；非正数回落 20）
-   * @param {{ source?: string, since?: number, filter?: 'zero'|'unused'|'' }} [opts]
+   * @param {{ source?: string, since?: number, filter?: 'zero'|'unused'|'', identity?: Identity }} [opts]
    *   source: 精确匹配来源（截 32）；since: 秒级下界；filter: zero=零命中 / unused=已注入未采纳
    * @returns {{ items: Array<{ id:number, ts:number, trace_id:string, query:string,
    *   hit_ids:string, chars:number, injected:number, used:number, elapsed_ms:number|null,
@@ -795,16 +955,17 @@ export class LocalBackend {
     const db = this._db()
     const raw = Number(limit)
     const lim = Math.max(1, Math.min(100, Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 20))
-    const where = []
-    const args = []
+    const extra = []
     const source = String(opts?.source ?? '').slice(0, 32)
-    if (source) { where.push('source = ?'); args.push(source) }
+    if (source) extra.push(['source = ?', [source]])
     const since = Number(opts?.since)
-    if (Number.isFinite(since)) { where.push('ts >= ?'); args.push(since) }
-    if (opts?.filter === 'zero') where.push("hit_ids IN ('[]','')")
-    else if (opts?.filter === 'unused') where.push('injected = 1 AND used = 0')
-    const sql = `SELECT id,ts,trace_id,query,hit_ids,chars,injected,used,elapsed_ms,source FROM recalls${where.length ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY ts DESC, id DESC LIMIT ?`
-    const rows = db.prepare(sql).all(...args, lim)
+    if (Number.isFinite(since)) extra.push(['ts >= ?', [since]])
+    if (opts?.filter === 'zero') extra.push(["hit_ids IN ('[]','')", []])
+    else if (opts?.filter === 'unused') extra.push(['injected = 1 AND used = 0', []])
+    const where = whereOf(opts?.identity, extra)
+    const sql = `SELECT id,ts,trace_id,query,hit_ids,chars,injected,used,elapsed_ms,source
+      FROM recalls${where.sql} ORDER BY ts DESC, id DESC LIMIT ?`
+    const rows = db.prepare(sql).all(...where.params, lim)
     return { items: rows.map((r) => ({ ...r, hits: hitIdsCount(r.hit_ids) })) }
   }
 
@@ -934,21 +1095,88 @@ export class LocalBackend {
   }
 }
 
-/** 外部服务客户端（S1 保留；只读四接口）。 */
+/**
+ * 读接口第二参数兼容层：既接受 AbortSignal（hook 直传 `recall(q, signal)` 的旧写法），
+ * 也接受 `{ signal, timeoutMs, identity }` 选项对象（路由统一 opts 口径）。
+ * why 必须兼容：hook 传的是 AbortSignal，路由传的是 opts；HttpBackend 一个方法要接住两种调用。
+ *
+ * @param {AbortSignal|{signal?:AbortSignal,timeoutMs?:number,identity?:any}|null|undefined} opts
+ * @returns {{ signal?: AbortSignal, timeoutMs?: number, identity?: any }}
+ */
+function callOpts(opts) {
+  if (!opts || typeof opts !== 'object') return {}
+  if (typeof opts.addEventListener === 'function' && typeof opts.aborted === 'boolean') return { signal: opts }
+  return { ...opts }
+}
+
+/** 远端协议串：`GET /version` 回 `{protocol}`，不匹配即 protocol_mismatch（面板可读）。 */
+export const WHALE_PROTOCOL = 'whale-memory/1'
+/** 单次响应体硬顶（防止远端返回巨大 JSON 拖死主线程）。 */
+const MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+
+/**
+ * 外部服务客户端：读四接口 + 写接口 + version。
+ *
+ * 两条硬口径：
+ * - 读接口 fail-open（返回 null），检索失败不能阻塞对话；
+ * - 写接口显式失败（返回 `{ok:false,error}`），绝不静默 null——否则 outbox 会把
+ *   "没写成功"当成"没响应"，重试与审计都失去依据。
+ *
+ * Bearer token 只由构造参数传入（不读 env/config 魔法），`authorization` 头统一注入，
+ * 读/写/version 三条链路同源。
+ */
 export class HttpBackend {
-  constructor({ baseUrl, timeoutMs = 3000, token = '', log = () => {} }) {
+  /**
+   * @param {{ baseUrl?: string, timeoutMs?: number, token?: string, log?: Function }} [opts]
+   */
+  constructor({ baseUrl, timeoutMs = 3000, token = '', log = () => {} } = {}) {
     this.baseUrl = String(baseUrl || '').replace(/\/+$/, '')
+    this.mode = 'http'
     this.timeoutMs = timeoutMs
     this.token = token
     this.log = log
+    /** 最近一次成功探测到的协议串（未探测为 null）。 */
+    this.protocol = null
+    /** 最近一次协议不匹配的证据 `{protocol,expected,baseUrl,at}`；匹配/未探测为 null。 */
+    this.protocolMismatch = null
+    this.protocolCheckedAt = null
   }
 
   get ready() { return Boolean(this.baseUrl) }
 
-  async request(path, opts = {}) {
-    if (!this.ready) return null
-    const { method = 'GET', body, signal, timeoutMs = this.timeoutMs } = opts
-    const timeout = AbortSignal.timeout(timeoutMs)
+  /**
+   * 运行中补 token（凭证服务异步解析，构造时拿不到）。
+   * @param {string} token
+   * @returns {{ ok: boolean }}
+   */
+  setToken(token) {
+    this.token = String(token || '')
+    return { ok: true }
+  }
+
+  /** 面板/统计可读的协议状态：即使不匹配也返回对象，不抛。 */
+  get protocolStatus() {
+    return {
+      ok: this.protocol === WHALE_PROTOCOL,
+      protocol: this.protocol,
+      expected: WHALE_PROTOCOL,
+      mismatch: this.protocolMismatch,
+      checked_at: this.protocolCheckedAt,
+      baseUrl: this.baseUrl,
+    }
+  }
+
+  /**
+   * 统一发送：不抛异常，返回显式结果。
+   * @param {string} path
+   * @param {{ method?: string, body?: unknown, signal?: AbortSignal, timeoutMs?: number, headers?: Record<string,string> }} [opts]
+   * @returns {Promise<{ ok: boolean, status: number, data?: any, error?: string, timedOut?: boolean }>}
+   */
+  async _send(path, opts = {}) {
+    if (!this.ready) return { ok: false, status: 0, error: 'backend_not_configured' }
+    const { method = 'GET', body, signal, timeoutMs = this.timeoutMs, headers = {} } = opts
+    const budget = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0 ? Number(timeoutMs) : this.timeoutMs
+    const timeout = AbortSignal.timeout(budget)
     const combined = signal ? AbortSignal.any([signal, timeout]) : timeout
     try {
       const res = await fetch(this.baseUrl + path, {
@@ -956,29 +1184,142 @@ export class HttpBackend {
         headers: {
           'content-type': 'application/json',
           ...(this.token ? { authorization: `Bearer ${this.token}` } : {}),
+          ...headers,
         },
         body: body === undefined ? undefined : JSON.stringify(body),
       })
-      if (!res.ok) return null
       const text = await res.text()
-      if (text.length > 2 * 1024 * 1024) return null
-      return JSON.parse(text)
+      if (!res.ok) {
+        return { ok: false, status: res.status, error: `http_${res.status}`, text: text.slice(0, 500) }
+      }
+      if (text.length > MAX_RESPONSE_BYTES) return { ok: false, status: res.status, error: 'response_too_large' }
+      let data = null
+      if (text) {
+        try { data = JSON.parse(text) } catch { return { ok: false, status: res.status, error: 'invalid_json' } }
+      }
+      return { ok: true, status: res.status, data }
     } catch (err) {
-      this.log(`[whale-memory] backend ${method} ${path} fail-open: ${err?.name || err?.message || 'error'}`)
-      return null
+      const timedOut = err?.name === 'TimeoutError' || err?.name === 'AbortError'
+      return {
+        ok: false, status: 0, timedOut,
+        error: timedOut ? 'timeout' : String(err?.code || err?.message || 'network_error'),
+      }
     }
   }
 
-  async stats(signal) { return this.request('/stats', { signal }) }
-  async recent(limit, signal) { return this.request(`/recent?limit=${encodeURIComponent(limit)}`, { signal }) }
-  async search(q, signal) { return this.request('/search', { method: 'POST', body: q, signal }) }
-  async recall(q, signal) { return this.request('/recall', { method: 'POST', body: q, signal }) }
+  /** 读接口 fail-open：失败返回 null（内部日志保留原因）。 */
+  async request(path, opts = {}) {
+    const out = await this._send(path, opts)
+    if (out.ok) return out.data
+    this.log(`[whale-memory] backend ${opts.method || 'GET'} ${path} fail-open: ${out.error}`)
+    return null
+  }
+
+  async stats(opts = {}) { return this.request('/stats', callOpts(opts)) }
+  async recent(limit, opts = {}) {
+    const { signal, ...rest } = callOpts(opts)
+    return this.request(`/recent?limit=${encodeURIComponent(limit)}`, { signal, ...rest })
+  }
+  async search(q, opts = {}) {
+    const { signal, ...rest } = callOpts(opts)
+    return this.request('/search', { method: 'POST', body: q, signal, ...rest })
+  }
+  async recall(q, opts = {}) {
+    const { signal, ...rest } = callOpts(opts)
+    return this.request('/recall', { method: 'POST', body: q, signal, ...rest })
+  }
+
+  /**
+   * 写入远端：POST `/write`，body `{event}`；成功返回远端 action。
+   *
+   * 冲突不在这里裁决：`{action:'conflict'}` 或 `{conflict:true}` 原样作为
+   * `conflict:true` 交给 Hybrid（它负责把本地节点置 stale 并保留 outbox 明细）。
+   *
+   * @param {object} event 节点/事件快照
+   * @param {{ signal?: AbortSignal, timeoutMs?: number }} [opts]
+   * @returns {Promise<{ ok: boolean, action?: string, conflict?: boolean, id?: string|null, status?: number, error?: string }>}
+   */
+  async write(event, opts = {}) {
+    const out = await this._send('/write', { method: 'POST', body: { event }, ...opts })
+    if (!out.ok) return { ok: false, error: out.error, status: out.status, timedOut: Boolean(out.timedOut) }
+    const data = out.data && typeof out.data === 'object' ? out.data : {}
+    if (data.ok === false) return { ok: false, error: String(data.error || 'write_rejected'), status: out.status, action: data.action }
+    const action = String(data.action ?? 'ok')
+    return {
+      ok: true,
+      action,
+      conflict: action === 'conflict' || data.conflict === true,
+      id: data.id === undefined || data.id === null ? null : String(data.id),
+      status: out.status,
+    }
+  }
+
+  /**
+   * 协议探测：GET `/version` → `{protocol:'whale-memory/1'}`。
+   *
+   * 不匹配时不抛、不静默：返回 `{ok:false,error:'protocol_mismatch'}`，同时把证据留在
+   * `protocolMismatch` / `protocolStatus` 上（面板与 stats 可读）。网络失败也显式返回。
+   *
+   * @param {{ signal?: AbortSignal, timeoutMs?: number }} [opts]
+   * @returns {Promise<{ ok: boolean, protocol?: string|null, expected: string, mismatch?: boolean, status?: number, error?: string }>}
+   */
+  async version(opts = {}) {
+    const out = await this._send('/version', opts)
+    if (!out.ok) return { ok: false, expected: WHALE_PROTOCOL, status: out.status, error: out.error }
+    const protocol = String(out.data?.protocol ?? '')
+    this.protocol = protocol || null
+    this.protocolCheckedAt = Date.now()
+    this.protocolMismatch = protocol === WHALE_PROTOCOL
+      ? null
+      : { protocol: protocol || null, expected: WHALE_PROTOCOL, baseUrl: this.baseUrl, at: this.protocolCheckedAt }
+    if (this.protocolMismatch) {
+      this.log(`[whale-memory] backend protocol mismatch: ${protocol || '(empty)'} != ${WHALE_PROTOCOL}`)
+      return { ok: false, error: 'protocol_mismatch', protocol, expected: WHALE_PROTOCOL, mismatch: true, status: out.status }
+    }
+    return { ok: true, protocol, expected: WHALE_PROTOCOL, status: out.status }
+  }
 }
 
-/** @param {{ mode?: string, url?: string, timeoutMs?: number }} cfg @param {{ token?: string, log?: Function, dataDir?: string, useWorker?: boolean }} [extra] */
+/**
+ * 后端工厂：local（默认）/ http（纯远端）/ hybrid（本地真源 + 远端副本 + outbox）。
+ *
+ * hybrid 不再当纯 Http 返回：读走 HTTP 失败回本地，写必须落本地并排队同步。
+ *
+ * @param {{ mode?: string, url?: string, timeoutMs?: number }} cfg backend 配置段
+ * @param {{ token?: string, log?: Function, dataDir?: string, useWorker?: boolean, config?: object|Function }} [extra]
+ *   config 为完整配置（或 getter）：hybrid 读 `sync.httpTimeoutMs`（默认 800ms），
+ *   LocalBackend 读 `write.*`，二者同源。
+ */
 export function createBackend(cfg, extra = {}) {
-  if (cfg?.mode === 'http' || cfg?.mode === 'hybrid') {
-    return new HttpBackend({ baseUrl: cfg.url || '', timeoutMs: cfg.timeoutMs || 3000, ...extra })
+  if (cfg?.mode === 'http') {
+    return new HttpBackend({
+      baseUrl: cfg.url || '',
+      timeoutMs: cfg.timeoutMs || 3000,
+      token: extra.token || '',
+      log: extra.log || (() => {}),
+    })
+  }
+  if (cfg?.mode === 'hybrid') {
+    const liveConfig = () => {
+      const c = extra.config
+      return typeof c === 'function' ? c() : c
+    }
+    const syncTimeout = Number(plain(liveConfig()?.sync?.httpTimeoutMs))
+    const httpTimeoutMs = Number.isFinite(syncTimeout) && syncTimeout > 0 ? syncTimeout : 800
+    const local = new LocalBackend({
+      dataDir: extra.dataDir || '',
+      useWorker: extra.useWorker !== false,
+      timeoutMs: cfg?.timeoutMs || 1200,
+      log: extra.log,
+      config: extra.config,
+    })
+    const http = new HttpBackend({
+      baseUrl: cfg.url || '',
+      timeoutMs: httpTimeoutMs,
+      token: extra.token || '',
+      log: extra.log || (() => {}),
+    })
+    return new HybridBackend({ local, http, config: extra.config, log: extra.log || (() => {}), httpTimeoutMs })
   }
   return new LocalBackend({
     dataDir: extra.dataDir || '',

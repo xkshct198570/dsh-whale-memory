@@ -17,5 +17,5 @@ jobs:
         run: node scripts/check.mjs
       - name: i18n keys
         run: node scripts/i18n-check.mjs
-      - name: Unit tests
-        run: node --test test/*.test.mjs
+      - name: Tests（分层 test/{unit,contract,hook,data,worker,lifecycle,sync,client}）
+        run: npm test

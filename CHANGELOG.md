@@ -1,13 +1,22 @@
 # Changelog
 
-## 0.5.1 — 2026-11-22（采纳信号 · 未发布）
+## 0.5.1 — 2026-11-22（采纳信号 · 后端与集成 · 未发布）
 
 审计 backlog P1「回复引用信号（used 恒 0）」落地：注入 ≠ 采纳，之前 adoptionRate 恒 0、未采纳 Top10 等同全部已注入查询。
 - 新增 `src/core/adoption.js`（无 IO 判定层）：原文 10 字窗口命中（强证据）或中文 bigram 覆盖率 ≥0.6 且 ≥5 个（改写型弱证据）即判采纳；节点 <8 字恒不采纳，宁漏判不伪造。
 - `LocalBackend.recall()` 返回 `recallId` 与最终注入节点 `injectedNodes`（只含真正进上下文的节点）；新增 `markRecallUsed(recallId, used)` 只回写 `used` 列（不改 hit_ids/chars，注入事实与采纳事实分离），失败 fail-open。
 - hook 接 `agent/assistant-stream`：按 (turn,step) 累积回复文本；在新一步 pre-step 或 `agent/turn-stopping`/`agent/disposed` 时结算，有引用证据才回写 used=1；无 `markRecallUsed` 的旧 backend 不崩。
 - 日报「未采纳 Top10」口径文案同步（原文窗口/bigram 覆盖判定，改写幅度大的回复可能漏判）。
-- 测试 215 → 231（230 pass / 1 skip）：新增 `test/adoption.test.mjs`、`test/adoption-signal.test.mjs`（含 hook→backend 全链路 used 落库断言），`test/hook.test.mjs` 扩 5 例。
+- 测试 215 → 231（230 pass / 1 skip）：新增 `test/unit/adoption.test.mjs`、`test/hook/adoption-signal.test.mjs`（含 hook→backend 全链路 used 落库断言），`test/hook/hook.test.mjs` 扩 5 例。
+
+同版本收尾批（后端接线 / 身份 / 迁移 / 测试分层 / 发布文档）：
+- 测试分层：`test/` 按 `unit/contract/hook/data/worker/lifecycle/sync/client` 八层重排；`npm test` 改为 8 条目录 glob（此前只跑根目录，子目录静默漏跑）；当前 **268 例**（267 pass / 1 skip / 0 fail），CI 跑全层。
+- HttpBackend 写链路：补 `POST /write`（body `{event}`，远端冲突原样交回调用方）、`GET /version`（`{protocol:'whale-memory/1'}`）与 Bearer token（`setToken`/credentials，读/写/version 同源头注入）；协议不符返回 `protocol_mismatch` 并把证据留在 `protocolStatus`，不抛不静默。
+- Hybrid 双轨：本地 SQLite 为真源、HTTP 为副本；读走 HTTP，失败/超时（默认 800ms）回退本地并计入 `stats.sync.http_fallbacks`；写先落本地再入 `sync_outbox`（持久化），30 秒看门狗续跑、指数退避、8 次失败转 failed、重启复位 running；远端冲突把本地节点置 stale 并保留 outbox 证据。
+- identity auto：`identity.mode=auto` 时取宿主 `deepseekAccount` 的 userId（5 分钟 TTL、fail-open 空串）+ 会话 cwd 派生的 workspace（规范化绝对路径，超 64 字稳定哈希压缩）；缺账号服务的老宿主回落 Config/空值；旧配置迁移强制 `fixed`，防旧库分区漂移。
+- 旧配置迁移：首启把 hub 0.2.0 的环境变量一次性写进 Config（网关地址→`backend.url` 且 local→http、两级超时、role/user→`identity` fixed、remote 开关）；marker（有本地库用 `meta.migrated_from`，无库用 `$DSH_HOME/whale-memory/migration.json`）幂等；保存失败只记日志不挡启动；已建 backend 不换实现，日志提示重启后生效。
+- 迁移审计：新增 `scripts/migrate-audit.mjs`——默认只读 dry-run；`--apply --apply-edges` 先 `wal_checkpoint` + `VACUUM INTO` 备份（保留 5 份）再写 `similar/manual` 边；sha256 归一化 text_hash 重映射、按状态/分区统计、双读 overlap、md/json 报告；操作手册 `docs/MIGRATION.md`。
+- 发布文档：`docs/DETAIL.md`（首行 640×300 无字预览图 + 5 条能力与隐私说明）+ `docs/preview.svg`；README 重写为用户视角（安装/使用/13 组配置/数据与隐私/限制/迁移/故障），`scripts/check.mjs` E9 通过。
 
 ## 0.5.0 — 2026-11-22（观测层批次 · 未发布）
 

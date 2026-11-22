@@ -622,8 +622,35 @@ export function recordWrite(db, event, decision) {
   return Number(info.lastInsertRowid)
 }
 
+/**
+ * 演化留痕（evolution 的唯一 INSERT 入口）。
+ *
+ * 为什么收敛成一处：「所有改动留痕」（架构书 §7.2）意味着 supersede 迁移、面板人工编辑、
+ * 邻居注记都要落同一张表；散在各处的 INSERT 迟早漏字段（旧代码只有 relations.js 一处，
+ * supersede 与人工 updateNode 都没留痕）。from_id=发起方/被改节点，to_id=被改节点。
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {{ ts?: number, fromId?: string, toId?: string, field?: string,
+ *   oldValue?: unknown, newValue?: unknown, traceId?: string }} row
+ * @returns {number} 新 evolution 行 id
+ */
+export function recordEvolution(db, row = {}) {
+  const text = (v) => (v === null || v === undefined ? null : String(v).slice(0, 500))
+  const info = db.prepare(`INSERT INTO evolution (ts,from_id,to_id,field,old_value,new_value,trace_id)
+    VALUES (?,?,?,?,?,?,?)`).run(
+    finite(row.ts, now()),
+    String(row.fromId ?? ''),
+    String(row.toId ?? ''),
+    String(row.field ?? ''),
+    text(row.oldValue),
+    text(row.newValue),
+    String(row.traceId ?? '').slice(0, 64),
+  )
+  return Number(info.lastInsertRowid) || 0
+}
+
 /** 事务包装：调用方已开事务时不重复 BEGIN（BEGIN 失败即视为嵌套，直接执行）。 */
-function withTx(db, fn) {
+export function withTx(db, fn) {
   let begun = false
   try {
     db.exec('BEGIN IMMEDIATE')
@@ -700,6 +727,10 @@ function insertNodeRow(db, event, text, { ts, validAt, source, origin, level, me
  * 否则 `w.reviewMode === 'auto'` 恒 false（auto 静默退化成 shadow）、`finite(Ref)` 恒 NaN
  * （maxChars/dailyCap 恒回默认值）。
  *
+ * 隐私开关（审计 P0-1 假开关）：真源是 Config 的 `privacy.redact`（面板「设置·隐私」那一栏
+ * 真正落在 schema 的 privacy 组；`write.redact` 在 schema 里不存在，只被旧单测当扁平写法用）。
+ * 因此先读 `privacy.redact`，缺失才回落 `write.redact`——保留直连 write 段的旧调用方。
+ *
  * @param {object|((() => object))|null|undefined} config
  * @returns {{ mode: 'shadow'|'auto', maxChars: number, dailyCap: number, protect: boolean, redact: boolean }}
  */
@@ -708,12 +739,17 @@ function resolveConfig(config) {
   const root = c && typeof c === 'object' ? c : {}
   const section = plain(root.write)
   const w = section && typeof section === 'object' ? section : root
+  const privacySection = plain(root.privacy)
+  const privacy = privacySection && typeof privacySection === 'object' ? privacySection : null
+  const redact = privacy && privacy.redact !== undefined
+    ? plain(privacy.redact) !== false
+    : plain(w.redact) !== false
   return {
     mode: plain(w.reviewMode ?? w.mode) === 'auto' ? 'auto' : 'shadow',
     maxChars: finite(plain(w.maxChars), TEXT_LIMIT),
     dailyCap: finite(plain(w.dailyCap), 200),
     protect: plain(w.protect) !== false,
-    redact: plain(w.redact) !== false,
+    redact,
   }
 }
 
@@ -801,9 +837,22 @@ export function processEvent(db, event, config = {}) {
         expiredAt: validExpiredAt(event?.expired_at),
       })
       if (action === 'SUPERSEDE') {
+        // 旧值必须在 UPDATE 之前读：evolution 的 old_value 是"改之前"，不能拿新行反推。
+        const before = db.prepare('SELECT status, text FROM nodes WHERE id=?').get(targetId) || {}
         db.prepare(`UPDATE nodes SET status='superseded', invalid_at=?, expired_at=?, superseded_by=?, updated_at=?
           WHERE id=?`).run(ts, ts, newId, ts, targetId)
         linkSupersede(db, targetId, newId)
+        // 所有改动留痕（§7.2）：状态迁移一条；正文被新事实替换时再补一条 text。
+        recordEvolution(db, {
+          ts, fromId: targetId, toId: newId, field: 'status',
+          oldValue: before.status ?? 'active', newValue: 'superseded', traceId: event?.traceId,
+        })
+        if (String(before.text ?? '') !== text) {
+          recordEvolution(db, {
+            ts, fromId: targetId, toId: newId, field: 'text',
+            oldValue: before.text ?? '', newValue: text, traceId: event?.traceId,
+          })
+        }
       } else {
         linkMutex(db, targetId, newId)
       }
@@ -854,7 +903,7 @@ function acceptCandidate(db, row, text, payload, shadowOf, writeId) {
   })
 
   if (shadowOf === 'MERGE') {
-    const target = targetId ? db.prepare('SELECT id,source,level,memory_type FROM nodes WHERE id=?').get(targetId) : null
+    const target = targetId ? db.prepare('SELECT id,source,level,memory_type,text FROM nodes WHERE id=?').get(targetId) : null
     if (!target) return { ok: false, error: 'target_not_found' }
     // 决策时目标不受保护、审核时已被标记保护：accept 必须拒绝，不能绕过保护面。
     if (isProtectedTarget(target, { protect: true })) return { ok: false, error: 'protected_target' }
@@ -868,17 +917,35 @@ function acceptCandidate(db, row, text, payload, shadowOf, writeId) {
       db.prepare('UPDATE nodes SET text=?, text_hash=?, text_bigrams=?, source=?, updated_at=? WHERE id=?')
         .run(text, contentHash(text), bigrams(text), source, ts, targetId)
     }
+    // 审核通过也是"一次改动"：正文被影子候选替换要留痕（§7.2），否则 accept 成了审计盲区。
+    if (String(target.text ?? '') !== text) {
+      recordEvolution(db, {
+        ts, fromId: targetId, toId: targetId, field: 'text',
+        oldValue: target.text ?? '', newValue: text, traceId: row.trace_id,
+      })
+    }
     db.prepare("UPDATE writes SET action='MERGE', node_id=? WHERE id=?").run(targetId, writeId)
     return { ok: true, id: targetId }
   }
 
   if (shadowOf === 'SUPERSEDE') {
-    const target = targetId ? db.prepare('SELECT id FROM nodes WHERE id=?').get(targetId) : null
+    const target = targetId ? db.prepare('SELECT id,status,text FROM nodes WHERE id=?').get(targetId) : null
     if (!target) return { ok: false, error: 'target_not_found' }
     const newId = insert()
     db.prepare(`UPDATE nodes SET status='superseded', invalid_at=?, expired_at=?, superseded_by=?, updated_at=?
       WHERE id=?`).run(ts, ts, newId, ts, targetId)
     linkSupersede(db, targetId, newId)
+    // 影子候选 accept 后的取代与 auto 模式同构：状态迁移 + 正文替换都要留痕。
+    recordEvolution(db, {
+      ts, fromId: targetId, toId: newId, field: 'status',
+      oldValue: target.status ?? 'active', newValue: 'superseded', traceId: row.trace_id,
+    })
+    if (String(target.text ?? '') !== text) {
+      recordEvolution(db, {
+        ts, fromId: targetId, toId: newId, field: 'text',
+        oldValue: target.text ?? '', newValue: text, traceId: row.trace_id,
+      })
+    }
     db.prepare("UPDATE writes SET action='SUPERSEDE', node_id=? WHERE id=?").run(newId, writeId)
     return { ok: true, id: newId }
   }

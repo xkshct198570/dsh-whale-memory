@@ -12,6 +12,7 @@ import { resolveIdentity } from './identity.js'
 import { bool, value } from './config-values.js'
 import { Config } from './config.js'
 import { HttpSyncTransport, pullFromGateway, pushToGateway } from '../core/sync.js'
+import { WHALE_PROTOCOL } from '../core/backend.js'
 
 const PREFIX = '/whale-memory/api'
 
@@ -141,9 +142,28 @@ function sendMethodNotAllowed(res, allow) {
   return sendJson(res, 405, { ok: false, error: 'method_not_allowed' })
 }
 
-/** @param {{ config: any, backend: any, log?: (s:string)=>void }} deps */
-export function createRoutes({ config, backend, getIdentityCfg = () => config?.identity, ctx, reflect, log = () => {} }) {
-  return async function handle(req, res) {
+/** @param {{ config: any, backend: any, getIdentityCfg?: () => any, getIdentityHint?: () => any,
+ *   getHostUserId?: () => string, migration?: { state?: any }, log?: (s:string)=>void }} deps */
+export function createRoutes({
+  config, backend,
+  getIdentityCfg = () => config?.identity,
+  getIdentityHint = () => null,
+  getHostUserId = () => '',
+  migration = null,
+  ctx, reflect, log = () => {},
+}) {
+  /** 迁移只读视图（/stats）：没有安装迁移时给空值，键始终存在。 */
+  const migrationView = () => {
+    const state = migration?.state || null
+    return {
+      migratedFrom: state?.migratedFrom ?? null,
+      migratedAt: state?.migratedAt ?? null,
+      pending: Boolean(state?.pending),
+    }
+  }
+
+  /** 主分发（内部）：抛错由下面的 handle 统一兜底成 502 JSON。 */
+  const dispatch = async (req, res) => {
     // 每次请求读实时配置：面板改了 allowRemote 必须立刻生效，不能闭包快照。
     const addr = req.socket?.remoteAddress
     if (!bool(config?.panel?.allowRemote, false) && !isLoopback(addr)) {
@@ -155,20 +175,125 @@ export function createRoutes({ config, backend, getIdentityCfg = () => config?.i
     let path = ''
     try { path = new URL(req.url || '/', 'http://127.0.0.1').pathname } catch { path = '' }
 
-    const ident = resolveIdentity(getIdentityCfg())
+    const ident = resolveIdentity(
+      getIdentityCfg(),
+      typeof getIdentityHint === 'function' ? getIdentityHint() : null,
+      typeof getHostUserId === 'function' ? String(getHostUserId() || '') : '',
+      // 路由没有会话 header ⇒ 会话 workspace 维度只在 hook（pre-step）启用。
+      '',
+    )
     if (!ident.ok) return sendJson(res, 400, { ok: false, error: ident.error })
     const identity = ident.identity
+    /** 面板要的只读身份视图（不泄漏正文）：来源逐字段可查。 */
+    const identityView = () => ({
+      mode: String(value(config?.identity?.mode, 'auto')),
+      userId: identity.userId,
+      roleId: identity.roleId,
+      workspace: identity.workspace,
+      source: ident.source,
+      workspaceSource: ident.sources?.workspace || 'default',
+    })
+
+    /** 请求显式带 workspace（string，含空串）时覆盖 Config；不带就沿用 handle 顶部身份。 */
+    const withRequestWorkspace = (workspace) => {
+      if (typeof workspace !== 'string') return ident
+      const baseHint = typeof getIdentityHint === 'function' ? (getIdentityHint() || {}) : {}
+      const hint = { ...baseHint, workspace: workspace.trim().slice(0, 64) }
+      return resolveIdentity(
+        getIdentityCfg(),
+        hint,
+        typeof getHostUserId === 'function' ? String(getHostUserId() || '') : '',
+        '',
+      )
+    }
+
+    /**
+     * 身份覆盖：请求显式带 userId/roleId/workspace（任一字符串）时优先用请求值，
+     * 未带就沿用 handle 顶部按 getIdentityCfg() 推导的身份。
+     *
+     * why 需要它：列表/详情端点必须传身份（跨身份泄漏是 P0），而面板/外部调用方
+     * 有时要"看另一个分区"；这里只做覆盖，不做授权判断——回环闸门已经在上面拦过。
+     */
+    const requestIdentity = (source) => {
+      if (!source || typeof source !== 'object') return { ok: true, identity }
+      const override = {}
+      for (const [key, max] of [['userId', 128], ['roleId', 64], ['workspace', 64]]) {
+        const raw = source[key]
+        if (typeof raw !== 'string') continue
+        override[key] = raw.trim().slice(0, max)
+      }
+      if (Object.keys(override).length === 0) return { ok: true, identity }
+      const baseHint = typeof getIdentityHint === 'function' ? (getIdentityHint() || {}) : {}
+      const got = resolveIdentity(
+        getIdentityCfg(),
+        { ...baseHint, ...override },
+        typeof getHostUserId === 'function' ? String(getHostUserId() || '') : '',
+        '',
+      )
+      return got.ok ? { ok: true, identity: got.identity } : { ok: false, error: got.error }
+    }
+
+    /** GET 查询串里的身份覆盖参数（不带的键为 undefined ⇒ 不覆盖）。 */
+    const identityParams = (params) => ({
+      userId: params.get('userId') ?? undefined,
+      roleId: params.get('roleId') ?? undefined,
+      workspace: params.get('workspace') ?? undefined,
+    })
+
+    /** 后端状态视图（/stats 与 /version 同源）：local 恒 match，http/hybrid 读 protocolStatus。 */
+    const backendView = () => {
+      const status = backend?.protocolStatus || null
+      const mode = String(backend?.mode || value(config?.backend?.mode, 'local'))
+      return {
+        mode,
+        ready: backend?.ready === undefined ? true : Boolean(backend.ready),
+        protocol: status ? (status.protocol ?? null) : WHALE_PROTOCOL,
+        expected: String(status?.expected || WHALE_PROTOCOL),
+        match: status ? Boolean(status.ok) : true,
+      }
+    }
+    /** outbox 只读出口：只有 hybrid 有（local/http 为 null，键仍存在）。 */
+    const backendOutbox = () => {
+      const outbox = backend?.outbox
+      return outbox && typeof outbox === 'object' ? outbox : null
+    }
+
+    // 后端状态出口（审计 P0-7）：面板页头据此显示「local/http/hybrid · 协议 OK/不兼容 · outbox n」。
+    if (path === `${PREFIX}/version` && req.method === 'GET') {
+      const view = backendView()
+      const status = backend?.protocolStatus || null
+      return sendJson(res, 200, {
+        ok: true,
+        protocol: view.protocol,
+        expected: view.expected,
+        match: view.match,
+        mode: view.mode,
+        baseUrl: String(status?.baseUrl || backend?.baseUrl || ''),
+        protocolStatus: status,
+        outbox: backendOutbox(),
+      })
+    }
 
     if (path === `${PREFIX}/stats` && req.method === 'GET') {
       const data = await backend.stats()
+      const outbox = backendOutbox()
       return sendJson(res, 200, data
-        ? { ok: true, offline: false, stats: data }
-        : { ok: false, offline: true, error: 'backend_unreachable', identity })
+        ? {
+          ok: true, offline: false, stats: data, identity: identityView(), migration: migrationView(),
+          backend: backendView(), ...(outbox ? { outbox } : {}),
+        }
+        : {
+          ok: false, offline: true, error: 'backend_unreachable', identity: identityView(),
+          migration: migrationView(), backend: backendView(), ...(outbox ? { outbox } : {}),
+        })
     }
 
     if (path === `${PREFIX}/recent` && req.method === 'GET') {
-      const limit = clamp(new URL(req.url, 'http://127.0.0.1').searchParams.get('limit'), 1, 10, 3)
-      const data = await backend.recent(limit)
+      const params = new URL(req.url, 'http://127.0.0.1').searchParams
+      const limit = clamp(params.get('limit'), 1, 10, 3)
+      const idn = requestIdentity(identityParams(params))
+      if (!idn.ok) return sendJson(res, 400, { ok: false, error: idn.error })
+      const data = await backend.recent(limit, { identity: idn.identity })
       return sendJson(res, data ? 200 : 502, data
         ? { ok: true, items: data.items || data || [] }
         : { ok: false, error: 'backend_unreachable' })
@@ -180,8 +305,12 @@ export function createRoutes({ config, backend, getIdentityCfg = () => config?.i
       const query = typeof body.value?.query === 'string' ? body.value.query.trim().slice(0, 200) : ''
       if (!query) return sendJson(res, 400, { ok: false, error: 'invalid_query' })
       const limit = clamp(body.value?.limit, 1, 20, 5)
+      // 请求显式带 workspace 时优先用请求值（面板/外部调用方可指定分区）；
+      // 不带则保持 Config（路由无会话 header）。
+      const identForRequest = withRequestWorkspace(body.value?.workspace)
+      if (!identForRequest.ok) return sendJson(res, 400, { ok: false, error: identForRequest.error })
       const started = Date.now()
-      const data = await backend.search({ query, limit, identity, traceId })
+      const data = await backend.search({ query, limit, identity: identForRequest.identity, traceId })
       if (!data) return sendJson(res, 502, { ok: false, error: 'backend_unreachable' })
       return sendJson(res, 200, {
         ok: true,
@@ -200,8 +329,10 @@ export function createRoutes({ config, backend, getIdentityCfg = () => config?.i
       const query = typeof body.value?.query === 'string' ? body.value.query.trim().slice(0, 200) : ''
       if (!query) return sendJson(res, 400, { ok: false, error: 'invalid_query' })
       const maxHits = clamp(body.value?.maxHits, 1, 10, 5)
+      const identForRequest = withRequestWorkspace(body.value?.workspace)
+      if (!identForRequest.ok) return sendJson(res, 400, { ok: false, error: identForRequest.error })
       const started = Date.now()
-      const data = await backend.search({ query, limit: maxHits, identity, traceId })
+      const data = await backend.search({ query, limit: maxHits, identity: identForRequest.identity, traceId })
       if (!data) return sendJson(res, 502, { ok: false, error: 'backend_unreachable' })
       return sendJson(res, 200, {
         ok: true,
@@ -350,12 +481,14 @@ export function createRoutes({ config, backend, getIdentityCfg = () => config?.i
       const params = new URL(req.url, 'http://127.0.0.1').searchParams
       const limit = clamp(params.get('limit'), 1, 100, 20)
       const offset = clamp(params.get('offset'), 0, 1_000_000, 0)
+      const idn = requestIdentity(identityParams(params))
+      if (!idn.ok) return sendJson(res, 400, { ok: false, error: idn.error })
       if (typeof backend.nodes !== 'function') {
         return sendJson(res, 502, { ok: false, error: 'backend_unavailable' })
       }
       let data
       try {
-        data = await backend.nodes({ identity, limit, offset })
+        data = await backend.nodes({ identity: idn.identity, limit, offset })
       } catch (err) {
         log(`[whale-memory] nodes fail: ${err?.message || 'error'}`)
         return sendJson(res, 502, { ok: false, error: 'backend_error' })
@@ -411,14 +544,24 @@ export function createRoutes({ config, backend, getIdentityCfg = () => config?.i
       const id = decodeURIComponent(path.slice(`${PREFIX}/nodes/`.length))
       if (req.method === 'GET') {
         if (typeof backend.getNode !== 'function') return sendJson(res, 502, { ok: false, error: 'backend_unavailable' })
-        const got = await backend.getNode(id)
+        const params = new URL(req.url, 'http://127.0.0.1').searchParams
+        const idn = requestIdentity(identityParams(params))
+        if (!idn.ok) return sendJson(res, 400, { ok: false, error: idn.error })
+        // 不属本身份的节点按 404 处理：存在性本身不该跨身份可探测。
+        const got = await backend.getNode(id, { identity: idn.identity })
         return sendJson(res, got?.ok === false ? 404 : 200, got?.ok === false ? got : { ok: true, node: got.node })
       }
       if (req.method === 'PATCH') {
         if (typeof backend.updateNode !== 'function') return sendJson(res, 502, { ok: false, error: 'backend_unavailable' })
         const body = await readJson(req)
         if (!body.ok) return sendJson(res, body.status, { ok: false, error: body.error })
-        const got = await backend.updateNode(id, body.value?.patch || body.value || {})
+        const idn = requestIdentity(body.value)
+        if (!idn.ok) return sendJson(res, 400, { ok: false, error: idn.error })
+        const got = await backend.updateNode(
+          id,
+          body.value?.patch || body.value || {},
+          { identity: idn.identity, traceId },
+        )
         return sendJson(res, got?.ok === false ? 400 : 200, got)
       }
       return sendMethodNotAllowed(res, 'GET, PATCH')
@@ -429,7 +572,9 @@ export function createRoutes({ config, backend, getIdentityCfg = () => config?.i
       const params = new URL(req.url, 'http://127.0.0.1').searchParams
       const limit = clamp(params.get('limit'), 1, 100, 20)
       const action = String(params.get('action') || '').trim().slice(0, 32)
-      const data = await backend.writes(limit, action)
+      const idn = requestIdentity(identityParams(params))
+      if (!idn.ok) return sendJson(res, 400, { ok: false, error: idn.error })
+      const data = await backend.writes(limit, action, { identity: idn.identity })
       return sendJson(res, 200, { ok: true, items: data.items || [] })
     }
 
@@ -447,21 +592,29 @@ export function createRoutes({ config, backend, getIdentityCfg = () => config?.i
       const since = Number.isFinite(sinceNum) ? sinceNum : null
       const filterRaw = String(params.get('filter') || '').trim()
       const filter = filterRaw === 'zero' || filterRaw === 'unused' ? filterRaw : ''
-      const data = await backend.recalls(limit, { source, since, filter })
+      const idn = requestIdentity(identityParams(params))
+      if (!idn.ok) return sendJson(res, 400, { ok: false, error: idn.error })
+      const data = await backend.recalls(limit, { source, since, filter, identity: idn.identity })
       return sendJson(res, 200, { ok: true, items: data.items || [] })
     }
 
     if (path === `${PREFIX}/edges` && req.method === 'GET') {
       if (typeof backend.edges !== 'function') return sendJson(res, 502, { ok: false, error: 'backend_unavailable' })
-      const limit = clamp(new URL(req.url, 'http://127.0.0.1').searchParams.get('limit'), 1, 100, 50)
-      const data = await backend.edges(limit)
+      const params = new URL(req.url, 'http://127.0.0.1').searchParams
+      const limit = clamp(params.get('limit'), 1, 100, 50)
+      const idn = requestIdentity(identityParams(params))
+      if (!idn.ok) return sendJson(res, 400, { ok: false, error: idn.error })
+      const data = await backend.edges(limit, { identity: idn.identity })
       return sendJson(res, 200, { ok: true, ...data })
     }
 
     if (path === `${PREFIX}/evolution` && req.method === 'GET') {
       if (typeof backend.evolution !== 'function') return sendJson(res, 502, { ok: false, error: 'backend_unavailable' })
-      const limit = clamp(new URL(req.url, 'http://127.0.0.1').searchParams.get('limit'), 1, 100, 50)
-      const data = await backend.evolution(limit)
+      const params = new URL(req.url, 'http://127.0.0.1').searchParams
+      const limit = clamp(params.get('limit'), 1, 100, 50)
+      const idn = requestIdentity(identityParams(params))
+      if (!idn.ok) return sendJson(res, 400, { ok: false, error: idn.error })
+      const data = await backend.evolution(limit, { identity: idn.identity })
       return sendJson(res, 200, { ok: true, items: data.items || [] })
     }
 
@@ -523,6 +676,24 @@ export function createRoutes({ config, backend, getIdentityCfg = () => config?.i
 
     log(`[whale-memory] 404 ${req.method} ${path}`)
     return sendJson(res, 404, { ok: false, error: 'not_found' })
+  }
+
+  /**
+   * 统一错误出口（审计 P2-1）：任何端点里 backend 抛错一律 502 `backend_error` 的 JSON，
+   * 不再让异常穿出 webServer（那会变成空响应/断连，面板只看到"加载失败"没有原因）。
+   * 已经写出响应头时（导出/分片写）只收尾，不二次写头——二次 sendJson 会抛 ERR_HTTP_HEADERS_SENT。
+   */
+  return async function handle(req, res) {
+    try {
+      return await dispatch(req, res)
+    } catch (err) {
+      log(`[whale-memory] route error -> 502 backend_error: ${err?.name || ''} ${err?.message || err}`)
+      if (res.headersSent || res.writableEnded) {
+        try { if (!res.writableEnded) res.end() } catch { /* 收尾失败没有可上报的通道 */ }
+        return undefined
+      }
+      return sendJson(res, 502, { ok: false, error: 'backend_error' })
+    }
   }
 }
 

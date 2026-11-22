@@ -38,7 +38,16 @@
     "sqlite"
   ],
   "scripts": {
-    "test": "node --test test/*.test.mjs",
+    "test": "node --test test/unit/*.test.mjs test/contract/*.test.mjs test/hook/*.test.mjs test/data/*.test.mjs test/worker/*.test.mjs test/lifecycle/*.test.mjs test/sync/*.test.mjs test/client/*.test.mjs",
+    "test:unit": "node --test test/unit/*.test.mjs",
+    "test:contract": "node --test test/contract/*.test.mjs",
+    "test:hook": "node --test test/hook/*.test.mjs",
+    "test:data": "node --test test/data/*.test.mjs",
+    "test:worker": "node --test test/worker/*.test.mjs",
+    "test:lifecycle": "node --test test/lifecycle/*.test.mjs",
+    "test:sync": "node --test test/sync/*.test.mjs",
+    "test:client": "node --test test/client/*.test.mjs",
+    "test:all": "npm run test",
     "check": "node scripts/check.mjs",
     "i18n": "node scripts/i18n-check.mjs",
     "eval": "node scripts/eval.mjs"

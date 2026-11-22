@@ -248,13 +248,33 @@ export function expandOneHop(db, { seeds = [], identity = {}, minConf = 0.6, cap
   return out
 }
 
-/** 边/演化统计（面板 /edges 用）。 */
-export function relationStats(db) {
-  const one = (sql) => Number(db.prepare(sql).get()?.n || 0)
+/**
+ * 边/演化统计（面板 /edges 用）。
+ *
+ * 身份口径（审计 P0-2）：edges/evolution 没有隔离列，可见性只能经 nodes 判定；
+ * 统计与明细必须同口径——否则面板显示"本区 2 条边 / 共 40 条"，数字本身就是泄漏。
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {{ userId?: string, roleId?: string, workspace?: string } | null} [identity]
+ */
+export function relationStats(db, identity = null) {
+  const filter = []
+  const params = []
+  for (const [col, v] of [['user_id', identity?.userId], ['role_id', identity?.roleId], ['workspace', identity?.workspace]]) {
+    const value = typeof v === 'string' ? v : String(v ?? '')
+    if (!value) continue
+    filter.push(`(n.${col} = '' OR n.${col} = ?)`)
+    params.push(value)
+  }
+  const seen = filter.length ? `(from_id IN (SELECT id FROM nodes n WHERE ${filter.join(' AND ')}) AND to_id IN (SELECT id FROM nodes n WHERE ${filter.join(' AND ')}))` : ''
+  const seenArgs = filter.length ? [...params, ...params] : []
+  const edgeScope = seen ? ` WHERE ${seen}` : ''
+  const nodeScope = filter.length ? ` AND ${filter.join(' AND ')}` : ''
+  const one = (sql, args = []) => Number(db.prepare(sql).get(...args)?.n || 0)
   return {
-    edges: one('SELECT count(*) AS n FROM edges'),
-    by_type: db.prepare('SELECT etype, count(*) AS n FROM edges GROUP BY etype').all(),
-    evolution: one('SELECT count(*) AS n FROM evolution'),
-    noted_nodes: one("SELECT count(*) AS n FROM nodes WHERE context_note <> ''"),
+    edges: one(`SELECT count(*) AS n FROM edges${edgeScope}`, seenArgs),
+    by_type: db.prepare(`SELECT etype, count(*) AS n FROM edges${edgeScope} GROUP BY etype`).all(...seenArgs),
+    evolution: one(`SELECT count(*) AS n FROM evolution${edgeScope}`, seenArgs),
+    noted_nodes: one(`SELECT count(*) AS n FROM nodes n WHERE context_note <> ''${nodeScope}`, params),
   }
 }
