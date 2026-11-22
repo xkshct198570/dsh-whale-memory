@@ -186,3 +186,24 @@ test('召回注入开关（P1-1）：injectLevels 按层级过滤，showSources 
     assert.equal(Number(row.chars), 0)
   } finally { b.dispose() }
 })
+
+test('节点详情带 1 跳邻居边（同分区可见，跨分区不泄露）', async () => {
+  const b = fresh()
+  try {
+    const a = await b.write({ text: '邻居边测试 A 节点', identity: ident })
+    const c = await b.write({ text: '邻居边测试 B 节点', identity: ident })
+    // 同分区 + 跨分区各插一条边：getNode 只回两端都可见的那条。
+    b.withDb((db) => {
+      const now = Date.now() / 1000
+      const ins = db.prepare('INSERT INTO edges(from_id,to_id,etype,source,conf,weight,created_at) VALUES (?,?,?,?,?,?,?)')
+      ins.run(a.id, c.id, 'similar', 'manual', 0.9, 0.9, now)
+      ins.run(a.id, 'n-not-visible', 'similar', 'manual', 0.8, 0.8, now)
+    })
+    const got = await b.getNode(a.id, { identity: ident })
+    assert.equal(got.ok, true)
+    assert.equal(got.edges.length, 1, '只应看到同分区的那条边')
+    assert.equal(got.edges[0].neighbor, c.id)
+    const invisible = await b.getNode(a.id, { identity: { userId: 'u1', roleId: '', workspace: 'qq' } })
+    assert.equal(invisible.ok, false, '跨身份按 404 处理')
+  } finally { b.dispose() }
+})

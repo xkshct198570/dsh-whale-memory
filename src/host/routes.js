@@ -549,7 +549,10 @@ export function createRoutes({
         if (!idn.ok) return sendJson(res, 400, { ok: false, error: idn.error })
         // 不属本身份的节点按 404 处理：存在性本身不该跨身份可探测。
         const got = await backend.getNode(id, { identity: idn.identity })
-        return sendJson(res, got?.ok === false ? 404 : 200, got?.ok === false ? got : { ok: true, node: got.node })
+        if (got?.ok === false) return sendJson(res, 404, got)
+        // edges 可选：旧后端不返回时保持 null 语义，面板据此显示“未提供”。
+        const edges = Array.isArray(got.edges) ? got.edges : null
+        return sendJson(res, 200, { ok: true, node: got.node, edges })
       }
       if (req.method === 'PATCH') {
         if (typeof backend.updateNode !== 'function') return sendJson(res, 502, { ok: false, error: 'backend_unavailable' })

@@ -821,7 +821,26 @@ export class LocalBackend {
     const db = this._db()
     const where = whereOf(opts?.identity, [['id=?', [String(id || '')]]])
     const row = db.prepare(`SELECT ${NODE_EXPORT_FIELDS.join(',')} FROM nodes${where.sql}`).get(...where.params)
-    return row ? { ok: true, node: row } : { ok: false, error: 'node_not_found' }
+    if (!row) return { ok: false, error: 'node_not_found' }
+    // 面板详情抽屉要"1 跳邻居边"（§7.2）：只暴露身份可见的两端。
+    // 边没有身份列，按两端节点是否在可见集合里判断（与 /edges 同口径）。
+    let edges = []
+    try {
+      const filter = identityFilter(opts?.identity)
+      const cond = filter.sql
+        ? `AND e.from_id IN (SELECT id FROM nodes${filter.sql}) AND e.to_id IN (SELECT id FROM nodes${filter.sql})`
+        : ''
+      const rows = db.prepare(`SELECT e.id, e.from_id, e.to_id, e.etype, e.source, e.conf, e.weight, e.created_at
+        FROM edges e
+        WHERE (e.from_id = ? OR e.to_id = ?) ${cond}
+        ORDER BY e.conf DESC, e.id DESC LIMIT 20`)
+        .all(String(id || ''), String(id || ''), ...filter.params, ...filter.params)
+      edges = rows.map((edge) => ({
+        ...edge,
+        neighbor: edge.from_id === String(id) ? edge.to_id : edge.from_id,
+      }))
+    } catch { edges = [] }
+    return { ok: true, node: row, edges }
   }
 
   /**
