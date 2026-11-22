@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "Whale Memory",
-    "description": "Local long-term memory: stores important facts/rules in a local SQLite database, recalls and injects them by identity before each turn, and lets the panel inspect, edit and review writes. No external requests by default; only with backend=http/hybrid does it call the configured URL (/stats /recent /search /recall /write /version). Disable the plugin to stop recall/writes; the database stays in ~/.dsh/whale-memory.",
+    "description": "Local long-term memory: stores important facts/rules in a local SQLite database, recalls and injects them by identity before each turn, and lets the panel inspect, edit and review writes. No external requests by default; only with backend=http/hybrid does it call the configured URL (/stats /recent /search /recall /write /version). Disable the plugin to stop recall/writes; the database stays in ~/.dsh/whale-memory. Rules (iron laws) live as Markdown under ~/.dsh/rules with git versioning; proposals are written only after your confirmation, and the database is a search mirror.",
     "detail": "docs/DETAIL.md"
   },
   "tab.overview": "Overview",

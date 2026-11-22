@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.0 — 2026-11-22（规则化 · 文件卫生 · 未发布）
+
+规则真源从数据库迁到本地 git 规则仓（`~/.dsh/rules/`），DB 只做镜像；提案制（识别→编译→关系判定→守卫→用户确认→git commit→渲染/镜像）。
+- `src/core/rule-store.js`：YAML 子集 front matter、严格校验、原子写、history 快照（20/key）、manifest 编号（空号 6 不复用）、git commit/log/show/revert、同 key 跨进程锁。
+- `rule-reconcile.js`：结构化编译（模态/动作/对象/条件/例外，主句完整性/例外吞没拒绝）、确定性关系判定（new/duplicate/refine/merge/conflict）、LLM 只改措辞的守卫校验。
+- `rule-proposal.js`：候选、30 天冷却、拒绝、单一 apply 事务（文件+git commit+镜像+AGENTS+审计+失败回滚）、会话确认。
+- `rule-render.js`：AGENTS 摘要管理块（一行一条，全文≤200 字+文件指针），无标记绝不追加；台账渲染函数保留未接线（避免双源）。
+- `rule-mirror.js`：文件→nodes 镜像（origin=`rule:<key>`），孤儿归档；`git-detector.js`：git 三态检测+安装指引+requireGit 闸门。
+- hook：作用域规则注入（workspace/role，global 靠 AGENTS 摘要）、提案提示、确认自动收录、启动自愈镜像/摘要。
+- 路由：rules 列表/详情/git-status/rebuild/import-legacy/propose/apply/reject/render-agents/update/diff/versions/revert。
+- UI：新增「规则」页签（规则库/待确认/历史）、提案收录/改写/拒绝、编辑/diff/回滚、Git 状态条与安装指引、设置「规则」组 11 字段；三语 729 键。
+- 文件卫生：配套 `~/ops/file-hygiene.mjs`（scan/trash/purge/extract-check/backup-check）与灾备排除项；铁律 17 入台账。
+- 测试 598（597 pass/1 skip）；空机 DSH profile 安装 + 全链路 E2E 11/11（`~/ops/dsh-blank-install-test.mjs`）。
+
 ## 0.5.1 — 2026-11-22（采纳信号 · 后端与集成 · 未发布）
 
 审计 backlog P1「回复引用信号（used 恒 0）」落地：注入 ≠ 采纳，之前 adoptionRate 恒 0、未采纳 Top10 等同全部已注入查询。
