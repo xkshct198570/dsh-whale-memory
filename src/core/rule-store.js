@@ -5,12 +5,16 @@
  * - 规则目录（默认 `$DSH_HOME/rules`，可参数覆盖）的初始化、规则文件读写、manifest 生成；
  * - 严格 YAML 子集 front matter 的解析/序列化与 schema 校验（不引依赖、不猜格式）；
  * - 原子写 + 写入前历史快照（每 key 保留 20 份）+ 回滚；
+ * - R5：`updateRule`（白名单字段编辑，version+1）、`revertRule`（旧版本正文/front 写回成新版本）、
+ *   `resolveRevision`（history 时间戳/ISO/git 短 sha → 某个版本）+ `diffLines`（纯函数行 diff）；
  * - git 只做本地 add/commit/log/show/revert，**绝不联网**（不 fetch/push/pull）。
  *
  * 边界：
  * - 本模块不认识 DB、不认识 HTTP、不调模型；镜像在 rule-mirror.js，路由在 rules-routes.js。
  * - 只允许 node 内置模块。校验口径复用 rules.js 的 detectSignals（隐私/模糊/祈使判定），
  *   避免"规则引擎一套口径、仓储又一套"。
+ * - `updateRule`/`revertRule` 只负责"文件 + git + 历史"；镜像/AGENTS 渲染/审计由路由层编排，
+ *   因为那三件事依赖 backend/config，仓储层不该反向 import host。
  *
  * Why 文件优先：规则需要人可读、可 diff、可回滚；数据库列改一次就要迁移，规则正文却要
  * 被 owner 反复手改。文件 + git 才是可审计的真源，manifest/history 都是生成物。
@@ -32,13 +36,27 @@ export const RULE_FIELDS = Object.freeze([
 
 export const RULE_TYPES = Object.freeze(['iron-rule', 'rule', 'rule-candidate'])
 export const RULE_MODALITIES = Object.freeze(['must', 'must_not', 'only', 'except'])
-export const RULE_PRIORITIES = Object.freeze(['P0', 'P1', 'P2'])
+export const RULE_PRIORITIES = Object.freeze(['P0', 'P1', 'P2', 'P3'])
 export const RULE_STATUSES = Object.freeze(['active', 'retired', 'superseded', 'proposal'])
 /** 空号永不复用：6 是历史保留号，任何类型都不得占用。 */
 export const RESERVED_NUMBERS = Object.freeze([6])
 
 export const RULE_BODY_MAX = 500
 export const HISTORY_KEEP = 20
+/**
+ * 可编辑字段白名单：owner 只能改正文/条件/例外/作用域/角色/优先级/状态。
+ * key/type/number/created 是身份与历史引用锚点，改了会让历史快照/镜像/引用全部指向错的东西，
+ * 因此不在白名单里，且必须在**写入前**返回 `immutable_field`，不能靠 validate 兜。
+ */
+export const RULE_PATCH_FIELDS = Object.freeze(['text', 'conditions', 'exceptions', 'scope', 'role', 'priority', 'status'])
+export const IMMUTABLE_RULE_FIELDS = Object.freeze(['key', 'type', 'number', 'created'])
+/** status 变更只允许 active↔retired；superseded 只由合并链路写，proposal 只由提案链路写。 */
+export const RULE_STATUS_TRANSITIONS = Object.freeze({
+  active: Object.freeze(['retired']),
+  retired: Object.freeze(['active']),
+})
+/** 单次 diff 的行数硬顶（5000 行 ≈ 面板可读上限，超出直接报错而不是卡死浏览器）。 */
+export const DIFF_LINE_LIMIT = 5000
 export const MANIFEST_FILE = 'manifest.json'
 export const RULE_DIRS = Object.freeze(['proposals', 'history'])
 /** 跨进程同 key 串行锁目录（生成物，不进 git）。 */
@@ -482,8 +500,9 @@ export function writeHistorySnapshot(root, key, content, opts = {}) {
 
 /**
  * 历史列表（新→旧）。source 取快照 front.origin；解析失败也给空 front，不丢文件记录。
+ * `version` 供 `/rules/versions` 面板直读（解析失败给 null，不猜）。
  * @param {string} root @param {string} key
- * @returns {{ok:boolean,entries?:Array<{rev:string,ts:string,source:string,text:string}>,error?:string}}
+ * @returns {{ok:boolean,entries?:Array<{rev:string,ts:string,version:number|null,source:string,text:string}>,error?:string}}
  */
 export function readHistory(root, key) {
   if (!isValidRuleKey(key)) return { ok: false, error: 'invalid_key' }
@@ -501,6 +520,7 @@ export function readHistory(root, key) {
     entries.push({
       rev,
       ts: isoOfRev(rev),
+      version: parsed.ok && Number.isInteger(parsed.rule.front.version) ? parsed.rule.front.version : null,
       source: parsed.ok ? String(parsed.rule.front.origin || 'file') : 'file',
       text: parsed.ok ? parsed.rule.text : '',
     })
@@ -748,6 +768,400 @@ export function rollbackTo(root, key, rev, opts = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// 编辑 / 版本 diff / 按版本回写（R5）
+// ---------------------------------------------------------------------------
+
+/** `now`（毫秒/Date）→ `YYYY-MM-DD`；非法输入退回今天，不因时间戳造假日期。 */
+function dateOf(now) {
+  const d = now instanceof Date ? now : new Date(Number.isFinite(now) ? Number(now) : Date.now())
+  return (Number.isNaN(d.getTime()) ? new Date() : d).toISOString().slice(0, 10)
+}
+
+/**
+ * revision 归一成 history 快照文件名（17 位戳，含同毫秒 `-N` 后缀）。
+ * 支持三种写法：`20261122191022000`、`20261122191022000.md`、ISO `2026-11-22T19:10:22.000`。
+ * 不匹配返回空串（由调用方继续尝试 git sha）。
+ * @param {string} rev @returns {string}
+ */
+function historyRevOf(rev) {
+  const s = String(rev ?? '').trim().replace(/\.md$/i, '')
+  if (/^\d{17}(?:-\d+)?$/.test(s)) return s
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?/)
+  if (!m) return ''
+  return `${m[1]}${m[2]}${m[3]}${m[4]}${m[5]}${m[6]}${(m[7] || '').padEnd(3, '0')}`
+}
+
+/** 正文按行切（空串是 0 行；末尾换行不制造幽灵空行）。 */
+function splitDiffLines(text) {
+  const s = String(text ?? '')
+  return s === '' ? [] : s.split('\n')
+}
+
+/**
+ * 纯函数行 diff（不引库）：`[{type:'same'|'add'|'del',text}]`，顺序即面板渲染顺序。
+ *
+ * 算法：先剥公共前缀/后缀（手改规则文件时 90% 只有一小段变化，剥完中间通常只剩几行），
+ * 中间段用 LCS 动态规划回溯；中间段超过约 2000×2000 时退化为"整段删+整段加"，
+ * 这条降级只影响展示粒度，不会给出错误结论（也不会 OOM 把面板拖死）。
+ *
+ * @param {string} oldText @param {string} newText
+ * @returns {Array<{type:'same'|'add'|'del',text:string}>}
+ */
+export function diffLines(oldText, newText) {
+  const a = splitDiffLines(oldText)
+  const b = splitDiffLines(newText)
+  const out = []
+  let start = 0
+  while (start < a.length && start < b.length && a[start] === b[start]) {
+    out.push({ type: 'same', text: a[start] })
+    start += 1
+  }
+  let endA = a.length
+  let endB = b.length
+  while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) { endA -= 1; endB -= 1 }
+  const midA = a.slice(start, endA)
+  const midB = b.slice(start, endB)
+
+  if (midA.length === 0) {
+    for (const line of midB) out.push({ type: 'add', text: line })
+  } else if (midB.length === 0) {
+    for (const line of midA) out.push({ type: 'del', text: line })
+  } else if ((midA.length + 1) * (midB.length + 1) > 4_000_000) {
+    for (const line of midA) out.push({ type: 'del', text: line })
+    for (const line of midB) out.push({ type: 'add', text: line })
+  } else {
+    const width = midB.length + 1
+    const dp = new Uint32Array((midA.length + 1) * width)
+    for (let i = midA.length - 1; i >= 0; i -= 1) {
+      for (let j = midB.length - 1; j >= 0; j -= 1) {
+        dp[i * width + j] = midA[i] === midB[j]
+          ? dp[(i + 1) * width + (j + 1)] + 1
+          : Math.max(dp[(i + 1) * width + j], dp[i * width + (j + 1)])
+      }
+    }
+    let i = 0
+    let j = 0
+    while (i < midA.length && j < midB.length) {
+      if (midA[i] === midB[j]) {
+        out.push({ type: 'same', text: midA[i] })
+        i += 1
+        j += 1
+      } else if (dp[(i + 1) * width + j] >= dp[i * width + (j + 1)]) {
+        out.push({ type: 'del', text: midA[i] })
+        i += 1
+      } else {
+        out.push({ type: 'add', text: midB[j] })
+        j += 1
+      }
+    }
+    while (i < midA.length) { out.push({ type: 'del', text: midA[i] }); i += 1 }
+    while (j < midB.length) { out.push({ type: 'add', text: midB[j] }); j += 1 }
+  }
+
+  for (let k = endA; k < a.length; k += 1) out.push({ type: 'same', text: a[k] })
+  return out
+}
+
+/**
+ * 把 `rev` 解析成某个版本的规则文档（只读，不写盘）。
+ *
+ * rev 的解析顺序**先 history 再 git**：17 位数字/ISO 是快照命名，纯 4–40 位十六进制才是 git
+ * 短 sha（两者偶尔重叠的极端情况优先本地快照，因为它更贴"面板选中的那一版"）。
+ *
+ * @param {{root?:string,key:string,rev:string}} args
+ * @param {{exec?:Function}} [opts]
+ * @returns {{ok:boolean,rev?:string,source?:'history'|'git',rule?:object,raw?:string,
+ *   error?:string,detail?:any}}
+ */
+export function resolveRevision({ root = '', key, rev } = {}, opts = {}) {
+  const base = baseDir(root)
+  if (!isValidRuleKey(key)) return { ok: false, error: 'invalid_key' }
+  const raw = String(rev ?? '').trim().replace(/\.md$/i, '')
+  if (!raw) return { ok: false, error: 'invalid_rev', detail: { rev: '' } }
+
+  const historyRev = historyRevOf(raw)
+  if (historyRev) {
+    const snap = readSnapshot(base, key, historyRev)
+    if (!snap.ok) {
+      return {
+        ok: false,
+        error: snap.error === 'snapshot_not_found' ? 'rev_not_found' : snap.error,
+        detail: { rev: raw, kind: 'history' },
+      }
+    }
+    return { ok: true, rev: historyRev, source: 'history', rule: snap.rule }
+  }
+
+  if (/^[0-9a-f]{4,40}$/i.test(raw)) {
+    const sha = raw.toLowerCase()
+    // 正式规则与候选落在不同目录，同一 sha 下要两个路径都试；都不在才算 rev_not_found。
+    for (const rel of [`${key}.md`, `proposals/${key}.md`]) {
+      const shown = gitShow(base, `${sha}:${rel}`, { exec: opts.exec })
+      if (!shown.ok) continue
+      const parsed = parseRuleDocument(shown.text)
+      if (!parsed.ok) continue
+      const normalized = normalizeRuleDoc(parsed.front, parsed.text)
+      return {
+        ok: true,
+        rev: sha,
+        source: 'git',
+        file: rel,
+        raw: shown.text,
+        rule: { ...normalized, bodyStart: parsed.bodyStart, file: join(base, rel) },
+      }
+    }
+    const repo = isGitRepo(base, { exec: opts.exec })
+    // git 没装才报 git_unavailable；装了但当前目录不是仓库 → 这个 sha 不可能存在。
+    if (!repo.ok && repo.error && repo.error !== 'not_a_git_repo') {
+      return { ok: false, error: repo.error, detail: { rev: raw, kind: 'git' } }
+    }
+    return { ok: false, error: 'rev_not_found', detail: { rev: raw, kind: 'git' } }
+  }
+
+  return { ok: false, error: 'invalid_rev', detail: { rev: raw } }
+}
+
+/**
+ * 白名单补丁 → 新 front + 新正文（纯函数；不改入参、不写盘）。
+ * 条件/例外**不做过滤**（空项/非字符串原样交给 validateRule 报错），否则"空项"会被悄悄吃掉。
+ * @param {object} front 当前已归一化 front
+ * @param {object} patch 已确认字段合法的补丁
+ * @param {number} version @param {string} updated @param {string} text
+ * @returns {{front:object,text:string}}
+ */
+function applyPatch(front, patch, version, updated, text) {
+  const next = { ...front }
+  if (Object.prototype.hasOwnProperty.call(patch, 'priority')) next.priority = String(patch.priority ?? '').trim().toUpperCase()
+  if (Object.prototype.hasOwnProperty.call(patch, 'scope')) next.scope = String(patch.scope ?? '').trim()
+  if (Object.prototype.hasOwnProperty.call(patch, 'role')) next.role = String(patch.role ?? '').trim()
+  if (Object.prototype.hasOwnProperty.call(patch, 'status')) next.status = String(patch.status ?? '').trim()
+  if (Object.prototype.hasOwnProperty.call(patch, 'conditions')) {
+    next.conditions = Array.isArray(patch.conditions)
+      ? patch.conditions.map((item) => (typeof item === 'string' ? item.trim() : item))
+      : patch.conditions
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, 'exceptions')) {
+    next.exceptions = Array.isArray(patch.exceptions)
+      ? patch.exceptions.map((item) => (typeof item === 'string' ? item.trim() : item))
+      : patch.exceptions
+  }
+  next.version = version
+  next.updated = updated
+  return { front: next, text }
+}
+
+/** 编辑是否真的改了东西（version/updated 是流程字段，不算"用户改了内容"）。 */
+function patchChanged(front, text, nextFront, nextText) {
+  if (String(text) !== String(nextText)) return true
+  for (const field of ['priority', 'scope', 'role', 'status']) {
+    if (String(front[field] ?? '') !== String(nextFront[field] ?? '')) return true
+  }
+  for (const field of ['conditions', 'exceptions']) {
+    if (JSON.stringify(front[field] || []) !== JSON.stringify(nextFront[field] || [])) return true
+  }
+  return false
+}
+
+/**
+ * 编辑一条规则（R5）：白名单字段 → 同一 validateRule → version+1 → 历史快照 → 原子写 → git。
+ *
+ * 失败语义：写入前失败什么都不动；`writeRule` 中途失败（manifest/git 等后段）时用**写入前快照**
+ * 把旧文件恢复回去，并返回 `rolledBack:true` —— 面板看到"没改成功"时文件也必须真的是旧版。
+ *
+ * 并发：本函数是同步的，同进程多次调用天然串行；跨进程由 writeRule 内部的同 key 锁保证
+ * 落盘/快照不交错。version 来自调用开始时的磁盘真源，所以串行编辑得到 2,3,4… 不会覆盖。
+ *
+ * @param {{root?:string,key:string,patch:object,identity?:object,traceId?:string,now?:number}} args
+ *   identity/traceId 只为与路由/审计同签名，本模块不写 DB。
+ * @param {{fs?:typeof nodeFs,git?:boolean,exec?:Function}} [opts]
+ * @returns {{ok:boolean,rule?:object,path?:string,history?:string,changed?:boolean,
+ *   commit?:object|null,version?:number,previousVersion?:number,error?:string,detail?:any,
+ *   rolledBack?:boolean}}
+ */
+export function updateRule({ root = '', key, patch, now = Date.now() } = {}, opts = {}) {
+  const fs = opts.fs || nodeFs
+  const base = baseDir(root)
+  const got = readRule(base, key)
+  if (!got.ok) return got
+  const doc = got.rule
+
+  if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
+    return { ok: false, error: 'invalid_patch', detail: { reason: 'patch_must_be_object' } }
+  }
+  for (const field of Object.keys(patch)) {
+    if (IMMUTABLE_RULE_FIELDS.includes(field)) {
+      return { ok: false, error: 'immutable_field', detail: { field } }
+    }
+    if (!RULE_PATCH_FIELDS.includes(field)) {
+      return { ok: false, error: 'invalid_patch', detail: { field, reason: 'field_not_patchable' } }
+    }
+  }
+
+  const current = doc.front
+  const currentStatus = String(current.status ?? '')
+  if (Object.prototype.hasOwnProperty.call(patch, 'status')) {
+    const target = String(patch.status ?? '').trim()
+    if (target !== currentStatus && !(RULE_STATUS_TRANSITIONS[currentStatus] || []).includes(target)) {
+      return {
+        ok: false,
+        error: 'invalid_patch',
+        detail: {
+          field: 'status',
+          reason: 'invalid_status_transition',
+          from: currentStatus,
+          to: target,
+          allowed: RULE_STATUS_TRANSITIONS[currentStatus] || [],
+        },
+      }
+    }
+  }
+
+  const text = Object.prototype.hasOwnProperty.call(patch, 'text') ? String(patch.text ?? '') : doc.text
+  const version = Number(current.version) + 1
+  const nextDoc = applyPatch(current, patch, version, dateOf(now), text)
+
+  // 编号唯一性：把自己剔出去，否则"改内容"会被自己那条规则判成撞号。
+  const numbers = new Map()
+  for (const other of listRules(base).rules) {
+    if (String(other.front.key) === String(key)) continue
+    numbers.set(other.front.number, other.front.key)
+  }
+  const check = validateRule(nextDoc.front, nextDoc.text, { numbers })
+  if (!check.ok) return { ok: false, error: 'invalid_rule', detail: check.errors }
+
+  if (!patchChanged(current, doc.text, nextDoc.front, nextDoc.text)) {
+    return {
+      ok: true,
+      changed: false,
+      rule: doc,
+      path: doc.file,
+      history: '',
+      commit: null,
+      version: Number(current.version),
+      previousVersion: Number(current.version),
+    }
+  }
+
+  let oldSource
+  try { oldSource = fs.readFileSync(doc.file, 'utf8') } catch (err) {
+    return { ok: false, error: 'snapshot_read_failed', detail: String(err?.message || err) }
+  }
+
+  // git:false 由本函数自己控制 commit 文案；若让 writeRule 提交，消息会是 `rules: <key> v<n>`，
+  // 面板/审计需要的是 `rule: update ...`，所以这里统一由 updateRule 提交一次。
+  const saved = writeRule(base, nextDoc, { fs, git: false })
+  if (!saved.ok) {
+    const restored = atomicWriteFile(doc.file, oldSource)
+    return { ok: false, error: saved.error, detail: saved.detail, rolledBack: restored.ok }
+  }
+
+  const commit = commitRuleChange(base, `rule: update ${key} v${version}`, opts)
+  return {
+    ok: true,
+    changed: true,
+    rule: saved.rule,
+    path: saved.path,
+    history: saved.history || '',
+    commit,
+    version,
+    previousVersion: Number(current.version),
+  }
+}
+
+/**
+ * 把指定版本（history 快照或 git 版本）的正文/front **作为新版本**写回。
+ *
+ * 不物理回退历史：旧版本仍在 history/ 里，新版本 version+1 并产生新快照，因此"回滚"本身
+ * 也可再被回滚——这是审计链能自证的前提。
+ *
+ * @param {{root?:string,key:string,rev:string,identity?:object,traceId?:string,now?:number}} args
+ * @param {{fs?:typeof nodeFs,git?:boolean,exec?:Function}} [opts]
+ * @returns {{ok:boolean,rule?:object,path?:string,history?:string,commit?:object|null,
+ *   version?:number,previousVersion?:number,revertedTo?:string,source?:string,
+ *   changed?:boolean,error?:string,detail?:any,rolledBack?:boolean}}
+ */
+export function revertRule({ root = '', key, rev, now = Date.now() } = {}, opts = {}) {
+  const fs = opts.fs || nodeFs
+  const base = baseDir(root)
+  const got = readRule(base, key)
+  if (!got.ok) return got
+  const doc = got.rule
+  const resolved = resolveRevision({ root: base, key, rev }, opts)
+  if (!resolved.ok) {
+    return {
+      ok: false,
+      error: resolved.error === 'snapshot_not_found' ? 'rev_not_found' : resolved.error,
+      detail: resolved.detail,
+    }
+  }
+
+  const snap = resolved.rule
+  const version = Number(doc.front.version) + 1
+  // 身份字段永远取**当前文件**：快照里的 key/number/created 可能来自 rename 前的旧世界，
+  // 真按快照覆盖会把规则改成另一条。内容字段（含 status/priority/scope）按快照还原文。
+  const nextFront = {
+    ...snap.front,
+    key: doc.front.key,
+    type: doc.front.type,
+    number: doc.front.number,
+    created: doc.front.created,
+    origin: doc.front.origin,
+    version,
+    updated: dateOf(now),
+  }
+  const nextDoc = { front: nextFront, text: snap.text }
+
+  const numbers = new Map()
+  for (const other of listRules(base).rules) {
+    if (String(other.front.key) === String(key)) continue
+    numbers.set(other.front.number, other.front.key)
+  }
+  const check = validateRule(nextFront, snap.text, { numbers })
+  if (!check.ok) return { ok: false, error: 'invalid_rule', detail: check.errors }
+
+  let oldSource
+  try { oldSource = fs.readFileSync(doc.file, 'utf8') } catch (err) {
+    return { ok: false, error: 'snapshot_read_failed', detail: String(err?.message || err) }
+  }
+  const saved = writeRule(base, nextDoc, { fs, git: false })
+  if (!saved.ok) {
+    const restored = atomicWriteFile(doc.file, oldSource)
+    return { ok: false, error: saved.error, detail: saved.detail, rolledBack: restored.ok }
+  }
+
+  const commit = commitRuleChange(base, `rule: revert ${key} to ${resolved.rev}`, opts)
+  return {
+    ok: true,
+    changed: true,
+    rule: saved.rule,
+    path: saved.path,
+    history: saved.history || '',
+    commit,
+    version,
+    previousVersion: Number(doc.front.version),
+    revertedTo: resolved.rev,
+    source: resolved.source,
+  }
+}
+
+/**
+ * 本地 git 提交（不联网；git 不可用/目录不是仓库时**降级**为只写文件）。
+ * @param {string} dir @param {string} message
+ * @param {{git?:boolean,exec?:Function}} opts
+ * @returns {object|null} 未尝试提交时 null
+ */
+function commitRuleChange(dir, message, opts = {}) {
+  if (opts.git === false) return null
+  const repo = isGitRepo(dir, { exec: opts.exec })
+  if (!repo.ok) {
+    return { ok: false, committed: false, message, error: repo.error || 'not_a_git_repo' }
+  }
+  const done = gitCommit(dir, message, { exec: opts.exec })
+  if (!done.ok) return { ok: false, committed: false, message, error: done.error || 'git_failed' }
+  return { ok: true, committed: Boolean(done.committed), message }
+}
+
+// ---------------------------------------------------------------------------
 // manifest
 // ---------------------------------------------------------------------------
 
@@ -865,14 +1279,24 @@ export function gitCommit(dir, message, opts = {}) {
   return { ok: true, committed: false }
 }
 
-/** @returns {{ok:boolean,entries?:Array<{hash:string,subject:string}>,error?:string}} */
+/**
+ * 本地 git 日志。`opts.path` 只列该路径的提交（`/rules/versions` 用），
+ * `opts.withTime` 追加 unix 秒时间戳（面板按时间排序/展示，不靠猜提交顺序）。
+ * @param {string} dir @param {number} [limit]
+ * @param {{exec?:Function,path?:string,withTime?:boolean}} [opts]
+ * @returns {{ok:boolean,entries?:Array<{hash:string,subject:string,ts?:number}>,error?:string}}
+ */
 export function gitLog(dir, limit = 20, opts = {}) {
   const n = Math.max(1, Math.min(200, Number(limit) || 20))
-  const r = runGit(dir, ['log', `-n${n}`, '--pretty=format:%h%x09%s'], opts)
+  const format = opts.withTime ? '%h%x09%at%x09%s' : '%h%x09%s'
+  const args = ['log', `-n${n}`, `--pretty=format:${format}`]
+  if (opts.path) args.push('--', String(opts.path))
+  const r = runGit(dir, args, opts)
   if (!r.ok) return r
   const entries = r.out.split('\n').map((line) => line.trim()).filter(Boolean).map((line) => {
-    const [hash, ...rest] = line.split('\t')
-    return { hash, subject: rest.join('\t') }
+    const parts = line.split('\t')
+    if (opts.withTime) return { hash: parts[0], ts: Number(parts[1]) || 0, subject: parts.slice(2).join('\t') }
+    return { hash: parts[0], subject: parts.slice(1).join('\t') }
   })
   return { ok: true, entries }
 }

@@ -29,7 +29,7 @@ export const LEGACY_IRON_RULE_ID = 'n1795335656522_ba2f7fa325'
 export const RULE_ORIGIN_PREFIX = 'rule:'
 
 const LEVEL_OF = Object.freeze({ 'iron-rule': 'core', rule: 'important', 'rule-candidate': 'important' })
-const WEIGHT_OF = Object.freeze({ P0: 1.0, P1: 0.8, P2: 0.6 })
+const WEIGHT_OF = Object.freeze({ P0: 1.0, P1: 0.8, P2: 0.6, P3: 0.5 })
 
 const EXCEPTION_RE = /[；;，,]?\s*例外\s*[：:]\s*([^。；;\n]+)/
 const RULE_TEMPLATE_HEAD_RE = /【规则·[^】]*】/g

@@ -685,7 +685,8 @@ export function createRoutes({
     }
 
     // 规则只读/管理端点（R3a）：命中即返回 true，未命中继续走 404。
-    if (await handleRules({ req, res, path, config, backend, log })) return undefined
+    // getLlm 透传给规则 apply：面板手改合并/冲突时需要模型只改措辞（R3b）。
+    if (await handleRules({ req, res, path, config, backend, log, getLlm: () => (ctx?.get?.('llm') ?? null) })) return undefined
 
     log(`[whale-memory] 404 ${req.method} ${path}`)
     return sendJson(res, 404, { ok: false, error: 'not_found' })

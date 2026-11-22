@@ -233,7 +233,8 @@ function isCooling(dir, hash, days, now) {
 /** 候选摘要（面板/聊天提示共用；不塞正文，避免把候选读成规则本体）。 */
 function summaryOf(draft, relation) {
   const label = trimmed(draft?.type) === 'iron-rule' ? `铁律${draft.number}` : trimmed(draft?.key)
-  const title = titleOfRule({ action: draft?.action, number: draft?.number }, draft?.text)
+  // 优先用结构化编译出的短标题（“删源文件”），退化才用渲染层启发式。
+  const title = textOf(draft?.title) || titleOfRule({ action: draft?.action, number: draft?.number }, draft?.text)
   return { label, title, relation }
 }
 

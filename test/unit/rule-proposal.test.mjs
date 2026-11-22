@@ -243,7 +243,7 @@ test('applyProposal：new 直接落盘（编号/文件/accepted/镜像/渲染/�
   assert.equal(result.applied.mirror.ok, true)
   assert.equal(result.applied.agents.ok, true)
   assert.equal(result.proposal.status, 'accepted')
-  assert.match(readRuleText(root, result.applied.key), /以后都别删源文件/)
+  assert.match(readRuleText(root, result.applied.key), /禁止删源文件/)
   assert.equal(mirrors.length, 1)
   assert.equal(renders.length, 1)
   // 审计：writes 一行 reason=rule_apply + evolution 一行（正文从无到有）。
