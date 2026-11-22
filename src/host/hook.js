@@ -536,7 +536,7 @@ export function installHook(ctx, {
           }
         } catch (err) {
           // 召回失败只丢召回：规则前缀与提示照常注入（fail-open 不等于整段失效）。
-          log(`[whale-memory] recall fail-open: ${err?.name || err?.message || err}`)
+          log(`[whale-memory] recall fail-open: ${err?.name || 'Error'} · ${err?.stack ? String(err.stack).split('\n').slice(0, 3).join(' | ') : (err?.message || err)}`)
         } finally {
           clearTimeout(timer)
           inflight.delete(ac)
@@ -550,7 +550,7 @@ export function installHook(ctx, {
       // 5) 提案检测：召回之后、后台跑；仅有可裁定的人（owner 在聊天里）才问。
       if (rulesOn && query) offerProposal({ sid, query, identityInfo: ident.identity, traceId })
     } catch (err) {
-      log(`[whale-memory] recall fail-open: ${err?.name || err?.message || err}`)
+      log(`[whale-memory] recall fail-open: ${err?.name || 'Error'} · ${err?.stack ? String(err.stack).split('\n').slice(0, 3).join(' | ') : (err?.message || err)}`)
     }
     return decision
   }
