@@ -204,7 +204,7 @@ export function apply(ctx, config) {
 
   installSearchFeed(ctx, { backend: backendProxy, config, log })
 
-  const handler = createRoutes({ config, backend: backendProxy, getIdentityCfg, getIdentityHint, getHostUserId, migration, ctx, reflect, log })
+  const handler = createRoutes({ config, backend: backendProxy, getIdentityCfg, getIdentityHint, getHostUserId, identityState, migration, ctx, reflect, log })
 
   ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: PREFIX, handler }), 'whale-memory: routes')
 
@@ -213,7 +213,7 @@ export function apply(ctx, config) {
   ctx.effect(() => () => { reflect.dispose(); backend.dispose?.() }, 'whale-memory: backend')
 
   ctx.effect(() => {
-    hook = installHook(ctx, { backend: backendProxy, config, getIdentityCfg, getIdentityHint, getHostUserId, log })
+    hook = installHook(ctx, { backend: backendProxy, config, getIdentityCfg, getIdentityHint, getHostUserId, identityState, log })
     return () => hook?.dispose()
   }, 'whale-memory: recall hook')
 

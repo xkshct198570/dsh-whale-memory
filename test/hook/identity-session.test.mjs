@@ -81,10 +81,12 @@ test('hook：pre-step 用会话 cwd 派生 workspace 传给召回；cfg.workspac
   const seen = []
   const config = { identity: { mode: 'auto', workspace: '' }, recall: { enabled: true, timeoutMs: 1000 } }
   const { ctx, state } = fakeCtx()
+  const identityState = {}
   installHook(ctx, {
     backend: { async recall(args) { seen.push(args.identity); return { prefix: 'P', hits: 1 } } },
     config,
     getHostUserId: () => 'host-1',
+    identityState,
   })
 
   await state.pre({ agent: { session: { id: 's1', header: { cwd: '/home/hy/hy' } } }, messages: userMsg }, async () => ({ kind: 'enter' }))
@@ -94,6 +96,10 @@ test('hook：pre-step 用会话 cwd 派生 workspace 传给召回；cfg.workspac
   assert.equal(seen[0].workspace, '/home/hy/hy')
   assert.equal(seen[1].workspace, '/home/hy/网页端聊天')
   assert.notEqual(seen[0].workspace, seen[1].workspace)
+  // 面板读不到会话 header：hook 把最近一次真正用的身份写进共享 state。
+  assert.equal(identityState.lastRecall.workspace, '/home/hy/网页端聊天')
+  assert.equal(identityState.lastRecall.workspaceSource, 'session')
+  assert.equal(identityState.lastRecall.userId, 'host-1')
 
   // 现网配置 workspace='web'：会话维度不得改变已有召回分区。
   const fixedConfig = { identity: { mode: 'auto', workspace: 'web' }, recall: { enabled: true, timeoutMs: 1000 } }

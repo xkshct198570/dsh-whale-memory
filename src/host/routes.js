@@ -149,6 +149,7 @@ export function createRoutes({
   getIdentityCfg = () => config?.identity,
   getIdentityHint = () => null,
   getHostUserId = () => '',
+  identityState = null,
   migration = null,
   ctx, reflect, log = () => {},
 }) {
@@ -192,6 +193,10 @@ export function createRoutes({
       workspace: identity.workspace,
       source: ident.source,
       workspaceSource: ident.sources?.workspace || 'default',
+      // 路由没有会话 header，identity.workspace 只是 Config/hint 的值；真正生效的会话
+      // workspace 由 hook 在最近一次召回时写进 identityState，这里只读展示（面板据此显示）。
+      runtimeWorkspace: identityState?.lastRecall?.workspace || null,
+      runtimeWorkspaceSource: identityState?.lastRecall?.workspaceSource || null,
     })
 
     /** 请求显式带 workspace（string，含空串）时覆盖 Config；不带就沿用 handle 顶部身份。 */
@@ -672,6 +677,7 @@ export function createRoutes({
       return sendJson(res, 200, {
         ok: true,
         config: echoConfig(config),
+        runtimeIdentity: identityView(),
         // 文档 §4 S11 写 0=不限制，代码里 0=关闭注入；以代码为准，冲突待文档侧修正。
         notes: { recall_charBudget: '0 = 关闭注入（与文档 §4 S11 的 0=不限制 冲突，以代码为准）' },
       })

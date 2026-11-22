@@ -119,7 +119,8 @@ test('/stats：identity 带 source/workspaceSource 与 migration 只读字段，
   }
   const migration = { state: { migratedFrom: 'hub-0.2.0', migratedAt: '2026-01-02T03:04:05.000Z', pending: false } }
   const config = { identity: { mode: 'auto', workspace: 'web' }, panel: { allowRemote: false } }
-  const handler = createRoutes({ config, backend, getHostUserId: () => 'host-9', migration, log: () => {} })
+  const identityState = { lastRecall: { workspace: '/home/hy/hy', workspaceSource: 'session', userId: 'host-9', roleId: '', at: 1 } }
+  const handler = createRoutes({ config, backend, getHostUserId: () => 'host-9', identityState, migration, log: () => {} })
   const { base, close } = await serve(handler)
   try {
     const res = await fetch(`${base}/whale-memory/api/stats`)
@@ -128,9 +129,18 @@ test('/stats：identity 带 source/workspaceSource 与 migration 只读字段，
     assert.equal(body.ok, true)
     assert.deepEqual(body.identity, {
       mode: 'auto', userId: 'host-9', roleId: '', workspace: 'web', source: 'host', workspaceSource: 'config',
+      // 会话维度只在 hook 里生效；路由读不到 header，只能回显最近一次召回真正用的 workspace。
+      runtimeWorkspace: '/home/hy/hy', runtimeWorkspaceSource: 'session',
     })
     assert.deepEqual(body.migration, migration.state)
     assert.equal(JSON.stringify(body).includes('memory text'), false)
+
+    // /config 也回 runtimeIdentity：面板页头用它显示会话 workspace（而不是 Config 值）。
+    const cfgRes = await fetch(`${base}/whale-memory/api/config`)
+    const cfgBody = await cfgRes.json()
+    assert.equal(cfgRes.status, 200)
+    assert.equal(cfgBody.runtimeIdentity.runtimeWorkspace, '/home/hy/hy')
+    assert.equal(cfgBody.runtimeIdentity.runtimeWorkspaceSource, 'session')
 
     // 搜索请求显式带 workspace 时优先请求值；不带保持 Config。
     await fetch(`${base}/whale-memory/api/search`, {

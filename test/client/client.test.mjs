@@ -443,6 +443,9 @@ function backendStatusApi() {
 
 test('页头/概览读 GET /version 显示后端/协议/outbox，失败降级为「—」', () => {
   assert.ok(CLIENT.includes("callJson('/version')"), '页头未读取 GET /version')
+  // 身份徽标优先显示会话 workspace（runtimeIdentity），没有召回历史才回 Config。
+  assert.match(CLIENT, /runtimeIdentity/, '页头未读取 /config.runtimeIdentity')
+  assert.match(CLIENT, /runtime\.runtimeWorkspace/, '页头未优先使用会话 workspace')
   assert.ok(CLIENT.includes("t('header.backendStatus'"), '页头缺少后端状态文案')
   assert.match(CLIENT, /header\.backendStatusTip/, '缺少 /version 来源提示')
   assert.match(CLIENT, /fmtNum\(backendStatus\.outbox/, '页头未渲染 outbox 数量')
@@ -466,7 +469,7 @@ test('页头/概览读 GET /version 显示后端/协议/outbox，失败降级为
   assert.match(overview, /t\('health\.backend'\)/, '概览健康区未显示后端模式')
   assert.match(overview, /t\('health\.protocol'\)/, '概览健康区未显示协议状态')
   assert.match(overview, /t\('health\.outbox'\)/, '概览健康区未显示 outbox')
-  assert.match(CLIENT, /roleId: String\(\(cfg\.identity && cfg\.identity\.roleId\)/, '身份徽标未接 roleId')
+  assert.match(CLIENT, /roleId: String\(\(runtime\.roleId !== undefined/, '身份徽标未接 roleId（优先 runtime，回退 Config）')
   for (const key of ['header.backendStatus', 'header.protocolOk', 'header.protocolMismatch', 'overview.migrationPending']) {
     for (const lang of LANGS) assert.equal(typeof dicts[lang][key], 'string', `${lang} 缺少 ${key}`)
   }

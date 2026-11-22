@@ -60,6 +60,7 @@ export function installHook(ctx, {
   getIdentityCfg = () => config?.identity,
   getIdentityHint = () => null,
   getHostUserId = () => '',
+  identityState = null,
   log = () => {},
 }) {
   const cache = new Map()
@@ -126,11 +127,22 @@ export function installHook(ctx, {
 
       cache.delete(String(sessionId))
       // 身份 auto：宿主 userId（5min 缓存，getter 同步返回）+ 会话 cwd 派生的 workspace。
-      // workspace 只在 Config 为空时生效（现网 'web' 非空 ⇒ 召回结果不变）。
+      // workspace 只在 Config.identity.workspace 为空时由会话接管（否则尊重用户显式配置）。
       const hostUserId = typeof getHostUserId === 'function' ? String(getHostUserId() || '') : ''
       const sessionWorkspace = deriveWorkspace(agent?.session?.header)
       const ident = resolveIdentity(getIdentityCfg(), getIdentityHint(), hostUserId, sessionWorkspace)
       if (!ident.ok) return decision
+      // 面板/routes 没有会话 header，读不到会话 workspace；这里把"最近一次召回真正用的身份"
+      // 记到共享 state，/stats 与 /config 只读展示，避免面板把 Config 值当成生效值。
+      if (identityState && typeof identityState === 'object') {
+        identityState.lastRecall = {
+          workspace: ident.identity.workspace,
+          roleId: ident.identity.roleId,
+          userId: ident.identity.userId,
+          workspaceSource: ident.sources?.workspace || '',
+          at: Date.now() / 1000,
+        }
+      }
 
       // 上一步的回复已完整落进 assistant-stream：进入新步前先结算，别让证据过期被下一轮覆盖。
       settle(sessionId)
