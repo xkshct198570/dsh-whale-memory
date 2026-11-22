@@ -486,24 +486,27 @@ export class LocalBackend {
      * 但被预算裁掉/丢弃"也留下来，日报才能列出"命中但未注入"的低分候选。
      * 注入与否由 injected/chars 表达，两者不混在同一个字段里。
      * @param {{ hitIds?: string[], chars?: number, injected?: number }} row
+     * @returns {number} 新行 id（失败 0）：hook 拿它回写 used 采纳信号
      */
     const audit = ({ hitIds = [], chars = 0, injected = 0 }) => {
       try {
         const db = this._db()
-        db.prepare(`INSERT INTO recalls
+        const info = db.prepare(`INSERT INTO recalls
           (ts,trace_id,query,hit_ids,chars,injected,used,elapsed_ms,user_id,role_id,workspace,source)
           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(
           now(), String(q?.traceId || ''), String(q?.query || '').slice(0, 500),
           JSON.stringify(hitIds), chars, injected,
-          // used 先留 0：回复引用信号未接入（backlog），adoptionRate 在接入前必然显示
-          // "未采纳"，这比编一个假信号或干脆不落库都可解释。
+          // used 落库时恒 0：注入不等于采纳，证据只能等回复侧（hook 的 assistant-stream）
+          // 拿到引用文本后再回写；这里先写 0 是「尚未判定」，不是「判定为未采纳」。
           0,
           Date.now() - started,
           String(q?.identity?.userId || ''), String(q?.identity?.roleId || ''), String(q?.identity?.workspace || ''),
           source,
         )
+        return Number(info.lastInsertRowid) || 0
       } catch (err) {
         this.log(`[whale-memory] recall audit fail-open: ${err?.message || err}`)
+        return 0
       }
     }
 
@@ -521,7 +524,7 @@ export class LocalBackend {
     const prefix = hits.length
       ? '【你想到的旧事】\n' + hits.map((h) => `- ${String(h.text || '').trim()}`).join('\n')
       : ''
-    audit({
+    const recallId = audit({
       hitIds: searched.map((h) => h.id),
       chars: prefix.length,
       injected: prefix ? 1 : 0,
@@ -529,6 +532,32 @@ export class LocalBackend {
     return {
       ok: true, prefix, chars: prefix.length, hits: hits.length,
       intent: budget.intent, dropped: trimmed.dropped, clipped: trimmed.clipped,
+      // 采纳信号的判定素材：只给**最终注入**的节点（被预算裁掉的节点不该产生采纳）。
+      recallId,
+      injectedNodes: hits.map((h) => ({ id: String(h?.id ?? ''), text: String(h?.text ?? '') })),
+    }
+  }
+
+  /**
+   * 采纳信号回写：一次召回被回复引用后置 used=1。
+   *
+   * why 只改 used 列：hit_ids/chars/injected 描述的是「注入事实」，回复侧只能证明
+   * 「是否被引用」，两者混在一个字段里会让日报的注入率与采纳率互相污染。
+   * 失败 fail-open：观测信号不能反向影响正常回复链路。
+   *
+   * @param {number} recallId `recall()` 返回的审计行 id
+   * @param {boolean} [used]
+   * @returns {{ ok: boolean, updated: number }}
+   */
+  markRecallUsed(recallId, used = true) {
+    const id = Number(recallId)
+    if (!Number.isInteger(id) || id <= 0) return { ok: false, updated: 0 }
+    try {
+      const info = this._db().prepare('UPDATE recalls SET used=? WHERE id=?').run(used ? 1 : 0, id)
+      return { ok: true, updated: Number(info.changes) || 0 }
+    } catch (err) {
+      this.log(`[whale-memory] markRecallUsed fail-open: ${err?.message || err}`)
+      return { ok: false, updated: 0 }
     }
   }
 

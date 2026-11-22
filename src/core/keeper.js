@@ -702,7 +702,7 @@ function installDefaultHandlers(keeper, deps) {
       '',
       '## 未采纳 Top10（近 24h）',
       '',
-      '> 口径：injected=1 且 used=0；回复引用信号未接入（backlog），接入前该表等同全部已注入查询。',
+      '> 口径：injected=1 且 used=0（used 由回复引用弱信号回写：注入节点原文 10 字窗口或中文 bigram 覆盖命中即记采纳；改写幅度大的回复可能漏判）。',
       '',
       ...countTable(data.unadopted, '未采纳次数'),
       '',

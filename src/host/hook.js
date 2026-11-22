@@ -10,11 +10,14 @@
  */
 import { resolveIdentity } from './identity.js'
 import { bool, num } from './config-values.js'
+import { judgeReply } from '../core/adoption.js'
 
 export const CONTEXT_NAME = 'whale-memory:recall'
 export const CONTEXT_ORDER = 100
 const CACHE_TTL_MS = 120_000
 const MAX_QUERY_CHARS = 2000
+/** 单步回复累积上限：只用于采纳判定，超出部分不影响回复本身。 */
+const REPLY_BUF_MAX = 16_384
 
 /**
  * 取最后一条用户消息的文本块。
@@ -54,9 +57,42 @@ function readCached(cache, sessionId) {
 export function installHook(ctx, { backend, config, getIdentityCfg = () => config?.identity, log = () => {} }) {
   const cache = new Map()
   const inflight = new Set()
+  /** 待判定的注入：key = `${session}:${turn}:${step}` → 该次召回的审计行与注入节点。 */
+  const pending = new Map()
+  /** 同一步的回复文本增量，结算后立即删除（只做判定，不落盘）。 */
+  const replyBuf = new Map()
   let disposed = false
 
   const timeoutMs = num(config?.recall?.timeoutMs, 2000)
+
+  const stepKey = (sid, turn, step) => `${sid}:${turn ?? 0}:${step ?? 0}`
+
+  /** 结算一条待判定注入：有引用证据才回写 used，无证据保持 0（未采纳）。 */
+  const settle = (key) => {
+    const entry = pending.get(key)
+    pending.delete(key)
+    const text = replyBuf.get(key) || ''
+    replyBuf.delete(key)
+    if (!entry || !entry.recallId || !text) return
+    try {
+      const verdict = judgeReply(text, entry.nodes)
+      if (!verdict.adopted) return
+      const res = backend.markRecallUsed?.(entry.recallId, true)
+      if (res && res.ok) {
+        log(`[whale-memory] adoption recall=${entry.recallId} cited=${verdict.nodeIds.length} chars=${text.length}`)
+      }
+    } catch (err) {
+      log(`[whale-memory] adoption fail-open: ${err?.name || err?.message || 'error'}`)
+    }
+  }
+
+  /** 结算某会话的历史待判条目（保留刚登记的当前步，避免把本轮自己的证据提前清掉）。 */
+  const settleSession = (sid, keepKey) => {
+    const prefix = `${sid}:`
+    for (const key of [...pending.keys()]) {
+      if (key.startsWith(prefix) && key !== keepKey) settle(key)
+    }
+  }
 
   const onPreStep = async (payload, next) => {
     const decision = await next()
@@ -76,6 +112,11 @@ export function installHook(ctx, { backend, config, getIdentityCfg = () => confi
       cache.delete(String(sessionId))
       const ident = resolveIdentity(getIdentityCfg())
       if (!ident.ok) return decision
+
+      // 上一步的回复已完整落进 assistant-stream：进入新步前先结算，别让证据过期被下一轮覆盖。
+      const key = stepKey(sessionId, payload?.turn, payload?.step)
+      settleSession(sessionId, key)
+      replyBuf.delete(key)
 
       const ac = new AbortController()
       inflight.add(ac)
@@ -97,6 +138,10 @@ export function installHook(ctx, { backend, config, getIdentityCfg = () => confi
         }, ac.signal)
         if (result && typeof result.prefix === 'string' && result.prefix) {
           cache.set(String(sessionId), { text: result.prefix, exp: Date.now() + CACHE_TTL_MS })
+          // 只有真正注入的召回才登记采纳待判（预算裁掉/零命中的行没有可采纳对象）。
+          if (result.recallId) {
+            pending.set(key, { recallId: Number(result.recallId), nodes: result.injectedNodes || [] })
+          }
           log(`[whale-memory] recall ok hits=${Number(result.hits || 0)} chars=${result.prefix.length} ms=${Date.now() - started}`)
         }
       } finally {
@@ -109,10 +154,41 @@ export function installHook(ctx, { backend, config, getIdentityCfg = () => confi
     return decision
   }
 
+  /** 回复侧文本增量：按 (turn, step) 累积，供结算时判「是否引用了注入节点」。 */
+  const offStream = ctx.on('agent/assistant-stream', (payload) => {
+    try {
+      if (disposed) return
+      const frame = payload?.frame
+      const agent = payload?.agent
+      if (!frame || frame.type !== 'chunk') return
+      const chunk = frame.chunk
+      if (!chunk || chunk.type !== 'text-delta' || typeof chunk.text !== 'string') return
+      const sid = agent?.session?.id ?? agent?.id
+      if (!sid) return
+      const key = stepKey(sid, frame.turn, frame.step)
+      const prev = replyBuf.get(key) || ''
+      if (prev.length >= REPLY_BUF_MAX) return
+      replyBuf.set(key, (prev + chunk.text).slice(0, REPLY_BUF_MAX))
+    } catch { /* 观测信号 fail-open，不影响流式回复 */ }
+  })
+
+  /** 回合关闭：结算该会话所有剩余待判条目，避免跨回合残留。 */
+  const offStopping = ctx.on('agent/turn-stopping', ({ agent } = {}) => {
+    try {
+      const sid = agent?.session?.id ?? agent?.id
+      if (sid) settleSession(sid)
+    } catch (err) {
+      log(`[whale-memory] adoption settle fail-open: ${err?.name || err?.message || 'error'}`)
+    }
+  })
+
   const offPre = ctx.on('agent/pre-step', onPreStep)
   const offDisposed = ctx.on('agent/disposed', ({ agent } = {}) => {
-    const sid = agent?.session?.id
-    if (sid) cache.delete(String(sid))
+    const sid = agent?.session?.id ?? agent?.id
+    if (!sid) return
+    cache.delete(String(sid))
+    settleSession(sid)
+    for (const key of [...replyBuf.keys()]) if (key.startsWith(`${sid}:`)) replyBuf.delete(key)
   })
 
   ctx.effect(() => ctx.systemPrompt.context({
@@ -132,9 +208,13 @@ export function installHook(ctx, { backend, config, getIdentityCfg = () => confi
     disposed = true
     offPre?.()
     offDisposed?.()
+    offStream?.()
+    offStopping?.()
     for (const ac of inflight) { try { ac.abort() } catch { /* noop */ } }
     inflight.clear()
     cache.clear()
+    pending.clear()
+    replyBuf.clear()
   }
   return { cache, dispose }
 }

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.1 — 2026-11-22（采纳信号 · 未发布）
+
+审计 backlog P1「回复引用信号（used 恒 0）」落地：注入 ≠ 采纳，之前 adoptionRate 恒 0、未采纳 Top10 等同全部已注入查询。
+- 新增 `src/core/adoption.js`（无 IO 判定层）：原文 10 字窗口命中（强证据）或中文 bigram 覆盖率 ≥0.6 且 ≥5 个（改写型弱证据）即判采纳；节点 <8 字恒不采纳，宁漏判不伪造。
+- `LocalBackend.recall()` 返回 `recallId` 与最终注入节点 `injectedNodes`（只含真正进上下文的节点）；新增 `markRecallUsed(recallId, used)` 只回写 `used` 列（不改 hit_ids/chars，注入事实与采纳事实分离），失败 fail-open。
+- hook 接 `agent/assistant-stream`：按 (turn,step) 累积回复文本；在新一步 pre-step 或 `agent/turn-stopping`/`agent/disposed` 时结算，有引用证据才回写 used=1；无 `markRecallUsed` 的旧 backend 不崩。
+- 日报「未采纳 Top10」口径文案同步（原文窗口/bigram 覆盖判定，改写幅度大的回复可能漏判）。
+- 测试 215 → 231（230 pass / 1 skip）：新增 `test/adoption.test.mjs`、`test/adoption-signal.test.mjs`（含 hook→backend 全链路 used 落库断言），`test/hook.test.mjs` 扩 5 例。
+
 ## 0.5.0 — 2026-11-22（观测层批次 · 未发布）
 
 审计 backlog P1「观测闭环」落地（架构书 §9.1/§9.2/§9.3）：
