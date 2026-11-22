@@ -806,6 +806,22 @@ function validExpiredAt(value) {
  * 插一个 active 节点（内部用）：字段全填，双时态 valid_at 置为本次决策时间。
  * @returns {string} 节点 id
  */
+/**
+ * 事实生效时间（Graphiti: reference_time 与系统时间分离）。
+ *
+ * `valid_at` 表示"这条事实何时为真"：调用方可传事件时间（消息时间/历史日志时间）；
+ * 缺省才回落到本次系统时间。`created_at` 永远是系统时间，不参与这里。
+ * 只接受有限正数，且不允许未来时间（未来时间会让"现在"过滤误判过期）。
+ * @param {{ referenceTime?: unknown } | null | undefined} event
+ * @param {number} ts 系统时间（秒）
+ * @returns {number}
+ */
+function validAtOf(event, ts) {
+  const raw = event?.referenceTime
+  const n = raw === null || raw === undefined || raw === '' ? NaN : Number(raw)
+  return Number.isFinite(n) && n > 0 && n <= ts ? n : ts
+}
+
 function insertNodeRow(db, event, text, { ts, validAt, source, origin, level, memoryType, expiredAt }) {
   const ident = normalizeIdentity(event?.identity)
   const hash = contentHash(text)
@@ -927,7 +943,7 @@ export function processEvent(db, event, config = {}) {
   } else if (action === 'ADD') {
     nodeId = withTx(db, () => insertNodeRow(db, event, text, {
       ts,
-      validAt: ts,
+      validAt: validAtOf(event, ts),
       source: mapSource(event?.source),
       origin: String(event?.origin ?? ''),
       level: validLevel(event?.level),
@@ -939,7 +955,7 @@ export function processEvent(db, event, config = {}) {
     nodeId = withTx(db, () => {
       const newId = insertNodeRow(db, event, text, {
         ts,
-        validAt: ts,
+        validAt: validAtOf(event, ts),
         source: mapSource(event?.source),
         origin: String(event?.origin ?? ''),
         level: validLevel(event?.level),
@@ -1010,7 +1026,7 @@ function acceptCandidate(db, row, text, payload, shadowOf, writeId) {
   const event = { identity: ident, traceId: String(row.trace_id ?? ''), tags: normalizeTags(payload?.tags) }
   const insert = () => insertNodeRow(db, event, text, {
     ts,
-    validAt: ts,
+    validAt: validAtOf({ ...event, referenceTime: payload?.referenceTime }, ts),
     source: mapSource(payload?.source),
     origin: 'shadow-review',
     level: validLevel(payload?.level),

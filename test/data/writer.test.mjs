@@ -1060,3 +1060,17 @@ test('judge Ref 解包：真实 Config 的 write.judge=llm 生效（面板开关
   assert.equal(calls.length, 1)
   assert.equal(calls[0].model, 'panel-model')
 })
+
+test('reference_time：事件时间进 valid_at，created_at 仍是系统时间（未来时间回落 now）', (t) => {
+  const db = freshDb(t)
+  const ts = now()
+  // 历史事实：事件时间 2020-01-01，不能被改写成"今天为真"。
+  const r = processEvent(db, event('历史事件：2020 年已验证的规则', { referenceTime: 1577836800, traceId: 'tr-ref' }), { write: { reviewMode: 'auto' } })
+  const row = db.prepare('SELECT valid_at,created_at FROM nodes WHERE id=?').get(r.id)
+  assert.equal(Number(row.valid_at), 1577836800)
+  assert.ok(Number(row.created_at) > 1577836800)
+  // 未来时间（时钟漂移/脏输入）不允许把事实标成"未来才成立"。
+  const r2 = processEvent(db, event('未来时间脏输入回落系统时间', { referenceTime: ts + 86400, traceId: 'tr-fut' }), { write: { reviewMode: 'auto' } })
+  const row2 = db.prepare('SELECT valid_at,created_at FROM nodes WHERE id=?').get(r2.id)
+  assert.equal(Number(row2.valid_at), Number(row2.created_at))
+})
