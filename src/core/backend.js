@@ -17,7 +17,9 @@ import { bigrams, contentHash, normalize } from './tokenize.js'
 import { search as searchDb } from './search.js'
 import { planBudget, trimHits } from './budget.js'
 import { applyNeighborNotes, relationStats } from './relations.js'
+import { computeMetrics } from './metrics.js'
 import { memoryPressure } from '../host/memory-guard.js'
+import { bool } from '../host/config-values.js'
 import { createWriteQueue, recordWrite } from './writer.js'
 import { DbWorkerClient } from './workers/client.js'
 
@@ -82,6 +84,21 @@ function timeOrNull(value) {
   if (value === null || value === undefined || value === '') return null
   const n = Number(value)
   return Number.isFinite(n) ? n : null
+}
+
+/**
+ * hit_ids 解析成命中条数。
+ * 审计表是历史数据，手工修过/旧版本写坏的行解析失败按 0 计，不能因为一行脏数据让面板整页挂。
+ * @param {unknown} raw hit_ids 列原文（JSON 数组字符串）
+ * @returns {number}
+ */
+function hitIdsCount(raw) {
+  try {
+    const parsed = JSON.parse(String(raw ?? '[]'))
+    return Array.isArray(parsed) ? parsed.length : 0
+  } catch {
+    return 0
+  }
 }
 
 /**
@@ -368,6 +385,23 @@ export class LocalBackend {
     const ftsBiRows = (() => { try { return one('SELECT count(*) AS n FROM nodes_fts_bi_docsize') } catch { return null } })()
     const jobRow = (state) => one(`SELECT count(*) AS n FROM jobs WHERE state='${state}'`)
     const lastFailed = (() => { try { return db.prepare("SELECT last_error FROM jobs WHERE state='failed' AND last_error IS NOT NULL ORDER BY updated_at DESC LIMIT 1").get()?.last_error || null } catch { return null } })()
+    // 最近失败明细：面板「最近失败」卡片直接渲染，省得再开一个接口。
+    const recentFailures = (() => {
+      try {
+        return db.prepare(`SELECT id,kind,state,attempts,last_error,updated_at FROM jobs
+          WHERE state='failed' ORDER BY updated_at DESC LIMIT 5`).all().map((row) => ({
+          id: Number(row.id), kind: String(row.kind || ''), state: String(row.state || 'failed'),
+          attempts: Number(row.attempts || 0), last_error: row.last_error || null,
+          updated_at: Number(row.updated_at || 0),
+        }))
+      } catch { return [] }
+    })()
+    // 指标/曲线与 totals/health 同一份打开连接：computeMetrics 只读，不新增连接也不写库。
+    // embed 关时 pending 滞留按 0 计（§9.1），不然每份日报都挂一个不可行动的 ✗。
+    const liveConfig = typeof this._config === 'function' ? this._config() : null
+    const metrics = computeMetrics(db, {
+      now: Date.now() / 1000, dbFile: this.dbPath, embedEnabled: bool(liveConfig?.embed?.enabled, false),
+    })
     return {
       totals: {
         nodes_total: nodesTotal,
@@ -381,9 +415,14 @@ export class LocalBackend {
         fts_rows: ftsRows,
         fts_bi_rows: ftsBiRows,
         vector_pending: one("SELECT count(*) AS n FROM nodes WHERE vector_state='pending'"),
-        jobs: { running: jobRow('running'), queued: jobRow('queued'), failed: jobRow('failed'), last_error: lastFailed },
+        jobs: {
+          running: jobRow('running'), queued: jobRow('queued'), failed: jobRow('failed'),
+          last_error: lastFailed, recent_failures: recentFailures,
+        },
         pressure: memoryPressure(),
       },
+      metrics: { day: metrics.day, values: metrics.values, targets: metrics.targets },
+      series: metrics.series,
       schema_version: getMeta(db, 'schema_version'),
       generated_at: new Date().toISOString(),
     }
@@ -395,7 +434,7 @@ export class LocalBackend {
       'SELECT ts,query,hit_ids,chars,injected,elapsed_ms FROM recalls ORDER BY ts DESC LIMIT ?',
     ).all(Math.max(1, Math.min(10, Number(limit) || 3)))
     return { items: rows.map((r) => ({
-      ts: r.ts, query: String(r.query || ''), hits: (JSON.parse(r.hit_ids || '[]')).length, chars: r.chars,
+      ts: r.ts, query: String(r.query || ''), hits: hitIdsCount(r.hit_ids), chars: r.chars,
       injected: Boolean(r.injected), elapsed_ms: r.elapsed_ms,
     })) }
   }
@@ -423,7 +462,14 @@ export class LocalBackend {
 
   /**
    * 召回 + 组装注入文本（与旧网关口径兼容的前缀）。
-   * @param {{ query:string, maxHits:number, identity:Identity, minRel?:number }} q
+   *
+   * 观测硬约束：**每一次召回都落一行 recalls**，包括零命中与意图预算为 0 的链路。
+   * 为什么：零命中不落库时，"零注入率/空转率"永远没有分母，审计看到的只有成功注入
+   * 的样本，等于用幸存者偏差给自己打分。预算为 0 也要落一行，否则"按意图关掉注入"
+   * 和"根本没有记忆"在数据里长得一样。
+   *
+   * @param {{ query:string, maxHits:number, identity:Identity, minRel?:number,
+   *   source?:string, traceId?:string, charBudget?:number, intentBudget?:boolean }} q
    */
   async recall(q, signal) {
     const started = Date.now()
@@ -433,34 +479,53 @@ export class LocalBackend {
       maxHits: q?.maxHits ?? 5,
       charBudget: q?.charBudget,
     })
-    if (budget.maxHits <= 0 || budget.charBudget <= 0) {
-      return { ok: true, prefix: '', chars: 0, hits: 0, intent: budget.intent }
-    }
-    const result = await this.search({
-      query: q?.query, limit: budget.maxHits, identity: q?.identity, minRel: q?.minRel,
-      diffusion: q?.diffusion, minConf: q?.minConf,
-    }, signal)
-    const trimmed = trimHits(result?.hits || [], budget)
-    const hits = trimmed.hits
-    const prefix = hits.length
-      ? '【你想到的旧事】\n' + hits.map((h) => `- ${String(h.text || '').trim()}`).join('\n')
-      : ''
-    if (prefix) {
+    // 调用方标来源（hook / panel-test / search...）；截 32 与 writes.source 口径一致。
+    const source = String(q?.source || 'hook').slice(0, 32)
+    /**
+     * 落审计行。hit_ids 记录的是**检索命中集合**（并非最终注入集合）：只有把"命中了
+     * 但被预算裁掉/丢弃"也留下来，日报才能列出"命中但未注入"的低分候选。
+     * 注入与否由 injected/chars 表达，两者不混在同一个字段里。
+     * @param {{ hitIds?: string[], chars?: number, injected?: number }} row
+     */
+    const audit = ({ hitIds = [], chars = 0, injected = 0 }) => {
       try {
         const db = this._db()
         db.prepare(`INSERT INTO recalls
           (ts,trace_id,query,hit_ids,chars,injected,used,elapsed_ms,user_id,role_id,workspace,source)
           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(
           now(), String(q?.traceId || ''), String(q?.query || '').slice(0, 500),
-          JSON.stringify(hits.map((h) => h.id)), prefix.length, 1, 0,
+          JSON.stringify(hitIds), chars, injected,
+          // used 先留 0：回复引用信号未接入（backlog），adoptionRate 在接入前必然显示
+          // "未采纳"，这比编一个假信号或干脆不落库都可解释。
+          0,
           Date.now() - started,
           String(q?.identity?.userId || ''), String(q?.identity?.roleId || ''), String(q?.identity?.workspace || ''),
-          'hook',
+          source,
         )
       } catch (err) {
         this.log(`[whale-memory] recall audit fail-open: ${err?.message || err}`)
       }
     }
+
+    if (budget.maxHits <= 0 || budget.charBudget <= 0) {
+      audit({})
+      return { ok: true, prefix: '', chars: 0, hits: 0, intent: budget.intent }
+    }
+    const result = await this.search({
+      query: q?.query, limit: budget.maxHits, identity: q?.identity, minRel: q?.minRel,
+      diffusion: q?.diffusion, minConf: q?.minConf,
+    }, signal)
+    const searched = Array.isArray(result?.hits) ? result.hits : []
+    const trimmed = trimHits(searched, budget)
+    const hits = trimmed.hits
+    const prefix = hits.length
+      ? '【你想到的旧事】\n' + hits.map((h) => `- ${String(h.text || '').trim()}`).join('\n')
+      : ''
+    audit({
+      hitIds: searched.map((h) => h.id),
+      chars: prefix.length,
+      injected: prefix ? 1 : 0,
+    })
     return {
       ok: true, prefix, chars: prefix.length, hits: hits.length,
       intent: budget.intent, dropped: trimmed.dropped, clipped: trimmed.clipped,
@@ -684,12 +749,34 @@ export class LocalBackend {
     return { ok: true, items }
   }
 
-  /** 最近召回审计（只读）。 */
-  async recalls(limit = 20) {
+  /**
+   * 最近召回审计（只读）：面板过滤与日报复盘共用同一个入口。
+   *
+   * 过滤参数全部走 SQL 占位符；filter 只认白名单（zero/unused），
+   * 未知值按"不过滤"处理——面板多传一个键不能把整页查空。
+   *
+   * @param {number} [limit] 1..100（越界夹取；非正数回落 20）
+   * @param {{ source?: string, since?: number, filter?: 'zero'|'unused'|'' }} [opts]
+   *   source: 精确匹配来源（截 32）；since: 秒级下界；filter: zero=零命中 / unused=已注入未采纳
+   * @returns {{ items: Array<{ id:number, ts:number, trace_id:string, query:string,
+   *   hit_ids:string, chars:number, injected:number, used:number, elapsed_ms:number|null,
+   *   source:string, hits:number }> }}
+   */
+  async recalls(limit = 20, opts = {}) {
     const db = this._db()
-    const rows = db.prepare('SELECT id,ts,trace_id,query,hit_ids,chars,injected,used,elapsed_ms,source FROM recalls ORDER BY ts DESC LIMIT ?')
-      .all(Math.max(1, Math.min(100, Number(limit) || 20)))
-    return { items: rows.map((r) => ({ ...r, hits: (JSON.parse(r.hit_ids || '[]')).length })) }
+    const raw = Number(limit)
+    const lim = Math.max(1, Math.min(100, Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 20))
+    const where = []
+    const args = []
+    const source = String(opts?.source ?? '').slice(0, 32)
+    if (source) { where.push('source = ?'); args.push(source) }
+    const since = Number(opts?.since)
+    if (Number.isFinite(since)) { where.push('ts >= ?'); args.push(since) }
+    if (opts?.filter === 'zero') where.push("hit_ids IN ('[]','')")
+    else if (opts?.filter === 'unused') where.push('injected = 1 AND used = 0')
+    const sql = `SELECT id,ts,trace_id,query,hit_ids,chars,injected,used,elapsed_ms,source FROM recalls${where.length ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY ts DESC, id DESC LIMIT ?`
+    const rows = db.prepare(sql).all(...args, lim)
+    return { items: rows.map((r) => ({ ...r, hits: hitIdsCount(r.hit_ids) })) }
   }
 
   /**

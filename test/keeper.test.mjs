@@ -435,6 +435,12 @@ test('report：有 dbFile 写 reports/<日期>.md；无 dbFile 跳过', async ()
     assert.match(body, /记忆日报/)
     assert.match(body, /节点总数：1/)
     assert.match(body, /零注入不计/)
+    // 日报新增：指标表（十一项）与 metrics 表落行。
+    assert.match(body, /## 指标（架构书 §9\.1，十一项）/)
+    assert.match(body, /## 命中但未注入 Top10/)
+    assert.match(body, /## 未采纳 Top10/)
+    assert.match(body, /## 近 24h 失败 job/)
+    assert.ok(Number(f.db.prepare('SELECT count(*) AS n FROM metrics').get().n) > 0, '日报必须把当天指标写进 metrics 表')
   } finally { f.close() }
 
   const dir = mkdtempSync(join(tmpdir(), 'whale-keeper-bare-'))
@@ -469,6 +475,71 @@ test('vector：embed 关 → skipped；开但无实现 → skipped 不失败', a
     assert.equal(res.result.skipped, 'embed_unavailable')
     assert.equal(on.db.prepare('SELECT vector_state FROM nodes WHERE id=?').get(id).vector_state, 'pending')
   } finally { on.close() }
+})
+
+test('report：命中未注入/未采纳/失败 job 三段与指标落表（手算值）', async () => {
+  const f = fresh()
+  try {
+    node(f.db, { text: '日报指标样本节点' })
+    const ts = f.clock
+    const recallRow = (d) => f.db.prepare(`INSERT INTO recalls
+      (ts,trace_id,query,hit_ids,chars,injected,used,elapsed_ms,user_id,role_id,workspace,source)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      d.ts, '', d.query, d.hitIds ?? '[]', d.chars ?? 0, d.injected ?? 0, d.used ?? 0, 5, '', '', '', 'hook',
+    )
+    const jobInsert = (d) => f.db.prepare(`INSERT INTO jobs
+      (kind,state,attempts,last_error,created_at,updated_at) VALUES (?,?,?,?,?,?)`)
+      .run(d.kind, d.state, d.attempts ?? 0, d.lastError ?? null, d.ts, d.ts)
+
+    // 近 24h：同一查询两次"命中未注入"；一条已注入未采纳；一条已注入已采纳（必须出表）；
+    // 一条零命中（只进零注入率，不进 Top10）。
+    recallRow({ ts: ts - 3600, query: '低分命中规则', hitIds: '["n1"]', injected: 0 })
+    recallRow({ ts: ts - 3500, query: '低分命中规则', hitIds: '["n1"]', injected: 0 })
+    recallRow({ ts: ts - 3400, query: '已注入未采纳', hitIds: '["n2"]', injected: 1, chars: 20 })
+    recallRow({ ts: ts - 3300, query: '已注入已采纳', hitIds: '["n3"]', injected: 1, chars: 20, used: 1 })
+    recallRow({ ts: ts - 3200, query: '零命中查询', hitIds: '[]', injected: 0 })
+    jobInsert({ kind: 'reflect', state: 'failed', attempts: 3, lastError: 'boom_boom', ts: ts - 600 })
+    jobInsert({ kind: 'consolidate', state: 'done', ts: ts - 1200 })
+    f.db.prepare(`INSERT INTO writes (ts,trace_id,action,reason,mode,user_id,role_id,workspace)
+      VALUES (?,?,'REJECT','privacy','auto','','','')`).run(ts - 100, '')
+    f.db.prepare(`INSERT INTO writes (ts,trace_id,action,reason,mode,user_id,role_id,workspace)
+      VALUES (?,?,'ADD','new','auto','','','')`).run(ts - 200, '')
+
+    const res = await f.keeper.runNow('report', {})
+    assert.equal(res.state, 'done')
+    assert.match(res.result.metrics_day, /^\d{4}-\d{2}-\d{2}$/)
+    assert.equal(res.result.metrics_day, res.result.path.split(/[\\/]/).pop().replace(/\.md$/, ''))
+
+    const body = readFileSync(res.result.path, 'utf8')
+    // 指标表十一项标签齐全；无评测数据 → 评测两项显示「未接入」而不是 0。
+    for (const label of ['precision@3', '识别命中率', '零注入率', '采纳率', '空转率', '注入字数均值', '待向量最长滞留', '作业成功率', '写入拒绝率', 'FTS 对齐', '库体积']) {
+      assert.ok(body.includes(label), `指标表缺 ${label}`)
+    }
+    assert.match(body, /未接入/)
+    assert.match(body, /## 命中但未注入 Top10/)
+    assert.match(body, /schema v3/)
+    assert.match(body, /低分命中规则/)
+    assert.match(body, /## 未采纳 Top10/)
+    assert.match(body, /已注入未采纳/)
+    assert.doesNotMatch(body, /已注入已采纳/, '已采纳的查询不进未采纳表')
+    assert.match(body, /## 近 24h 失败 job/)
+    assert.match(body, /reflect/)
+    assert.match(body, /boom_boom/)
+
+    // metrics 表：当天数字型指标全落（评测两项 null 不落、fts_aligned 布尔不落）。
+    const rows = f.db.prepare('SELECT name, value FROM metrics WHERE day = ?').all(res.result.metrics_day)
+    const byName = new Map(rows.map((row) => [row.name, Number(row.value)]))
+    assert.equal(byName.has('fts_aligned'), false)
+    assert.equal(byName.get('zero_injection_rate'), 0.2) // 1 次零命中 / 5 次召回
+    assert.equal(byName.get('adoption_rate'), 0.5) // 1 采纳 / 2 注入
+    assert.equal(byName.get('idle_rate'), 0.5)
+    assert.equal(byName.get('inject_chars_avg'), 20) // (20 + 20) / 2
+    assert.equal(byName.get('job_success_7d'), 0.5) // done 1 / (1+1)
+    assert.equal(byName.get('write_reject_rate'), 0.5) // REJECT 1 / 2
+    assert.equal(byName.get('pending_age_max_min'), 0)
+    assert.ok(byName.get('db_size_bytes') > 0)
+    assert.equal(rows.length, 8)
+  } finally { f.close() }
 })
 
 test('installKeeper：默认 handlers 可用，ctx.effect 卸载即 dispose', async () => {

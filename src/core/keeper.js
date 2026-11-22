@@ -11,12 +11,14 @@
  *   日志只在"进入压力态"打一次（清压后复位，不刷屏）。
  * - 定时器 unref：不拖住 Host 退出；dispose 后 tick 空转（{ran:[],skipped:'disposed'}）。
  *
- * 本模块只读写 jobs / nodes / edges / writes（audit）与 reports 目录，
+ * 本模块只读写 jobs / nodes / edges / writes（audit）/ metrics（日报落表）与 reports 目录，
  * 不碰 FTS、不碰召回注入；write/reflect 的 handler 由 index.js 接线，这里不注册。
  */
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { memoryPressure } from '../host/memory-guard.js'
+import { bool } from '../host/config-values.js'
+import { METRIC_DEFS, computeMetrics, writeMetricsRows } from './metrics.js'
 import { parseTags, rebuildTagEdges, upsertEdge } from './relations.js'
 
 /** 允许的作业类型（enqueue/register 校验用；与 schema jobs.kind 语义一致）。 */
@@ -474,6 +476,102 @@ export function buildTopicEdges(db, { dfMax = 12, maxNodes = 5000, maxPairs = 50
   return { edges: pairs, tags: groups.size }
 }
 
+/**
+ * 指标值渲染：null 表示"未接入"（评测没跑/没有召回），布尔指标用 ✓/✗。
+ * 为什么单位在渲染层定：metrics.js 只存纯数值，展示单位（%、字、分钟、MB）随日报/面板变，
+ * 存成字符串会让 metrics 表无法做算术和曲线。
+ * @param {{ fmt: string }} def METRIC_DEFS 的一项
+ * @param {unknown} value computeMetrics 产出的原始值
+ * @returns {string}
+ */
+function metricCell(def, value) {
+  if (value === null || value === undefined) return '未接入'
+  if (value === true) return '✓'
+  if (value === false) return '✗'
+  const num = Number(value)
+  if (!Number.isFinite(num)) return '未接入'
+  switch (def.fmt) {
+    case 'rate': return rateText(num)
+    case 'chars': return `${Math.round(num)} 字`
+    case 'min': return `${num.toFixed(1)} 分钟`
+    case 'bytes': return `${(num / 1024 / 1024).toFixed(2)} MB`
+    default: return String(value)
+  }
+}
+
+/**
+ * 目标列渲染：只有可判达标的指标有目标（FTS 对齐/库体积是观测项，标 —）。
+ * @param {{ dir: string|null, target: number|null, fmt: string }} def
+ * @returns {string}
+ */
+function targetCell(def) {
+  if (def.target === null || def.target === undefined) return '—'
+  const cmp = def.dir === 'min' ? '≥' : '≤'
+  return `${cmp} ${def.fmt === 'rate' ? rateText(def.target) : def.target}`
+}
+
+/**
+ * 达标列渲染：值缺失或指标本身不判达标时给 —，不把"没数据"判成"不达标"。
+ * @param {{ dir: string|null, target: number|null }} def
+ * @param {unknown} value
+ * @returns {string}
+ */
+function passCell(def, value) {
+  if (value === null || value === undefined || typeof value !== 'number' || def.target === null || def.target === undefined) return '—'
+  const ok = def.dir === 'min' ? value >= def.target : value <= def.target
+  return ok ? '✓' : '✗'
+}
+
+/** 比率 → 百分比文本（保留 1 位，避免 0.3333333333333333 刷屏）。 */
+function rateText(value) {
+  return `${(Number(value) * 100).toFixed(1)}%`
+}
+
+/**
+ * Top10 表里的查询截断：recalls.query 最长 500 字（整段用户提示词），原样入表会把
+ * 日报撑成一篇聊天记录，也看不出聚合意图；80 字足够识别同一类查询。
+ * @param {unknown} query
+ * @returns {string}
+ */
+function shortQuery(query) {
+  const text = String(query ?? '')
+  return text.length > 80 ? `${text.slice(0, 80)}…` : text
+}
+
+/** Markdown 表格单元格转义：query 里可能有 | 或换行，不转义会把表结构打断。 */
+function markdownCell(value) {
+  return String(value ?? '').replace(/\|/g, '\\|').replace(/\r?\n/g, ' ').trim()
+}
+
+/** 两个审计 Top10 表的渲染（空数据写「（无）」，不留空表头）。 */
+function countTable(rows, column) {
+  const list = Array.isArray(rows) ? rows : []
+  if (list.length === 0) return ['（无）']
+  return [
+    `| 查询 | ${column} |`,
+    '| --- | --- |',
+    ...list.map((row) => `| ${markdownCell(shortQuery(row.query))} | ${Number(row.n || 0)} |`),
+  ]
+}
+
+/** 24h 失败 job 表：attempts 是已失败重试次数，last_error 是最后一次原因。 */
+function failedTable(rows) {
+  const list = Array.isArray(rows) ? rows : []
+  if (list.length === 0) return ['（无）']
+  return [
+    '| kind | attempts | last_error | updated_at |',
+    '| --- | --- | --- | --- |',
+    ...list.map((row) => `| ${markdownCell(row.kind)} | ${Number(row.attempts || 0)} | ${markdownCell(row.last_error || '')} | ${clockText(row.updated_at)} |`),
+  ]
+}
+
+/** 本地时钟文本 YYYY-MM-DD HH:mm（日报里的 updated_at 人读用）。 */
+function clockText(seconds) {
+  const d = new Date(toSeconds(seconds) * 1000)
+  const p = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
 /** 默认 handlers 安装（createKeeper 内调用；单独拆函数便于阅读）。 */
 function installDefaultHandlers(keeper, deps) {
   const { store, config = {}, log = () => {}, nowSec } = deps
@@ -533,9 +631,9 @@ function installDefaultHandlers(keeper, deps) {
     if (!dbFile) return { skipped: 'no_dbfile' }
     const ts = nowSec()
     const day = dayStamp(ts)
-    const stats = store.withDb((db) => {
+    const data = store.withDb((db) => {
       const one = (sql, ...args) => Number(db.prepare(sql).get(...args)?.n || 0)
-      return {
+      const stats = {
         nodes: one('SELECT count(*) AS n FROM nodes'),
         active: one("SELECT count(*) AS n FROM nodes WHERE status='active'"),
         edges: one('SELECT count(*) AS n FROM edges'),
@@ -543,9 +641,29 @@ function installDefaultHandlers(keeper, deps) {
         jobsFailed: one(`SELECT count(*) AS n FROM jobs WHERE state='failed' AND updated_at >= ?`, ts - 86400),
         recalls: one('SELECT count(*) AS n FROM recalls WHERE ts >= ?', ts - 86400),
         withHits: one(`SELECT count(*) AS n FROM recalls WHERE ts >= ? AND hit_ids NOT IN ('[]','')`, ts - 86400),
-        injected: one('SELECT count(*) AS n FROM recalls WHERE ts >= ? AND injected=1', ts - 86400),
+        injected: one(`SELECT count(*) AS n FROM recalls WHERE ts >= ? AND injected=1`, ts - 86400),
       }
+      // 「命中但未注入」是"低分命中"在没有分数列时的代理口径：检索命中了，但注入侧被
+      // 预算/层级裁光。按 query 聚合才能看出反复发生的是同一类问题。
+      const lowScoreHits = db.prepare(`SELECT query, count(*) AS n FROM recalls
+        WHERE ts >= ? AND injected = 0 AND hit_ids NOT IN ('[]','')
+        GROUP BY query ORDER BY n DESC, query LIMIT 10`).all(ts - 86400)
+      const unadopted = db.prepare(`SELECT query, count(*) AS n FROM recalls
+        WHERE ts >= ? AND injected = 1 AND used = 0
+        GROUP BY query ORDER BY n DESC, query LIMIT 10`).all(ts - 86400)
+      const failedJobs = db.prepare(`SELECT kind, attempts, last_error, updated_at FROM jobs
+        WHERE state='failed' AND updated_at >= ? ORDER BY updated_at DESC LIMIT 20`).all(ts - 86400)
+      // embed 关 → pending 滞留记 0（§9.1），日报不该每天挂一个没有消费方的 ✗。
+      const metrics = computeMetrics(db, {
+        day, now: ts, dbFile, embedEnabled: bool(config?.embed?.enabled, false),
+      })
+      // 指标落表与日报写文件同一次执行：面板读 metrics 表做历史对比时，
+      // 日报当天必须已经有一行，否则"昨天日报有、今天面板没有"。
+      writeMetricsRows(db, metrics)
+      return { stats, lowScoreHits, unadopted, failedJobs, metrics }
     })
+
+    const { stats, metrics } = data
     const totalJobs = stats.jobsDone + stats.jobsFailed
     const jobRate = totalJobs > 0 ? Math.round((stats.jobsDone / totalJobs) * 1000) / 10 : 100
     // 零注入不计：无命中的召回说明没得注，不算失手，不进注入率分母。
@@ -559,6 +677,14 @@ function installDefaultHandlers(keeper, deps) {
       `- active：${stats.active}`,
       `- edges：${stats.edges}`,
       '',
+      '## 指标（架构书 §9.1，十一项）',
+      '',
+      '| 指标 | 值 | 目标 | 达标 |',
+      '| --- | --- | --- | --- |',
+      ...METRIC_DEFS.map((def) => `| ${def.label} | ${metricCell(def, metrics.values[def.name])} | ${targetCell(def)} | ${passCell(def, metrics.values[def.name])} |`),
+      '',
+      `> 指标日：${metrics.day}；7 日窗口按本地自然日，与 /stats 同源。`,
+      '',
       '## 近 24h 作业',
       '',
       `- 成功率：${jobRate}%（done ${stats.jobsDone} / failed ${stats.jobsFailed}）`,
@@ -568,12 +694,28 @@ function installDefaultHandlers(keeper, deps) {
       `- 召回：${stats.recalls} 次（有命中 ${stats.withHits} 次）`,
       `- 注入：${stats.injected} 次，注入率 ${injectRate}%（零注入不计：无命中的召回不进分母）`,
       '',
+      '## 命中但未注入 Top10（近 24h）',
+      '',
+      '> 代理口径：无分数明细列，暂以「检索有命中但 injected=0」近似「低分命中」；分数明细待 schema v3 挂账。',
+      '',
+      ...countTable(data.lowScoreHits, '命中次数'),
+      '',
+      '## 未采纳 Top10（近 24h）',
+      '',
+      '> 口径：injected=1 且 used=0；回复引用信号未接入（backlog），接入前该表等同全部已注入查询。',
+      '',
+      ...countTable(data.unadopted, '未采纳次数'),
+      '',
+      '## 近 24h 失败 job（state=failed，updated_at 降序）',
+      '',
+      ...failedTable(data.failedJobs),
+      '',
     ].join('\n')
     const dir = join(dirname(dbFile), 'reports')
     const path = join(dir, `${day}.md`)
     mkdirSync(dir, { recursive: true })
     writeFileSync(path, markdown, 'utf8')
-    return { path, nodes: stats.nodes, active: stats.active, edges: stats.edges }
+    return { path, nodes: stats.nodes, active: stats.active, edges: stats.edges, metrics_day: metrics.day }
   })
 }
 

@@ -435,8 +435,19 @@ export function createRoutes({ config, backend, getIdentityCfg = () => config?.i
 
     if (path === `${PREFIX}/recalls` && req.method === 'GET') {
       if (typeof backend.recalls !== 'function') return sendJson(res, 502, { ok: false, error: 'backend_unavailable' })
-      const limit = clamp(new URL(req.url, 'http://127.0.0.1').searchParams.get('limit'), 1, 100, 20)
-      const data = await backend.recalls(limit)
+      const params = new URL(req.url, 'http://127.0.0.1').searchParams
+      // 缺省 limit 走真默认 20（clamp 收到 null 会当成 0 夹到 1，fallback 就成了死代码）。
+      const limitRaw = params.get('limit')
+      const limit = limitRaw === null || limitRaw.trim() === '' ? 20 : clamp(limitRaw, 1, 100, 20)
+      // 过滤参数：source 截 32；since 只认数字秒（非数字忽略，不 400——面板旧版可能带脏值）；
+      // filter 只认白名单，未知值按不过滤处理。
+      const source = String(params.get('source') || '').trim().slice(0, 32)
+      const sinceRaw = params.get('since')
+      const sinceNum = sinceRaw === null || sinceRaw.trim() === '' ? NaN : Number(sinceRaw)
+      const since = Number.isFinite(sinceNum) ? sinceNum : null
+      const filterRaw = String(params.get('filter') || '').trim()
+      const filter = filterRaw === 'zero' || filterRaw === 'unused' ? filterRaw : ''
+      const data = await backend.recalls(limit, { source, since, filter })
       return sendJson(res, 200, { ok: true, items: data.items || [] })
     }
 

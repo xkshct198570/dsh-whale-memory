@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.0 — 2026-11-22（观测层批次 · 未发布）
+
+审计 backlog P1「观测闭环」落地（架构书 §9.1/§9.2/§9.3）：
+- 新增 `src/core/metrics.js`：十一项指标唯一口径 + 7 日 series；纯函数只读，落表只由日报调用（`writeMetricsRows` UPSERT）。
+- `GET /stats` 增 `metrics{day,values,targets}`、`series[7]`、`health.jobs.recent_failures`（既有 totals/health 键不动）。
+- 召回审计补零命中：每次召回都落 `recalls` 行（含零命中与意图预算 0），`source` 由调用方传入；`hit_ids` 改记检索命中集合（注入与否由 injected/chars 表达）；`GET /recalls` 支持 `source/since/filter=zero|unused/limit`。
+- 日报新增：十一项指标表（目标/达标）、命中但未注入 Top10（低分命中的代理口径）、未采纳 Top10、24h 失败 job 表，并把指标写入 `metrics` 表。
+- embed 关闭时 pending 滞留按 0 计（§9.1，避免每天挂一个不可行动的 ✗）。
+- 面板概览：新增零注入率/采纳率/作业成功率/库体积指标卡（带目标达标态）、7 日曲线（注入率/零命中占比）、最近失败卡片；三语各 392 键。
+- 测试 197 → 215（214 pass / 1 skip）：新增 `test/metrics.test.mjs`、`test/recalls.test.mjs`，keeper 报告与 stats 契约断言扩展。
+
 ## 0.4.3 — 2026-11-22
 
 工程质量审计后的修复批次（对照架构书 v3.5 / 计划书 v1.5）：
