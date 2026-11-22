@@ -17,7 +17,7 @@
  * 用显式标记把"机器负责的字节区间"钉死，才能在用户手改块外内容后依然安全重渲染。
  */
 import { readFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import { atomicWriteFile, listRules } from './rule-store.js'
 
@@ -100,8 +100,13 @@ function digestLine(doc) {
   const label = type === 'iron-rule' && Number.isInteger(number) && number > 0
     ? `铁律${number}`
     : trimmed(front.key)
-  const excerpt = Array.from(text).slice(0, EXCERPT_CHARS).join('')
-  return `- ${label} · ${titleOfRule(front, text)}（${scopeLabel(front.scope)}）：${excerpt}`
+  const chars = Array.from(text)
+  const cut = chars.slice(0, EXCERPT_CHARS).join('')
+  const excerpt = chars.length > EXCERPT_CHARS ? `${cut}…` : cut
+  // 摘要必须指到「哪一条文件」：只给目录时用户还得自己找文件（真机 AGENTS 实测暴露）。
+  const file = trimmed(doc.file) || (trimmed(front.key) ? `${trimmed(front.key)}.md` : '')
+  const tail = file ? `（文件：${basename(file)}）` : ''
+  return `- ${label} · ${titleOfRule(front, text)}（${scopeLabel(front.scope)}）：${excerpt}${tail}`
 }
 
 /**
@@ -120,7 +125,7 @@ export function rulesDigestContent(rules, opts = {}) {
   for (const doc of docs) lines.push(digestLine(doc))
   const dir = trimmed(opts.dir) || dirnameOfRules(rules)
   // 传数组（apply 后的 postRules）时没有目录信息，脚注宁可省略也不写半截路径。
-  if (docs.length && dir) lines.push(`完整正文：${displayPath(dir)}`)
+  if (docs.length && dir) lines.push(`规则文件目录：${displayPath(dir)}`)
   return {
     content: lines.join('\n'),
     count: docs.length,

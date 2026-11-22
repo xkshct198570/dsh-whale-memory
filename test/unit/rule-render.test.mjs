@@ -87,7 +87,12 @@ test('rulesDigestContent：只收 global+active 铁律，按编号排序，正�
   assert.match(got.content, /^## 规则摘要（自动生成，勿手改）/)
   assert.match(got.content, /- 铁律13 · /)
   const longLine = got.content.split('\n').find((line) => line.startsWith('- 铁律20'))
-  assert.equal(Array.from(longLine.slice(longLine.indexOf('：') + 1)).length, 60)
+  // 摘要 60 字后追加「（文件：…）」指针，取两者之间的正文再数长度。
+  const excerpt = longLine.slice(longLine.indexOf('：') + 1, longLine.indexOf('（文件：'))
+  // 60 字 + 截断省略号（长文本才有）
+  assert.equal(Array.from(excerpt).length, 61)
+  assert.match(excerpt, /…$/)
+  assert.match(longLine, /（文件：iron-rule-20\.md）$/)
 })
 
 test('rulesDigestContent：标题取 action，缺省退正文首句；作用域规则只注入不进摘要', () => {
@@ -166,7 +171,7 @@ test('renderAgentsDigest：只替换块内部，块外字节与标记保留，�
   assert.equal(after.includes(RULES_BEGIN), true)
   assert.equal(after.includes(RULES_END), true)
   assert.match(after, /- 铁律17 · 删文档前先核路径（全局）：删文档前先核对绝对路径。/)
-  assert.match(after, /完整正文：/)
+  assert.match(after, /规则文件目录：/)
   assert.equal(readFileSync(`${path}.bak`, 'utf8'), content, '.bak 必须是替换前全文')
   // 同一批规则用 doc.file 反推目录，渲染结果必须与显式 rulesDir 完全一致（幂等性不依赖调用形态）。
   const viaFile = renderAgentsDigest({
