@@ -16,11 +16,20 @@ import { runRulesSelfHeal } from '../../index.js'
 import { RULES_BEGIN, RULES_END, agentsPathOf } from '../../src/core/rule-render.js'
 
 /** 临时规则仓 + 临时 SQLite；`.seeded.json` 预置避免默认播种干扰计数。 */
-function fresh(t) {
+function fresh(t, { seeded = true } = {}) {
   const home = mkdtempSync(join(tmpdir(), 'whale-selfheal-'))
   const rulesDir = join(home, 'rules')
   const dbDir = mkdtempSync(join(tmpdir(), 'whale-selfheal-db-'))
   nodeFs.mkdirSync(rulesDir, { recursive: true })
+  if (!seeded) {
+    const db = openDb(dbDir)
+    t.after(() => {
+      closeDb(db)
+      nodeFs.rmSync(home, { recursive: true, force: true })
+      nodeFs.rmSync(dbDir, { recursive: true, force: true })
+    })
+    return { home, rulesDir, db, backend: { withDb: (fn) => fn(db) } }
+  }
   // 有效播种 marker（契约 §2.9：version+keys 参与判据）：keys 记全部默认 key，
   // 自愈播种据此判「已播」，避免测试被 16 条默认铁律污染计数。
   const defaultsDir = fileURLToPath(new URL('../../defaults/rules', import.meta.url))
@@ -175,4 +184,67 @@ test('runRulesSelfHeal：播种在自愈内后台执行（有 marker 时判已�
   assert.equal(result.seeded?.skipped, 'already_seeded')
   assert.equal(nodeFs.readFileSync(join(rulesDir, 'iron-rule-1.md'), 'utf8'), before)
   assert.equal(existsSync(agentsPathOf(rulesDir)), false, '自愈不得创建宿主 AGENTS 资产')
+})
+
+// ---------------------------------------------------------------------------
+// 干净安装 P1：宿主没有 AGENTS.md 时，启动自愈创建最小管理块
+// ---------------------------------------------------------------------------
+
+test('runRulesSelfHeal：空机（无 AGENTS.md）→ 创建最小管理块，默认铁律可见', (t) => {
+  const { home, rulesDir, backend } = fresh(t)
+  writeRuleFile(rulesDir, { key: 'iron-rule-1', number: 1, text: '必须保留审计日志。' })
+  const agentsPath = join(home, 'AGENTS.md')
+  assert.equal(existsSync(agentsPath), false)
+
+  const result = runRulesSelfHeal({ config: cfgOf(rulesDir), backend })
+  assert.equal(result.agents?.ok, true, result.agents?.code)
+  assert.equal(result.agents?.created, true)
+  assert.equal(existsSync(agentsPath), true, '干净安装必须创建 AGENTS.md')
+  const content = nodeFs.readFileSync(agentsPath, 'utf8')
+  assert.ok(content.startsWith(`${RULES_BEGIN}\n`))
+  assert.ok(content.endsWith(`${RULES_END}\n`))
+  assert.match(content, /- 铁律1 · 保留审计日志/)
+})
+
+test('runRulesSelfHeal：rules.createAgentsIfMissing=false → 空机不创建；true 默认开', (t) => {
+  const { home, rulesDir, backend } = fresh(t)
+  writeRuleFile(rulesDir, { key: 'iron-rule-1', number: 1 })
+  const agentsPath = join(home, 'AGENTS.md')
+
+  const off = runRulesSelfHeal({
+    config: cfgOf(rulesDir, { createAgentsIfMissing: false }), backend,
+  })
+  assert.equal(off.agents?.ok, false)
+  assert.equal(off.agents?.code, 'no_markers')
+  assert.equal(existsSync(agentsPath), false, '开关关闭时不得创建')
+
+  // 默认（未配该键）必须开：干净安装的验收口径。
+  const on = runRulesSelfHeal({ config: cfgOf(rulesDir), backend })
+  assert.equal(on.agents?.created, true)
+  assert.equal(existsSync(agentsPath), true)
+})
+
+test('runRulesSelfHeal：规则目录为空时不自愈出空壳 AGENTS', (t) => {
+  const { home, rulesDir, backend } = fresh(t)
+  const agentsPath = join(home, 'AGENTS.md')
+  const result = runRulesSelfHeal({ config: cfgOf(rulesDir), backend })
+  assert.equal(result.rules, 0)
+  assert.equal(result.agents, null)
+  assert.equal(existsSync(agentsPath), false)
+})
+
+test('干净安装 E2E：无 marker 空仓 → 播种 16 条默认铁律 → AGENTS 自动创建且全部可见', (t) => {
+  const { home, rulesDir, backend } = fresh(t, { seeded: false })
+  const agentsPath = join(home, 'AGENTS.md')
+  const result = runRulesSelfHeal({ config: cfgOf(rulesDir), backend })
+  assert.equal(result.seeded?.seeded, 16, '空仓应播种 16 条默认铁律')
+  assert.equal(result.rules, 16)
+  assert.equal(result.agents?.created, true, result.agents?.code)
+  const content = nodeFs.readFileSync(agentsPath, 'utf8')
+  const lines = content.split('\n').filter((line) => line.startsWith('- '))
+  assert.equal(lines.length, 16, '16 条默认铁律必须全部进 AGENTS 摘要')
+  assert.match(content, /- iron-rule-safety /)
+  assert.match(content, /- 铁律1 · /)
+  assert.match(content, /^<!-- whale-memory:rules:begin -->\n/, '最小管理块从 begin 开始')
+  assert.match(content, /<!-- whale-memory:rules:end -->\n$/, '以 end 结束')
 })

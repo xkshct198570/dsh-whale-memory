@@ -133,6 +133,7 @@ export function createWhaleMemoryService({ ctx, backendRef, getHook = () => null
  *
  * @param {{config:any, backend:any, log?:Function, store?:any}} [deps]
  *   store 默认真实 rule-store；测试注入 fake 以断言 recoverPendingTxn 接线。
+ *   `rules.createAgentsIfMissing`（默认 true）控制「宿主无 AGENTS.md 时创建最小管理块」。
  * @returns {{skipped?:string, dir:string, rules:number, recovered?:object|null,
  *   seeded?:object|null, mirror?:object|null, agents?:object|null}}
  */
@@ -188,9 +189,17 @@ export function runRulesSelfHeal({ config, backend, log = () => {}, store = rule
   }
 
   // 4) AGENTS 摘要自愈：只看 rules.renderAgents（无标记时 render 返回 no_markers，静默跳过）。
+  // 干净安装：宿主还没有 AGENTS.md 时创建最小管理块（否则默认铁律在 AGENTS 里完全不可见）。
+  // 开关 `rules.createAgentsIfMissing`（默认开）：只在启动自愈里生效，面板手动渲染不创建。
   if (bool(config?.rules?.renderAgents, true)) {
     try {
-      result.agents = renderAgentsDigest({ rules: listed.rules, agentsPath: agentsPathOf(dir), rulesDir: dir, log })
+      result.agents = renderAgentsDigest({
+        rules: listed.rules,
+        agentsPath: agentsPathOf(dir),
+        rulesDir: dir,
+        createIfMissing: bool(config?.rules?.createAgentsIfMissing, true),
+        log,
+      })
       if (result.agents && result.agents.ok === false && result.agents.code !== 'no_markers') {
         log(`[whale-memory] rules agents self-heal skipped: ${result.agents.code || result.agents.error || 'error'}`)
       }

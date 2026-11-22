@@ -19,7 +19,7 @@
  * Why 管理块：AGENTS/台账是人工也在编辑的文件，渲染必须可增量、可自愈、可回滚；
  * 用显式标记把"机器负责的字节区间"钉死，才能在用户手改块外内容后依然安全重渲染。
  */
-import { existsSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import { atomicWriteFile, listRules } from './rule-store.js'
@@ -384,7 +384,7 @@ function runWithRepoLock(root, fn, { lock = null, log = () => {} } = {}) {
  *   log:Function, label:string}} args
  * @returns {{ok:boolean, changed?:boolean, content?:string, error?:string, code?:string}}
  */
-function rewriteBlock({ path, begin, end, body, log, label }) {
+function rewriteBlock({ path, begin, end, body, log, label, createIfMissing = false }) {
   for (let attempt = 0; attempt < WRITE_ATTEMPTS; attempt += 1) {
     // 先取读前指纹：读→比对→写三步之间任何一步被别人改过，都重读重来。
     const before = statSignature(path)
@@ -393,7 +393,21 @@ function rewriteBlock({ path, begin, end, body, log, label }) {
       content = readFileSync(path, 'utf8')
     } catch (err) {
       const missing = err?.code === 'ENOENT'
-      return { ok: false, code: missing ? 'no_markers' : `${label}_unreadable` }
+      if (!missing) return { ok: false, code: `${label}_unreadable` }
+      // 干净安装（R8-06 P1）：宿主还没有 AGENTS.md 时，启动自愈/播种后可创建**最小管理块**，
+      // 否则 16 条默认铁律在 AGENTS 里完全不可见（只剩 hook 降级注入的几百字）。
+      // 只在调用方显式允许时创建：面板手动渲染/台账渲染不得凭空造宿主资产。
+      if (!createIfMissing) return { ok: false, code: 'no_markers' }
+      const created = `${begin}\n${body('')}\n${end}\n`
+      try {
+        mkdirSync(dirname(path), { recursive: true })
+      } catch { /* 目录已存在/无权限：写入会给出真实错误 */ }
+      const written = atomicWriteFile(path, created)
+      if (!written.ok) {
+        log(`[whale-memory] render ${label} create failed: ${written.error}`)
+        return { ok: false, code: 'write_failed', error: `write_failed:${written.error}` }
+      }
+      return { ok: true, changed: true, created: true }
     }
     const afterRead = statSignature(path)
     if (afterRead !== before) continue
@@ -418,17 +432,21 @@ function rewriteBlock({ path, begin, end, body, log, label }) {
  * 重渲染 AGENTS 摘要块。
  *
  * @param {{rules:any, agentsPath:string, rulesDir?:string, root?:string,
- *   lock?:Function, log?:Function}} args
+ *   lock?:Function, createIfMissing?:boolean, log?:Function}} args
+ *   `createIfMissing` 只在启动自愈/播种后由 index.js 传 true（干净安装 P1）；
+ *   面板手动渲染保持默认 false（不凭空创建宿主资产）。
  * @returns {{ok:boolean, changed?:boolean, count?:number, keys?:string[], chars?:number,
  *   path?:string, code?:string, error?:string}}
  */
 export function renderAgentsDigest({
-  rules, agentsPath, rulesDir = '', root = '', lock = null, log = () => {},
+  rules, agentsPath, rulesDir = '', root = '', lock = null, createIfMissing = false, log = () => {},
 } = {}) {
   const path = trimmed(agentsPath)
   if (!path) return { ok: false, code: 'no_agents_path' }
   const lockRoot = trimmed(root) || trimmed(rulesDir) || dirnameOfRules(rules)
   const digest = rulesDigestContent(rules, { dir: rulesDir })
+  // 空摘要不创建文件：建一个空洞的管理块只会给用户留个空壳资产。
+  const allowCreate = Boolean(createIfMissing) && digest.count > 0
   let outcome
   try {
     outcome = runWithRepoLock(lockRoot, () => rewriteBlock({
@@ -438,6 +456,7 @@ export function renderAgentsDigest({
       body: () => digest.content,
       log,
       label: 'agents',
+      createIfMissing: allowCreate,
     }), { lock, log })
   } catch (err) {
     log(`[whale-memory] render agents failed: ${err?.name || err?.message || err}`)
@@ -448,10 +467,11 @@ export function renderAgentsDigest({
     // 让调用方/面板知道这次是"没拿到锁"而不是"文件写坏"。
     return { ok: false, code: outcome?.code || (outcome?.error ? 'lock_failed' : 'render_failed'), error: outcome?.error }
   }
-  log(`[whale-memory] render agents changed=${outcome.changed} rules=${digest.count}`)
+  log(`[whale-memory] render agents changed=${outcome.changed} created=${Boolean(outcome.created)} rules=${digest.count}`)
   return {
     ok: true,
     changed: outcome.changed,
+    created: Boolean(outcome.created),
     count: digest.count,
     keys: digest.keys,
     chars: Array.from(digest.content).length,

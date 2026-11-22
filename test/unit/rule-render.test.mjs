@@ -415,3 +415,92 @@ test('renderAgentsDigest：渲染时恒重读磁盘（块外手改不丢字节�
   assert.equal(got.ok, true)
   assert.match(readFileSync(path, 'utf8'), /块外内容第一行（用户手改）。/)
 })
+
+// ---------------------------------------------------------------------------
+// R8-06 P1：干净安装时创建最小管理块（只有显式 createIfMissing 才创建）
+// ---------------------------------------------------------------------------
+
+test('renderAgentsDigest：createIfMissing=true 且文件不存在 → 创建最小管理块', (t) => {
+  const dir = freshDir(t)
+  const path = join(dir, 'AGENTS.md')
+  const got = renderAgentsDigest({
+    rules: [doc({ key: 'iron-rule-40', number: 40, text: '干净安装也要看得见默认铁律。' })],
+    agentsPath: path,
+    createIfMissing: true,
+  })
+  assert.equal(got.ok, true, got.code)
+  assert.equal(got.changed, true)
+  assert.equal(got.created, true)
+  assert.equal(got.count, 1)
+  assert.equal(existsSync(path), true, '干净安装必须落 AGENTS.md')
+  const content = readFileSync(path, 'utf8')
+  assert.ok(content.startsWith(`${RULES_BEGIN}\n`), '首行就是 begin 标记')
+  assert.ok(content.endsWith(`${RULES_END}\n`), '末行就是 end 标记')
+  assert.match(content, /- 铁律40 · 干净安装也要看得见默认铁律/)
+  const markers = inspectMarkers(content)
+  assert.equal(markers.ok, true, '创建出来的块必须完整单例')
+  assert.equal(markers.beginCount, 1)
+  assert.equal(markers.endCount, 1)
+  assert.equal(fileHasMarkers(path), true)
+})
+
+test('renderAgentsDigest：createIfMissing 默认关闭（手动渲染不造宿主资产）', (t) => {
+  const dir = freshDir(t)
+  const path = join(dir, 'AGENTS.md')
+  const got = renderAgentsDigest({ rules: [doc()], agentsPath: path })
+  assert.equal(got.ok, false)
+  assert.equal(got.code, 'no_markers')
+  assert.equal(existsSync(path), false)
+})
+
+test('renderAgentsDigest：createIfMissing=true 但文件存在且无标记 → 仍不追加', (t) => {
+  const dir = freshDir(t)
+  const path = join(dir, 'AGENTS.md')
+  const content = '# 用户自己的说明书\n\n没有任何管理块。\n'
+  writeFileSync(path, content, 'utf8')
+  const got = renderAgentsDigest({ rules: [doc()], agentsPath: path, createIfMissing: true })
+  assert.equal(got.ok, false)
+  assert.equal(got.code, 'no_markers')
+  assert.equal(readFileSync(path, 'utf8'), content, '用户资产一个字节都不动')
+})
+
+test('renderAgentsDigest：createIfMissing=true 且已有标记 → 正常块内替换，块外不变', (t) => {
+  const dir = freshDir(t)
+  const { path, content } = agentsFile(dir)
+  const got = renderAgentsDigest({
+    rules: [doc({ key: 'iron-rule-41', number: 41 })],
+    agentsPath: path,
+    createIfMissing: true,
+  })
+  assert.equal(got.ok, true, got.code)
+  assert.equal(got.changed, true)
+  assert.equal(got.created, false, '已有文件不应标记为创建')
+  const after = readFileSync(path, 'utf8')
+  assert.ok(after.startsWith('# 本机说明书'), '块外开头保留')
+  assert.match(after, /块外内容最后一行。/)
+  assert.equal(after.replace(/\n/g, '').length > 0, true)
+})
+
+test('renderAgentsDigest：创建后再次渲染幂等（changed=false，mtime 不变，不刷 .bak）', (t) => {
+  const dir = freshDir(t)
+  const path = join(dir, 'AGENTS.md')
+  const rules = [doc({ key: 'iron-rule-42', number: 42 })]
+  const first = renderAgentsDigest({ rules, agentsPath: path, createIfMissing: true })
+  assert.equal(first.created, true)
+  const mtime = statSync(path).mtimeMs
+  const second = renderAgentsDigest({ rules, agentsPath: path, createIfMissing: true })
+  assert.equal(second.ok, true)
+  assert.equal(second.changed, false)
+  assert.equal(second.created, false)
+  assert.equal(statSync(path).mtimeMs, mtime, '内容不变必须保留 mtime')
+  assert.equal(existsSync(`${path}.bak`), false, '创建不是替换，不产生 .bak')
+})
+
+test('renderAgentsDigest：createIfMissing=true 但规则为空 → 不创建空壳管理块', (t) => {
+  const dir = freshDir(t)
+  const path = join(dir, 'AGENTS.md')
+  const got = renderAgentsDigest({ rules: [], agentsPath: path, createIfMissing: true })
+  assert.equal(got.ok, false)
+  assert.equal(got.code, 'no_markers')
+  assert.equal(existsSync(path), false)
+})

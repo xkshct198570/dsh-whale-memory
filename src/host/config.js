@@ -102,6 +102,8 @@ export const Config = z.object({
     // AGENTS 摘要重渲染开关（R3b）：关=只写规则文件，渲染由面板手动触发。
     // 与 enabled/llm 同口径标 volatile：hook/routes 每次现取，改了立即生效，不用重挂。
     renderAgents: z.boolean().default(true).volatile(),
+    // 空机首次启动时若 AGENTS.md 不存在，创建最小管理块（已有文件绝不追加）。
+    createAgentsIfMissing: z.boolean().default(true).volatile(),
     // 作用域规则每轮注入预算（字符；global 不注入，只作 AGENTS 缺标记时的降级）。
     injectChars: z.natural().min(0).max(4000).default(600).volatile(),
   }).default({}),
