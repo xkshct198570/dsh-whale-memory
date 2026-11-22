@@ -6,6 +6,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   buildMergePrompt,
+  chainIssues,
   classifyRelation,
   compileStructured,
   domainOfText,
@@ -13,8 +14,10 @@ import {
   extractSlots,
   guardRewrite,
   mainClauseIntact,
+  modalityOf,
   normalizeForGuard,
   parseMergeReply,
+  resolveChain,
   retainsClause,
   splitConditions,
 } from '../../src/core/rule-reconcile.js'
@@ -116,14 +119,15 @@ test('compileStructured：显式铁律N → key/number 钉死', () => {
 })
 
 test('compileStructured：空号 6 永不复用（nextNumber 正好是 6 → 跳 7）', () => {
-  const got = compileStructured('必须保留审计日志', {}, { source: 'owner', nextNumber: 6 })
+  // 编号只属于 iron-rule（R8-01）：这里用强定规句拿铁律，才能断言占号/跳号。
+  const got = compileStructured('以后都别删审计日志', {}, { source: 'owner', nextNumber: 6 })
   assert.equal(got.ok, true)
   assert.equal(got.draft.number, 7)
 })
 
 test('compileStructured：编号已被占用 → 取下一个空号', () => {
   const existing = [doc({ key: 'rule-1', number: 1 }), doc({ key: 'rule-2', number: 2 })]
-  const got = compileStructured('必须保留审计日志', {}, { source: 'owner', nextNumber: 2, existingRules: existing })
+  const got = compileStructured('以后都别删审计日志', {}, { source: 'owner', nextNumber: 2, existingRules: existing })
   assert.equal(got.ok, true)
   assert.equal(got.draft.number, 3)
 })
@@ -132,7 +136,7 @@ test('compileStructured：refine 沿用旧编号（同 key 已存在）', () => 
   const text = '以后都别删源文件'
   const first = compileStructured(text, {}, { source: 'owner', nextNumber: 5 })
   const existing = [doc({
-    key: first.draft.key, number: 9, type: 'rule', text: first.draft.text,
+    key: first.draft.key, number: 9, type: 'iron-rule', text: first.draft.text,
   })]
   const again = compileStructured(text, {}, { source: 'owner', nextNumber: 10, existingRules: existing })
   assert.equal(again.ok, true)
@@ -637,4 +641,92 @@ test('黄金：标题不是纯动词、≤12 字（面板短名）', () => {
     assert.ok(Array.from(draft.title).length <= 12, `${text} -> ${draft.title}`)
     assert.equal(/(?:^|)删$/.test(draft.title), false, `${text} 标题不能只是动词`)
   }
+})
+
+// ---------------------------------------------------------------------------
+// R8-04：作用域闸 / 模态表 / 链解析
+// ---------------------------------------------------------------------------
+
+test('classifyRelation：跨 scope（workspace A vs B）→ unrelated/new，只在 crossScope 提示', () => {
+  const draft = {
+    key: 'rule-new', text: '源文件必须保留。', scope: 'workspace:/tmp/ws-a', object: '源文件', modality: 'must',
+  }
+  const got = classifyRelation(draft, [
+    doc({ key: 'rule-b', scope: 'workspace:/tmp/ws-b', text: '源文件必须保留。', object: '源文件', modality: 'must' }),
+  ])
+  assert.equal(got.relation, 'new', '没有同 scope 既有规则 → new')
+  assert.deepEqual(got.targets, [])
+  assert.ok(got.crossScope.some((item) => item.key === 'rule-b'), '跨区命中必须进 crossScope 提示')
+})
+
+test('classifyRelation：同 scope 同文 → duplicate；跨 scope 同文不 duplicate', () => {
+  const base = { key: 'rule-a', scope: 'global', text: '源文件必须保留。', object: '源文件', modality: 'must' }
+  const same = classifyRelation({ ...base, key: 'rule-x' }, [doc(base)])
+  assert.equal(same.relation, 'duplicate')
+  const cross = classifyRelation(
+    { ...base, key: 'rule-x', scope: 'workspace:/tmp/ws-a' },
+    [doc(base)],
+  )
+  assert.notEqual(cross.relation, 'duplicate')
+  assert.deepEqual(cross.targets, [])
+})
+
+test('classifyRelation：only vs must 是收窄 → merge（不判 conflict）', () => {
+  const draft = {
+    key: 'rule-new', text: '只能用本地模型。', object: '本地模型', modality: 'only', conditions: [], exceptions: [],
+  }
+  const got = classifyRelation(draft, [
+    doc({ key: 'rule-5', number: 5, text: '必须用本地模型。', object: '本地模型', modality: 'must' }),
+  ])
+  assert.equal(got.relation, 'merge')
+  assert.equal(got.targets[0].key, 'rule-5')
+})
+
+test('modalityOf：单字「别」不得命中「区别/特别/个别」词内（v3.7 误判）', () => {
+  for (const text of ['必须区别对待两份报告', '特别处理过程稿', '个别文件需要复核']) {
+    assert.notEqual(modalityOf(text), 'must_not', text)
+  }
+  // 真否定仍然要认。
+  assert.equal(modalityOf('别删源文件'), 'must_not')
+  assert.equal(modalityOf('以后都别删源文件'), 'must_not')
+})
+
+test('resolveChain：merged_into/superseded_by 传递解析到当前 active 规则', () => {
+  const a = doc({ key: 'rule-a', status: 'superseded', text: 'a' })
+  a.front.merged_into = 'rule-b'
+  const b = doc({ key: 'rule-b', status: 'superseded', text: 'b' })
+  b.front.superseded_by = 'rule-c'
+  const c = doc({ key: 'rule-c', status: 'active', number: 3, text: 'c' })
+  const got = resolveChain([a, b, c], 'rule-a')
+  assert.equal(got.ok, true)
+  assert.deepEqual(got.chain, ['rule-a', 'rule-b', 'rule-c'])
+  assert.equal(got.status, 'active')
+  assert.equal(got.broken, false)
+  assert.equal(got.cycle, false)
+})
+
+test('resolveChain：A→B→A 环 → cycle；chainIssues 报红（给 /rules/health）', () => {
+  const a = doc({ key: 'rule-a', status: 'superseded', text: 'a' })
+  a.front.merged_into = 'rule-b'
+  const b = doc({ key: 'rule-b', status: 'superseded', text: 'b' })
+  b.front.merged_into = 'rule-a'
+  const got = resolveChain([a, b], 'rule-a')
+  assert.equal(got.ok, false)
+  assert.equal(got.cycle, true)
+  const issues = chainIssues([a, b])
+  assert.equal(issues.ok, false)
+  assert.equal(issues.cycles.length, 1, JSON.stringify(issues))
+  assert.ok(issues.cycles[0].chain.includes('rule-a'))
+})
+
+test('resolveChain：指向已删除 key → broken；chainIssues 列出断链', () => {
+  const a = doc({ key: 'rule-a', status: 'superseded', text: 'a' })
+  a.front.superseded_by = 'rule-gone'
+  const got = resolveChain([a], 'rule-a')
+  assert.equal(got.ok, false)
+  assert.equal(got.broken, true)
+  assert.equal(got.missingKey, 'rule-gone')
+  const issues = chainIssues([a])
+  assert.equal(issues.broken.length, 1)
+  assert.equal(issues.broken[0].key, 'rule-a')
 })

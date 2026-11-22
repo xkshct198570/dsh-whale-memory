@@ -75,6 +75,16 @@ function identityFilter(identity) {
   return { sql: clauses.length ? ` AND ${clauses.join(' AND ')}` : '', params }
 }
 
+/** 规则镜像的 origin 前缀（与 rule-mirror.js 的 RULE_ORIGIN_PREFIX 同值）。 */
+const RULE_ORIGIN_PREFIX = 'rule:'
+
+/**
+ * 规则镜像不参与召回（R8-08 / 架构书 §4.3/§4.4）：镜像只做面板检索/审计。
+ * 之前 `identityFilter` 对 `workspace=''` 放行，导致 role/workspace 规则在任意工作区被召回
+ * （`/recall-test` 实测可复现）；这里在 SQL 层直接排除，而不是在打分后再过滤。
+ */
+const RECALL_ORIGIN_FILTER = ` AND (n.origin IS NULL OR n.origin NOT LIKE '${RULE_ORIGIN_PREFIX}%')`
+
 /**
  * 跑一路 FTS（固定 LIMIT 50），把候选按 id 去重并入 map。
  * @param {import('node:sqlite').DatabaseSync} db
@@ -88,7 +98,7 @@ function collectFts(db, table, match, filter, candidates, path = 'L1') {
   const sql =
     `SELECT n.id, n.text, n.level, n.memory_type, n.source, n.created_at, n.last_hit_at, n.context_note ` +
     `FROM ${table} JOIN nodes n ON n.rowid = ${table}.rowid ` +
-    `WHERE ${table} MATCH ? AND n.status = 'active'${filter.sql} ` +
+    `WHERE ${table} MATCH ? AND n.status = 'active'${RECALL_ORIGIN_FILTER}${filter.sql} ` +
     `ORDER BY rank LIMIT ${FTS_LIMIT}`
   let rows
   try {
@@ -127,6 +137,15 @@ function scoreTerms(plan) {
 /** @param {string} level @returns {number} */
 function levelRank(level) {
   return LEVEL[level] ?? LEVEL.normal
+}
+
+/** 规则镜像行 id 集合：扩散路径（relations.js 不返回 origin）按 id 排除，保证召回零规则。 */
+function ruleNodeIds(db) {
+  try {
+    return new Set(db.prepare("SELECT id FROM nodes WHERE origin LIKE 'rule:%'").all().map((row) => String(row.id)))
+  } catch {
+    return new Set()
+  }
 }
 
 /**
@@ -221,13 +240,14 @@ export function search(db, opts = {}) {
   const seen = new Set(hits.map((h) => h.id))
   const relBySeed = new Map(hits.slice(0, 3).map((h) => [h.id, h.rel]))
   if (opts.diffusion !== false && hits.length > 0) {
+    const ruleIds = ruleNodeIds(db)
     for (const row of expandOneHop(db, {
       seeds: hits.slice(0, 3),
       identity: opts.identity,
       minConf: opts.minConf,
       cap: 20,
     })) {
-      if (seen.has(row.id)) continue
+      if (seen.has(row.id) || ruleIds.has(String(row.id))) continue
       seen.add(row.id)
       // 边的方向不固定：via 是种子那一端，另一头才是扩散命中。
       const fromId = String(row.from_id)

@@ -150,8 +150,8 @@ test('坏枚举/保留号/非法 scope → 各自明确错误码', () => {
     [{ modality: 'should' }, 'invalid_modality'],
     [{ priority: 'P9' }, 'invalid_priority'],
     [{ status: 'weird' }, 'invalid_status'],
-    [{ number: 0 }, 'invalid_number'],
-    [{ number: 6 }, 'number_reserved'],
+    [{ type: 'iron-rule', number: 0 }, 'invalid_number'],
+    [{ type: 'iron-rule', number: 6 }, 'number_reserved'],
     [{ scope: 'workspace:relative/path' }, 'scope_workspace_relative'],
     [{ scope: 'role:' }, 'scope_role_invalid'],
     [{ version: 0 }, 'invalid_version'],
@@ -187,7 +187,7 @@ test('manifest 编号：已有 17 → 18；空号 6 永不分配；空仓从 1 �
   assert.equal(nextRuleNumber([17]), 18)
 
   const root = freshRoot(t)
-  assert.equal(writeDoc(root, frontOf({ key: 'rule-5', number: 5 }), '必须执行第五项检查。').ok, true)
+  assert.equal(writeDoc(root, frontOf({ key: 'rule-5', type: 'iron-rule', number: 5 }), '必须执行第五项检查。').ok, true)
   assert.equal(writeDoc(root, frontOf({ key: 'iron-rule-17', type: 'iron-rule', number: 17 }), '必须先验证再覆盖正式库。').ok, true)
   const manifest = JSON.parse(readFileSync(join(root, MANIFEST_FILE), 'utf8'))
   assert.equal(manifest.nextNumber, 18)
@@ -394,7 +394,7 @@ test('purgeRule：安全行 number=0 只删文件、不写墓碑、不压回 nex
 
 test('purgeRule：git 不可用降级 fs.unlinkSync；文件照样删除、commit 记录降级原因', (t) => {
   const root = freshRoot(t)
-  assert.equal(writeDoc(root, frontOf({ key: 'rule-4', number: 4 }), '必须保留审计行。').ok, true)
+  assert.equal(writeDoc(root, frontOf({ key: 'rule-4', type: 'iron-rule', number: 4 }), '必须保留审计行。').ok, true)
   const noGit = () => {
     const err = new Error('spawn git ENOENT')
     err.code = 'ENOENT'
@@ -410,7 +410,7 @@ test('purgeRule：git 不可用降级 fs.unlinkSync；文件照样删除、commi
 
 test('purgeRule：重复 purge → rule_not_found，墓碑不重复堆积', (t) => {
   const root = freshRoot(t)
-  assert.equal(writeDoc(root, frontOf({ key: 'rule-2', number: 2 }), '必须保留审计行。').ok, true)
+  assert.equal(writeDoc(root, frontOf({ key: 'rule-2', type: 'iron-rule', number: 2 }), '必须保留审计行。').ok, true)
   assert.equal(purgeRule({ root, key: 'rule-2' }, { git: false }).ok, true)
   const again = purgeRule({ root, key: 'rule-2' }, { git: false })
   assert.equal(again.ok, false)
@@ -449,7 +449,7 @@ test('key 是路径安全边界：越界 key 在建目录/加锁前就被拒绝'
 test('listRules：坏文件进 errors，不拖垮合法规则', (t) => {
   const root = freshRoot(t)
   assert.equal(writeDoc(root, frontOf(), '必须保留审计行。').ok, true)
-  writeFileSync(join(root, 'broken.md'), '---\nkey: broken\ntype: rule\nnumber: nope\n---\n\n必须保留。\n', 'utf8')
+  writeFileSync(join(root, 'broken.md'), '---\nkey: broken\ntype: iron-rule\nnumber: nope\n---\n\n必须保留。\n', 'utf8')
   const list = listRules(root)
   assert.equal(list.ok, true)
   assert.equal(list.rules.length, 1)
@@ -528,14 +528,14 @@ test('updateRule：git 提交消息为 rule: update <key> v<n>（注入 exec，�
 
 test('updateRule：key/type/number/created 一律 immutable_field，文件不动', (t) => {
   const root = freshRoot(t)
-  assert.equal(writeDoc(root, frontOf(), '必须先验证再覆盖正式库。').ok, true)
+  assert.equal(writeDoc(root, frontOf({ key: 'iron-rule-1', type: 'iron-rule' }), '必须先验证再覆盖正式库。').ok, true)
   for (const field of IMMUTABLE_RULE_FIELDS) {
-    const updated = updateRule({ root, key: 'rule-1', patch: { [field]: field === 'number' ? 2 : 'x' } }, { git: false })
+    const updated = updateRule({ root, key: 'iron-rule-1', patch: { [field]: field === 'number' ? 2 : 'x' } }, { git: false })
     assert.equal(updated.ok, false, `${field} 必须拒绝`)
     assert.equal(updated.error, 'immutable_field')
     assert.equal(updated.detail.field, field)
   }
-  const got = readRule(root, 'rule-1')
+  const got = readRule(root, 'iron-rule-1')
   assert.equal(got.rule.front.number, 1)
   assert.equal(got.rule.front.version, 1)
 })

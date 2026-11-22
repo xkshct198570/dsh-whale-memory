@@ -30,17 +30,19 @@
  * Why 单独成文件：路由文件已 35K，再塞规则读写会继续膨胀；把 payload 纯函数独立出来
  * 还能脱 HTTP 做契约测试（不起真服务器）。
  */
-import { readJson, sendJson } from './http-kit.js'
+import { existsSync } from 'node:fs'
+import { readJson, sendJson, isWriteMethod, writeRequestProblem } from './http-kit.js'
 import { value } from './config-values.js'
 import { detectGit, gitRequired, refreshGit } from './git-detector.js'
 import {
   DIFF_LINE_LIMIT, computeManifest, createRule, defaultRuleRoot, diffLines, ensureRuleRepo, gitLog,
   isValidRuleKey, listRules, purgeRule, reactivateRule, readHistory, readManifest, readRule,
-  resolveRevision, retireRule, revertRule, updateRule,
+  readTombstones, resolveRevision, retireRule, revertRule, updateRule,
 } from '../core/rule-store.js'
 import { importLegacyRule, mirrorRules, mirrorStatus } from '../core/rule-mirror.js'
+import { chainIssues, resolveChain } from '../core/rule-reconcile.js'
 import {
-  applyProposal, createProposal, listProposals, rejectProposal, setSessionPending,
+  applyProposal, createProposal, listProposals, readProposal, rejectProposal, setSessionPending,
 } from '../core/rule-proposal.js'
 import { agentsPathOf, renderAgentsDigest, titleOfRule } from '../core/rule-render.js'
 
@@ -92,6 +94,8 @@ export function rulesListPayload({ root = '', config = {}, detect = detectGit, f
     scope: textOf(doc.front.scope),
     role: textOf(doc.front.role),
     status: textOf(doc.front.status),
+    // `origin` 是「默认铁律」徽标的唯一判据（default:<key>）；列表不带它，面板只能瞎猜。
+    origin: textOf(doc.front.origin),
     updated: textOf(doc.front.updated),
     title: titleOf(doc.front, doc.text),
     excerpt: textOf(doc.text).slice(0, 80),
@@ -191,7 +195,12 @@ export function proposalView(item) {
     },
     guard: { ok: failures.length === 0, failures },
     needsManual: item?.needsManual && typeof item.needsManual === 'object'
-      ? { code: textOf(item.needsManual.code), at: textOf(item.needsManual.at) }
+      ? {
+        code: textOf(item.needsManual.code),
+        at: textOf(item.needsManual.at),
+        failures,
+        ...(item.needsManual.detail ? { detail: textOf(item.needsManual.detail) } : {}),
+      }
       : null,
     applied: item?.applied && typeof item.applied === 'object' ? item.applied : null,
   }
@@ -230,7 +239,8 @@ function legacyCandidateView(doc) {
 export function rulesProposalsPayload({ root = '', config = {}, status = '' } = {}) {
   const dir = root || resolveRulesRoot(config)
   const wanted = textOf(status).split(',').map((s) => s.trim()).filter(Boolean)
-  const jsonItems = listProposals({ rulesDir: dir, config }).proposals.map(proposalView)
+  // `status=pending,needs_manual` 必须同时出现在面板：失败候选不是死数据，用户要能改写重试。
+  const jsonItems = listProposals({ rulesDir: dir, config, status: wanted.join(',') }).proposals.map(proposalView)
   const mdItems = listRules(dir).rules
     .filter((doc) => doc.front.type === 'rule-candidate' || doc.front.status === 'proposal')
     .map(legacyCandidateView)
@@ -255,6 +265,110 @@ export function gitStatusPayload({ config = {}, detect = detectGit } = {}) {
       checkedAt: Number(view?.checkedAt) || Date.now(),
       ...(view?.error ? { error: String(view.error) } : {}),
     },
+  }
+}
+
+/**
+ * 规则库健康检查（只读，不写盘、不修自愈）：文件 ↔ manifest ↔ retired 墓碑 ↔ 编号/key 一致性。
+ *
+ * Why 200+ok:false：这是监控探针，调用方要能一次拿到全部 failures 做巡检图表；
+ * HTTP 层失败只留给「接口不存在/未授权」，业务不一致用 body 表达（与 render no_markers 同口径）。
+ *
+ * @param {{root?:string,config?:any,detect?:Function}} [args]
+ * @returns {object}
+ */
+export function rulesHealthPayload({ root = '', config = {}, detect = detectGit } = {}) {
+  const dir = root || resolveRulesRoot(config)
+  const list = listRules(dir)
+  const manifest = readManifest(dir)
+  const tombstones = readTombstones(dir)
+  const failures = []
+  const push = (code, extra = {}) => failures.push({ code, ...extra })
+
+  // ① 文件层：解析/校验失败、key≠文件名、编号重复都由 listRules 归到 errors。
+  // validateRule 的具体原因在 detail[].code（duplicate_number/number_reserved/…），必须摊平，
+  // 否则巡检只能看到笼统的 invalid_rule，等于没报出到底是撞号还是保留号。
+  for (const item of list.errors) {
+    push(textOf(item.error) || 'invalid_rule', { file: textOf(item.file), detail: item.detail })
+    if (Array.isArray(item.detail)) {
+      for (const error of item.detail) {
+        const code = textOf(error?.code)
+        if (code && code !== textOf(item.error)) {
+          push(code, { file: textOf(item.file), field: textOf(error?.field), detail: error?.message })
+        }
+      }
+    }
+  }
+
+  // ② manifest 与磁盘文件对账（manifest 是墓碑唯一真源，内容漂移必须报）。
+  if (!manifest) {
+    push('manifest_missing', { file: `${dir}/manifest.json` })
+  } else {
+    const computed = computeManifest(list.rules, manifest.retired)
+    if (Number(manifest.total) !== computed.total) {
+      push('manifest_total_mismatch', { expected: computed.total, actual: Number(manifest.total) })
+    }
+    if (Number(manifest.nextNumber) !== computed.nextNumber) {
+      push('manifest_next_number_mismatch', { expected: computed.nextNumber, actual: Number(manifest.nextNumber) })
+    }
+    const liveKeys = list.rules.map((doc) => textOf(doc.front.key)).sort()
+    const manifestKeys = (Array.isArray(manifest.keys) ? manifest.keys : []).map((key) => textOf(key)).sort()
+    if (liveKeys.join('\n') !== manifestKeys.join('\n')) {
+      push('manifest_keys_mismatch', {
+        missing: liveKeys.filter((key) => !manifestKeys.includes(key)),
+        extra: manifestKeys.filter((key) => !liveKeys.includes(key)),
+      })
+    }
+    const manifestRetired = (Array.isArray(manifest.retired) ? manifest.retired : [])
+      .map((item) => ({ key: textOf(item?.key), number: Number(item?.number) }))
+      .sort((a, b) => a.number - b.number || a.key.localeCompare(b.key))
+    const diskRetired = tombstones.map((item) => ({ key: item.key, number: item.number }))
+    if (manifestRetired.length !== diskRetired.length
+      || manifestRetired.some((item, index) => item.number !== diskRetired[index].number || item.key !== diskRetired[index].key)) {
+      push('retired_mismatch', { manifest: manifestRetired, retiredDir: diskRetired })
+    }
+  }
+
+  // ③ 合并/取代链：断链、环、链终点非 active 都必须报（注入/摘要只该用 terminal+active）。
+  const chains = chainIssues(list.rules)
+  for (const item of chains.broken) {
+    push('chain_broken', { key: textOf(item.key), missingKey: textOf(item.missingKey), chain: item.chain })
+  }
+  for (const item of chains.cycles) {
+    push('chain_cycle', { key: textOf(item.key), chain: item.chain })
+  }
+  for (const doc of list.rules) {
+    const key = textOf(doc.front.key)
+    const pointer = textOf(doc.front.merged_into) || textOf(doc.front.superseded_by)
+    if (!pointer) continue
+    const resolved = resolveChain(list.rules, key)
+    // 断链/环已在上面报过，这里只报「链能走通但终点不是 active」。
+    if (resolved.ok && resolved.status !== 'active') {
+      push('chain_target_inactive', { key, chain: resolved.chain, status: resolved.status })
+    }
+  }
+
+  // ④ 墓碑编号不得被现存铁律复活（writeRule 不拦恢复默认，必须在巡检里红）。
+  const retiredNumbers = new Set(tombstones.map((item) => item.number))
+  for (const doc of list.rules) {
+    const n = Number(doc.front.number)
+    if (doc.front.type === 'iron-rule' && Number.isInteger(n) && n > 0 && retiredNumbers.has(n)) {
+      push('retired_number_reused', { key: textOf(doc.front.key), number: n })
+    }
+  }
+
+  return {
+    ok: failures.length === 0,
+    dir,
+    failures,
+    counts: {
+      rules: list.rules.length,
+      errors: list.errors.length,
+      tombstones: tombstones.length,
+      nextNumber: manifest ? Number(manifest.nextNumber) : null,
+    },
+    git: gitView({ config, detect }),
+    checkedAt: Date.now(),
   }
 }
 
@@ -332,6 +446,8 @@ export async function applyPayload({
   const result = await applyProposal({
     id,
     decisions,
+    // 面板先调 /rules/plan 拿 planHash，apply 只认指纹：不一致由 core 返回 plan_hash_mismatch（409）。
+    planHash: textOf(body?.planHash),
     identity: body?.identity && typeof body.identity === 'object' ? body.identity : {},
     traceId: textOf(body?.traceId),
     rulesDir: dir,
@@ -355,6 +471,106 @@ export async function applyPayload({
     detail: result.detail,
     rolledBack: result.rolledBack,
     proposal: result.proposal ? proposalView(result.proposal) : undefined,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// R8-09：plan 预览 / 恢复默认 / 能力探测（契约保留，core 未上线时显式降级）
+// ---------------------------------------------------------------------------
+
+/** 规则 plan 模块（task-2 新增 `src/core/rule-plan.js`）；未上线返回 null，不抛。 */
+async function loadRulePlan() {
+  try {
+    const mod = await import('../core/rule-plan.js')
+    return mod && typeof mod.buildApplyPlan === 'function' ? mod : null
+  } catch {
+    return null
+  }
+}
+
+/** 默认规则恢复函数（task-1 可能提供）；按常见命名探测，未提供返回 null。 */
+async function loadDefaultRestore() {
+  try {
+    const mod = await import('../core/rule-defaults.js')
+    for (const name of ['restoreDefaultRule', 'restoreRuleDefault', 'restoreDefault']) {
+      if (typeof mod?.[name] === 'function') return mod[name]
+    }
+  } catch { /* 模块不可用按「未提供」处理 */ }
+  return null
+}
+
+/**
+ * 面板能力探测：`GET /rules` 带 capabilities，客户端据此**隐藏**尚未上线能力的入口
+ * （恢复默认按钮、plan 预览），而不是点了才报 501。
+ * @returns {Promise<{plan:boolean,restoreDefault:boolean}>}
+ */
+export async function rulesCapabilities() {
+  const plan = existsSync(new URL('../core/rule-plan.js', import.meta.url))
+  const restore = await loadDefaultRestore()
+  return { plan, restoreDefault: Boolean(restore) }
+}
+
+/**
+ * 应用计划预览：调 task-2 的纯函数 buildApplyPlan，不写盘。
+ * core 未导出时返回 `plan_unavailable`（路由 501），接口契约保持不变。
+ *
+ * @param {{root?:string,config?:any,body?:object,detect?:Function,log?:Function,now?:number}} args
+ * @returns {Promise<object>}
+ */
+export async function planPayload({
+  root = '', config = {}, body = {}, detect = detectGit, log = () => {}, now = Date.now(),
+} = {}) {
+  const guard = writeGuard(config, detect)
+  if (!guard.ok) return { ok: false, error: guard.error, git: guard.git }
+  const dir = root || resolveRulesRoot(config)
+  const id = textOf(body?.id).trim()
+  if (!id) return { ok: false, error: 'proposal_not_found' }
+  const got = readProposal({ rulesDir: dir, config, id })
+  if (!got.ok) return { ok: false, error: 'proposal_not_found' }
+  const planMod = await loadRulePlan()
+  if (!planMod) return { ok: false, error: 'plan_unavailable', degraded: true }
+  const decisions = body?.decisions && typeof body.decisions === 'object' ? body.decisions : {}
+  try {
+    const out = planMod.buildApplyPlan({
+      proposal: got.proposal, rulesDir: dir, config, decisions, now, log,
+    })
+    if (out && out.ok) return { ok: true, dir, id, plan: out.plan }
+    return {
+      ok: false,
+      error: textOf(out?.error) || 'rule_guard_failed',
+      failures: Array.isArray(out?.failures) ? out.failures : undefined,
+      needsManual: out?.needsManual,
+    }
+  } catch (err) {
+    log(`[whale-memory] rules plan failed: ${err?.message || err}`)
+    return { ok: false, error: 'plan_failed', detail: String(err?.message || err) }
+  }
+}
+
+/**
+ * 单条规则从包内默认恢复（task-1 的 default 播种能力）；未提供时 501 降级。
+ * @param {{root?:string,config?:any,body?:object,detect?:Function,git?:boolean,exec?:Function,
+ *   log?:Function,now?:number}} args
+ * @returns {Promise<object>}
+ */
+export async function restoreDefaultPayload({
+  root = '', config = {}, body = {}, detect = detectGit, git = true, exec = null,
+  log = () => {}, now = Date.now(),
+} = {}) {
+  const guard = writeGuard(config, detect)
+  if (!guard.ok) return { ok: false, error: guard.error, git: guard.git }
+  const key = textOf(body?.key).trim()
+  if (!isValidRuleKey(key)) return { ok: false, error: 'invalid_key' }
+  const restore = await loadDefaultRestore()
+  if (!restore) return { ok: false, error: 'restore_unavailable', degraded: true }
+  const dir = root || resolveRulesRoot(config)
+  try {
+    const out = await restore({ root: dir, key, git, exec, now, log, config })
+    if (out && out.ok === false) return { ok: false, error: textOf(out.error) || 'restore_failed', detail: out.detail }
+    return { ok: true, dir, key, restored: out?.rule ? ruleView(out.rule) : undefined, ...(out || {}) }
+  } catch (err) {
+    log(`[whale-memory] rules restore-default failed: ${err?.message || err}`)
+    return { ok: false, error: 'restore_failed', detail: String(err?.message || err) }
   }
 }
 
@@ -999,6 +1215,8 @@ export function rejectPayload({ root = '', config = {}, body = {}, now = Date.no
  */
 export function renderAgentsPayload({ root = '', config = {}, log = () => {} } = {}) {
   if (value(config?.rules?.enabled, true) === false) return { ok: false, error: 'rules_disabled' }
+  // 架构书 §4.1：rules.renderAgents=false 时自愈与手动渲染都跳过（手动重渲染不得绕过开关）。
+  if (value(config?.rules?.renderAgents, true) === false) return { ok: false, error: 'render_disabled' }
   const dir = root || resolveRulesRoot(config)
   const result = renderAgentsDigest({ rules: dir, agentsPath: agentsPathOf(dir), log })
   return { ok: Boolean(result.ok), dir, code: textOf(result.code), changed: Boolean(result.changed), count: Number(result.count) || 0 }
@@ -1082,11 +1300,19 @@ function statusQuery(req) {
  */
 function statusForError(code) {
   if (code === 'proposal_not_found' || code === 'rule_not_found' || code === 'rev_not_found') return 404
-  if (code === 'rules_disabled' || code === 'git_required') return 403
+  if (code === 'rules_disabled' || code === 'render_disabled' || code === 'git_required'
+    || code === 'cross_origin_denied') return 403
+  if (code === 'plan_unavailable' || code === 'restore_unavailable') return 501
   if (code === 'proposal_not_pending' || code === 'rule_locked') return 409
+  // 计划 CAS/墓碑/目标冲突都是并发语义：面板重试前必须先重新 plan。
+  if (code === 'plan_hash_mismatch' || code === 'plan_stale' || code === 'number_retired'
+    || code === 'target_conflict' || code === 'target_missing' || code === 'affected_missing') return 409
+  if (code === 'lock_failed') return 503
+  if (code === 'number_exhausted' || code === 'txn_failed') return 422
   // 幂等动作的"没动"是冲突语义：已停用再停用 / 未停用却恢复 / 同 key 重建，都不该按 400 报。
   if (code === 'already_retired' || code === 'not_retired' || code === 'duplicate_rule') return 409
   if (code === 'diff_too_large') return 413
+  if (code === 'unsupported_media_type') return 415
   if (code === 'rule_guard_failed' || code === 'needs_manual' || code === 'llm_unavailable'
     || code === 'llm_unparseable' || code === 'llm_error' || code === 'commit_failed'
     || code === 'write_failed' || code === 'affected_write_failed' || code === 'invalid_rule'
@@ -1106,10 +1332,24 @@ function statusForError(code) {
  */
 export async function handleRules({
   req, res, path, config, backend, detect = detectGit, log = () => {}, getLlm = () => null, git = true,
+  invalidateCache = () => {},
 }) {
   const p = textOf(path)
+  // 规则端点自带一次写闸：即使被独立挂载（不经 routes.js dispatch），跨源 text/plain 也进不来。
+  if (isWriteMethod(req.method)) {
+    const problem = writeRequestProblem(req)
+    if (problem) { sendJson(res, problem.status, { ok: false, error: problem.error }); return true }
+  }
+  /** 写成功后清召回缓存：面板写完，下一步注入必须看到新规则（不新鲜 30s 缓存）。 */
+  const afterWrite = (payload) => {
+    if (payload && payload.ok) {
+      try { invalidateCache() } catch { /* 缓存清理失败不回滚已落盘的规则 */ }
+    }
+    return payload
+  }
   const listPath = `${RULES_PREFIX}/rules`
   const gitPath = `${RULES_PREFIX}/rules/git-status`
+  const healthPath = `${RULES_PREFIX}/rules/health`
   const rebuildPath = `${RULES_PREFIX}/rules/rebuild-mirror`
   const importPath = `${RULES_PREFIX}/rules/import-legacy`
   const proposePath = `${RULES_PREFIX}/rules/propose`
@@ -1117,6 +1357,8 @@ export async function handleRules({
   const rejectPath = `${RULES_PREFIX}/rules/reject`
   const renderPath = `${RULES_PREFIX}/rules/render-agents`
   const proposalsPath = `${RULES_PREFIX}/rules/proposals`
+  const planPath = `${RULES_PREFIX}/rules/plan`
+  const restorePath = `${RULES_PREFIX}/rules/restore-default`
   const diffPath = `${RULES_PREFIX}/rules/diff`
   const versionsPath = `${RULES_PREFIX}/rules/versions`
   const updatePath = `${RULES_PREFIX}/rules/update`
@@ -1126,7 +1368,9 @@ export async function handleRules({
 
   if (p === listPath) {
     if (req.method !== 'GET') { sendMethodNotAllowed(res, 'GET'); return true }
-    sendJson(res, 200, rulesListPayload({ config, detect }))
+    // capabilities 让客户端**隐藏**还没上线的入口（恢复默认/plan），而不是点了才 501。
+    const capabilities = await rulesCapabilities()
+    sendJson(res, 200, { ...rulesListPayload({ config, detect }), capabilities })
     return true
   }
 
@@ -1138,9 +1382,36 @@ export async function handleRules({
     return true
   }
 
+  if (p === healthPath) {
+    if (req.method !== 'GET') { sendMethodNotAllowed(res, 'GET'); return true }
+    // 巡检探针：业务不一致也回 200，ok:false + failures[] 交给调用方（文档口径一致）。
+    sendJson(res, 200, rulesHealthPayload({ config, detect }))
+    return true
+  }
+
   if (p === proposalsPath) {
     if (req.method !== 'GET') { sendMethodNotAllowed(res, 'GET'); return true }
     sendJson(res, 200, rulesProposalsPayload({ config, status: statusQuery(req) }))
+    return true
+  }
+
+  if (p === planPath) {
+    if (req.method !== 'POST') { sendMethodNotAllowed(res, 'POST'); return true }
+    const body = await readJson(req)
+    if (!body.ok) { sendJson(res, body.status, { ok: false, error: body.error }); return true }
+    const payload = await planPayload({ config, body: body.value, detect, log })
+    sendJson(res, payload.ok ? 200 : statusForError(textOf(payload.error)), payload)
+    return true
+  }
+
+  if (p === restorePath) {
+    if (req.method !== 'POST') { sendMethodNotAllowed(res, 'POST'); return true }
+    const body = await readJson(req)
+    if (!body.ok) { sendJson(res, body.status, { ok: false, error: body.error }); return true }
+    const payload = afterWrite(await restoreDefaultPayload({ config, backend, body: body.value, detect, git, log }))
+    // 恢复默认的 key 是入参：非法 key 属于参数问题（422），不是「未知错误」的 400。
+    const status = payload.ok ? 200 : (payload.error === 'invalid_key' ? 422 : statusForError(textOf(payload.error)))
+    sendJson(res, status, payload)
     return true
   }
 
@@ -1173,14 +1444,14 @@ export async function handleRules({
     if (req.method !== 'POST') { sendMethodNotAllowed(res, 'POST'); return true }
     const body = await readJson(req)
     if (!body.ok) { sendJson(res, body.status, { ok: false, error: body.error }); return true }
-    const payload = updatePayload({
+    const payload = afterWrite(updatePayload({
       config,
       backend,
       body: body.value,
       detect,
       git,
       log,
-    })
+    }))
     sendJson(res, payload.ok ? 200 : statusForError(textOf(payload.error)), payload)
     return true
   }
@@ -1189,14 +1460,14 @@ export async function handleRules({
     if (req.method !== 'POST') { sendMethodNotAllowed(res, 'POST'); return true }
     const body = await readJson(req)
     if (!body.ok) { sendJson(res, body.status, { ok: false, error: body.error }); return true }
-    const payload = revertPayload({
+    const payload = afterWrite(revertPayload({
       config,
       backend,
       body: body.value,
       detect,
       git,
       log,
-    })
+    }))
     sendJson(res, payload.ok ? 200 : statusForError(textOf(payload.error)), payload)
     return true
   }
@@ -1205,14 +1476,14 @@ export async function handleRules({
     if (req.method !== 'POST') { sendMethodNotAllowed(res, 'POST'); return true }
     const body = await readJson(req)
     if (!body.ok) { sendJson(res, body.status, { ok: false, error: body.error }); return true }
-    const payload = createPayload({
+    const payload = afterWrite(createPayload({
       config,
       backend,
       body: body.value,
       detect,
       git,
       log,
-    })
+    }))
     sendJson(res, payload.ok ? 200 : statusForError(textOf(payload.error)), payload)
     return true
   }
@@ -1221,14 +1492,14 @@ export async function handleRules({
     if (req.method !== 'POST') { sendMethodNotAllowed(res, 'POST'); return true }
     const body = await readJson(req)
     if (!body.ok) { sendJson(res, body.status, { ok: false, error: body.error }); return true }
-    const payload = deletePayload({
+    const payload = afterWrite(deletePayload({
       config,
       backend,
       body: body.value,
       detect,
       git,
       log,
-    })
+    }))
     sendJson(res, payload.ok ? 200 : statusForError(textOf(payload.error)), payload)
     return true
   }
@@ -1246,7 +1517,7 @@ export async function handleRules({
     if (req.method !== 'POST') { sendMethodNotAllowed(res, 'POST'); return true }
     const body = await readJson(req)
     if (!body.ok) { sendJson(res, body.status, { ok: false, error: body.error }); return true }
-    const payload = await applyPayload({
+    const payload = afterWrite(await applyPayload({
       config,
       backend,
       body: body.value,
@@ -1254,7 +1525,7 @@ export async function handleRules({
       getLlm,
       git,
       log,
-    })
+    }))
     sendJson(res, payload.ok ? 200 : statusForError(textOf(payload.error)), payload)
     return true
   }
@@ -1271,7 +1542,9 @@ export async function handleRules({
   if (p === renderPath) {
     if (req.method !== 'POST') { sendMethodNotAllowed(res, 'POST'); return true }
     await readJson(req)
-    sendJson(res, 200, renderAgentsPayload({ config, log }))
+    const payload = afterWrite(renderAgentsPayload({ config, log }))
+    // no_markers/duplicate_markers 是幂等「没动」，200 带 ok:false；闸门类错误才按 403。
+    sendJson(res, payload.error ? statusForError(textOf(payload.error)) : 200, payload)
     return true
   }
 
@@ -1280,7 +1553,7 @@ export async function handleRules({
     // 无载荷动作：仍要排空 body，避免 keep-alive 连接残留请求体；空 body 不算错误。
     await readJson(req)
     const payload = rebuildMirrorPayload({ config, backend, detect, log })
-    sendJson(res, payload.ok ? 200 : 403, payload)
+    sendJson(res, payload.ok ? 200 : statusForError(textOf(payload.error)), payload)
     return true
   }
 
@@ -1291,17 +1564,24 @@ export async function handleRules({
       sendJson(res, body.status, { ok: false, error: body.error })
       return true
     }
-    const key = textOf(body.value?.key).trim().slice(0, 64)
+    const rawKey = textOf(body.value?.key).trim()
+    // 非法 key 不再静默截断：422 让调用方知道是参数问题；未给 key 时按旧铁律节点推导。
+    if (rawKey && !isValidRuleKey(rawKey.slice(0, 64))) {
+      sendJson(res, 422, { ok: false, error: 'invalid_key' })
+      return true
+    }
+    const key = rawKey.slice(0, 64)
     const rawNumber = Number(body.value?.number)
-    const payload = importLegacyPayload({
+    const payload = afterWrite(importLegacyPayload({
       config,
       backend,
       key,
       number: Number.isInteger(rawNumber) && rawNumber > 0 ? rawNumber : null,
       detect,
       log,
-    })
-    sendJson(res, payload.ok ? 200 : 403, payload)
+    }))
+    // 404=节点不存在、409=重复、422=未通过校验；不再把管理动作一律按 403 报。
+    sendJson(res, payload.ok ? 200 : statusForError(textOf(payload.error)), payload)
     return true
   }
 

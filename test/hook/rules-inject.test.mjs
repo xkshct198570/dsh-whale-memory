@@ -4,13 +4,13 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync, readdirSync, existsSync, readFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync, readdirSync, existsSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { installHook, buildRulesPrefix, scopeMatches } from '../../src/host/hook.js'
 import { writeRule } from '../../src/core/rule-store.js'
 import { RULES_BEGIN, RULES_END } from '../../src/core/rule-render.js'
-import { listProposals, rejectProposal, resetSessionPending } from '../../src/core/rule-proposal.js'
+import { listProposals, proposalNonce, rejectProposal, resetSessionPending } from '../../src/core/rule-proposal.js'
 
 /** 假 ctx：on/systemPrompt/effect/setTimeout/get；定时器同步执行，让提案链路可断言。 */
 function fakeCtx({ inlineTimers = true } = {}) {
@@ -251,7 +251,8 @@ test('hook：owner 规则句 → 本轮 context 追加一条候选提示 + 候�
   await state.pre(preStepPayload('s1', '以后都别删源文件'), async () => ({ kind: 'enter' }))
   const text = contextText(state)
   assert.equal((text.match(/【规则候选】/g) || []).length, 1, '每会话每轮最多一条')
-  assert.match(text, /请在回复末尾用一句话询问用户是否收进铁律/)
+  // R8-05：提示行由 buildProposalAskLine 生成，必须带可执行 nonce（不是"去问用户"）。
+  assert.match(text, /回复「收录 p[0-9a-z]{8}」确认收进铁律/)
   const proposals = listProposals({ rulesDir }).proposals
   assert.equal(proposals.length, 1)
   assert.equal(proposals[0].status, 'pending')
@@ -290,7 +291,10 @@ test('hook：确认短语 → 下一轮自动收录，context 给【规则已收
   t.after(() => hook.dispose())
   await state.pre(preStepPayload('s1', '以后都别删源文件'), async () => ({ kind: 'enter' }))
   assert.equal(listProposals({ rulesDir }).proposals[0].status, 'pending')
-  await state.pre(preStepPayload('s1', '确认'), async () => ({ kind: 'enter' }))
+  // R8-05 契约变更：只认「收录 <id8>」nonce（原「确认」断言作废）。
+  const nonce = proposalNonce(listProposals({ rulesDir }).proposals[0])
+  assert.match(nonce, /^p[0-9a-z]{8}$/)
+  await state.pre(preStepPayload('s1', `收录 ${nonce}`), async () => ({ kind: 'enter' }))
   const text = contextText(state)
   assert.match(text, /【规则已收录】/)
   assert.deepEqual(readdirSync(rulesDir).filter((n) => n.endsWith('.md') && n.toLowerCase() !== 'readme.md').length, 1)
@@ -307,7 +311,8 @@ test('hook：需要改写且无模型 → 【规则待人工处理】并转面�
   const pending = listProposals({ rulesDir, status: 'pending' }).proposals
   assert.equal(pending.length, 1)
   assert.equal(pending[0].relation.relation, 'merge')
-  await state.pre(preStepPayload('s1', '确认'), async () => ({ kind: 'enter' }))
+  // R8-05 契约变更：确认句必须带 nonce，否则不会进入 apply。
+  await state.pre(preStepPayload('s1', `收录 ${proposalNonce(pending[0])}`), async () => ({ kind: 'enter' }))
   const text = contextText(state)
   assert.match(text, /【规则待人工处理】/)
   assert.match(text, /面板确认/)
@@ -388,4 +393,114 @@ test('hook：规则写入不破坏采纳结算（recallId/markRecallUsed 仍按�
   state.handlers['agent/turn-stopping']({ agent: { session: { id: 's1' } } })
   assert.deepEqual(used, [[3, true]])
   assert.equal(readFileSync(join(rulesDir, 'rule-role.md'), 'utf8').includes('只审不施工'), true)
+})
+
+// ---------------------------------------------------------------------------
+// R8-07：预算关闭 / 排序 / 缓存键 / win32 路径
+// ---------------------------------------------------------------------------
+
+test('buildRulesPrefix：injectChars=0 = 关闭注入（不是无限预算）', (t) => {
+  const { rulesDir } = freshHome(t)
+  seed(rulesDir, { key: 'rule-role', number: 1, scope: 'role:reviewer' }, '必须只审不施工。')
+  const got = buildRulesPrefix({
+    identity: { roleId: 'reviewer' }, rulesDir, config: cfgOf(rulesDir, {}, { injectChars: 0 }),
+  })
+  assert.equal(got.text, '', '0 预算必须注入空串')
+  assert.deepEqual(got.keys, [])
+  assert.equal(got.mode, 'off')
+  assert.equal(got.disabled, true)
+})
+
+test('hook：injectChars=0 时 role 规则不进 context（召回照常）', async (t) => {
+  const { rulesDir } = freshHome(t)
+  seed(rulesDir, { key: 'rule-role', number: 1, scope: 'role:reviewer' }, '必须只审不施工。')
+  const { ctx, state } = fakeCtx()
+  const hook = installHook(ctx, {
+    backend: quietBackend(),
+    config: cfgOf(rulesDir, { roleId: 'reviewer' }, { injectChars: 0 }),
+  })
+  t.after(() => hook.dispose())
+  await state.pre(preStepPayload('s1', '看看'), async () => ({ kind: 'enter' }))
+  const text = contextText(state)
+  assert.equal(text.includes('【规则·'), false)
+  assert.match(text, /【你想到的旧事】/, '关闭规则注入不得连召回一起关掉')
+})
+
+test('buildRulesPrefix：排序=铁律编号 → priority → key（priority 真正参与）', (t) => {
+  const { rulesDir } = freshHome(t)
+  // 直接给规则数组：普通规则 number=null（R8-01 契约），不依赖 store 对无编号规则的写入闸。
+  // 普通规则：key 序（a < z）与 priority 序相反，必须 priority 优先。
+  const rules = [
+    { front: ruleFront({ key: 'rule-a-p2', number: null, scope: 'role:r1', priority: 'P2' }), text: '必须第二执行。' },
+    { front: ruleFront({ key: 'rule-z-p0', number: null, scope: 'role:r1', priority: 'P0' }), text: '必须第一执行。' },
+    // 铁律：编号序压过 priority。
+    { front: ruleFront({ key: 'iron-rule-12', number: 12, type: 'iron-rule', scope: 'role:r1', priority: 'P2' }), text: '必须铁律十二。' },
+    { front: ruleFront({ key: 'iron-rule-5', number: 5, type: 'iron-rule', scope: 'role:r1', priority: 'P3' }), text: '必须铁律五。' },
+  ]
+  const got = buildRulesPrefix({
+    identity: { roleId: 'r1' }, rulesDir, rules, config: cfgOf(rulesDir), budget: 4000,
+  })
+  assert.deepEqual(got.keys, ['iron-rule-5', 'iron-rule-12', 'rule-z-p0', 'rule-a-p2'])
+})
+
+test('hook：缓存键含预算 + 规则文件最大 mtime（改预算/原地改正文都生效）', async (t) => {
+  const { rulesDir } = freshHome(t)
+  seed(rulesDir, { key: 'rule-role', number: 1, scope: 'role:reviewer' }, '必须只审不施工。')
+  const { ctx, state } = fakeCtx()
+  const config = cfgOf(rulesDir, { roleId: 'reviewer' })
+  const hook = installHook(ctx, { backend: quietBackend(), config })
+  t.after(() => hook.dispose())
+  const rulesKeys = () => [...hook.cache.keys()].filter((key) => String(key).startsWith('#rules|'))
+
+  await state.pre(preStepPayload('s1', '一'), async () => ({ kind: 'enter' }))
+  assert.match(contextText(state), /必须只审不施工。/)
+  const firstKeys = rulesKeys()
+  assert.equal(firstKeys.length, 1)
+
+  // 改预算 → 换键（1s 内生效，不需要重启/清缓存）。
+  config.rules.injectChars = 20
+  await state.pre(preStepPayload('s1', '二'), async () => ({ kind: 'enter' }))
+  assert.ok(rulesKeys().length >= 2, '预算必须进缓存键')
+  assert.ok(Array.from(contextText(state).replace('【规则·role:reviewer】', '')).length <= 20, '新预算立即生效')
+
+  config.rules.injectChars = 600
+  await state.pre(preStepPayload('s1', '三'), async () => ({ kind: 'enter' }))
+  // 原地改正文：目录 mtime 不变，只有文件 mtime 变——缓存键必须能发现。
+  const file = join(rulesDir, 'rule-role.md')
+  writeFileSync(file, readFileSync(file, 'utf8').replace('必须只审不施工。', '必须只审不施工并留档。'), 'utf8')
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  await state.pre(preStepPayload('s1', '四'), async () => ({ kind: 'enter' }))
+  assert.match(contextText(state), /并留档/, '文件最大 mtime 必须进缓存键')
+})
+
+test('hook：规则缓存 TTL 淘汰（过期 #rules 条目被清扫）', async (t) => {
+  const { rulesDir } = freshHome(t)
+  seed(rulesDir, { key: 'rule-role', number: 1, scope: 'role:reviewer' }, '必须只审不施工。')
+  const { ctx, state } = fakeCtx()
+  const hook = installHook(ctx, { backend: quietBackend(), config: cfgOf(rulesDir, { roleId: 'reviewer' }) })
+  t.after(() => hook.dispose())
+  hook.cache.set('#rules|v2|expired', { text: '过期', exp: Date.now() - 1000, meta: {} })
+  await state.pre(preStepPayload('s1', '看看'), async () => ({ kind: 'enter' }))
+  assert.equal(hook.cache.has('#rules|v2|expired'), false, 'TTL 过期必须淘汰')
+})
+
+test('scopeMatches：win32 大小写/分隔符归一；posix 大小写敏感；软链按 realpath 命中', (t) => {
+  const { home } = freshHome(t)
+  const win32 = { platform: 'win32', realpath: false }
+  assert.equal(scopeMatches('workspace:C:\\Work\\App', '', 'c:/work/app/sub', win32), true)
+  assert.equal(scopeMatches('workspace:c:/work/app', '', 'C:\\Work\\App\\sub', win32), true)
+  assert.equal(scopeMatches('workspace:C:\\Work\\App', '', 'c:/work/app2', win32), false)
+  assert.equal(scopeMatches('workspace:C:\\Work\\App', '', 'c:/work/app/sub', { platform: 'linux', realpath: false }), false,
+    '非 win32 不得大小写不敏感')
+  assert.equal(scopeMatches('workspace:/tmp/ws\\', '', '/tmp/ws/sub', { realpath: false }), true, '分隔符必须归一')
+
+  const real = join(home, 'real-ws')
+  mkdirSync(real, { recursive: true })
+  const link = join(home, 'link-ws')
+  try {
+    symlinkSync(real, link, 'dir')
+  } catch {
+    return // 平台不允许软链（如无权限的 Windows）：跳过该断言
+  }
+  assert.equal(scopeMatches(`workspace:${link}`, '', real), true, '软链与真实目录必须视为同一工作区')
 })

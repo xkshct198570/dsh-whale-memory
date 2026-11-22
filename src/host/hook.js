@@ -17,13 +17,15 @@
  * Why 规则走同一个 context：新开 section 会抢 `whale-memory:recall` 之外的位置与名字，
  * 且预算/清理/失败开放要再做一遍；复用同一段文本，等于复用同一套缓存与降级路径。
  */
-import { statSync } from 'node:fs'
+import { readdirSync, realpathSync, statSync } from 'node:fs'
+import { join } from 'node:path'
 import { deriveWorkspace, resolveIdentity } from './identity.js'
 import { bool, num, value } from './config-values.js'
 import { judgeReply } from '../core/adoption.js'
 import { listRules } from '../core/rule-store.js'
 import { agentsPathOf, fileHasMarkers } from '../core/rule-render.js'
 import {
+  buildProposalAskLine,
   confirmPendingForSession,
   createProposal,
   resolveRuleRoot,
@@ -92,21 +94,43 @@ function chars(text) {
 }
 
 /**
+ * 作用域路径归一（R8-07）：分隔符统一 `/`、存在时取 `realpath`、去尾斜杠、
+ * Windows 全小写（盘符/大小写不敏感）。
+ *
+ * Why realpath：规则里写给用户的是「他看的路径」，会话 cwd 可能是同一目录的软链/短路径；
+ * 不归一会假不匹配。realpath 失败（路径不存在）时保留原值，绝不因为路径不在就丢掉规则。
+ *
+ * @param {string} value @param {{platform?:string, realpath?:boolean}} [opts]
+ *   platform 缺省 `process.platform`（测试可注入 'win32' 验证大小写口径）。
+ * @returns {string}
+ */
+export function normalizeScopePath(value, opts = {}) {
+  const platform = textOf(opts.platform || process.platform)
+  let out = trimmed(value).replace(/\\/g, '/')
+  if (opts.realpath !== false) {
+    try { out = realpathSync(out).replace(/\\/g, '/') } catch { /* 路径不存在：保留原样 */ }
+  }
+  out = out.replace(/\/+$/, '')
+  return platform === 'win32' ? out.toLowerCase() : out
+}
+
+/**
  * 作用域匹配：`role:` 严格相等；`workspace:` 精确或前缀目录（`path/` 下）。
  * 为什么不比较派生后的 workspace：规则里存的是绝对路径，identity.workspace 也是同一口径
  * 的派生值；再派生一次只会把超长路径压缩成 h:hash 而假不匹配（架构书 §3.4）。
  * @param {string} scope @param {string} roleId @param {string} workspace
+ * @param {{platform?:string, realpath?:boolean}} [opts] 路径归一选项（win32 大小写可测）
  * @returns {boolean}
  */
-export function scopeMatches(scope, roleId, workspace) {
+export function scopeMatches(scope, roleId, workspace, opts = {}) {
   const raw = trimmed(scope)
   if (raw.startsWith('role:')) {
     const role = trimmed(raw.slice('role:'.length))
     return Boolean(role && roleId && role === roleId)
   }
   if (raw.startsWith('workspace:')) {
-    const base = trimmed(raw.slice('workspace:'.length)).replace(/\/+$/, '')
-    const ws = trimmed(workspace).replace(/\/+$/, '')
+    const base = normalizeScopePath(raw.slice('workspace:'.length), opts)
+    const ws = normalizeScopePath(workspace, opts)
     if (!base || !ws) return false
     return ws === base || ws.startsWith(`${base}/`)
   }
@@ -119,7 +143,10 @@ function scopeLabel(scope) {
   return raw
 }
 
-/** 注入排序：铁律按编号在前，其余按 priority + key；同编号不重复。 */
+/** 优先级排序权重：未知值排到最后。 */
+const PRIORITY_RANK = Object.freeze({ P0: 0, P1: 1, P2: 2, P3: 3 })
+
+/** 注入排序：铁律按编号 → priority → key；普通规则 priority → key（R8-07）。 */
 function compareForInject(a, b) {
   const ironA = textOf(a.front.type) === 'iron-rule' ? 0 : 1
   const ironB = textOf(b.front.type) === 'iron-rule' ? 0 : 1
@@ -127,6 +154,9 @@ function compareForInject(a, b) {
   const numA = Number(a.front.number) || 0
   const numB = Number(b.front.number) || 0
   if (numA !== numB) return numA - numB
+  const rankA = PRIORITY_RANK[textOf(a.front.priority).toUpperCase()] ?? 9
+  const rankB = PRIORITY_RANK[textOf(b.front.priority).toUpperCase()] ?? 9
+  if (rankA !== rankB) return rankA - rankB
   return textOf(a.front.key).localeCompare(textOf(b.front.key))
 }
 
@@ -142,10 +172,17 @@ export function buildRulesPrefix({
   identity = {}, rulesDir, config = {}, rules = null, agentsPath = '', budget = null,
 } = {}) {
   const dir = trimmed(rulesDir) || resolveRuleRoot('', config)
-  const limit = Math.max(0, Number.isFinite(budget) ? Number(budget) : num(config?.rules?.injectChars, RULE_INJECT_DEFAULT))
+  const configured = Number.isFinite(budget) ? Number(budget) : num(config?.rules?.injectChars, RULE_INJECT_DEFAULT)
+  // R8-07：0 = 关闭注入（不是"无限"）。负值同样按关闭处理（配置越界不该放大成无预算）。
+  const limit = Number.isFinite(configured) ? Math.max(0, Math.floor(configured)) : RULE_INJECT_DEFAULT
   const ident = identity && typeof identity === 'object' ? identity : {}
   const roleId = trimmed(ident.roleId)
   const workspace = trimmed(ident.workspace)
+  const markers = fileHasMarkers(agentsPath || agentsPathOf(dir))
+
+  if (limit === 0) {
+    return { text: '', keys: [], skipped: [], chars: 0, mode: 'off', hasAgentsMarkers: markers, disabled: true }
+  }
 
   let docs = []
   if (Array.isArray(rules)) docs = rules
@@ -160,7 +197,6 @@ export function buildRulesPrefix({
     && textOf(doc?.front?.type) !== 'rule-candidate')
 
   const scoped = active.filter((doc) => scopeMatches(doc.front.scope, roleId, workspace))
-  const markers = fileHasMarkers(agentsPath || agentsPathOf(dir))
   // global 只作降级：AGENTS 有标记块时摘要已经能看见，再注入就是双份预算双份漂移风险。
   const globals = markers ? [] : active.filter((doc) => trimmed(doc.front.scope || 'global') === 'global')
 
@@ -279,13 +315,32 @@ export function installHook(ctx, {
     return Array.isArray(raw) ? raw.map((x) => String(x)) : undefined
   }
 
-  /** 规则目录 mtime：目录项变更（新增/删除/改名）都会变，足以作为缓存键的一部分。 */
+  /** 规则目录 mtime：目录项变更（新增/删除/改名/原子 rename 写）都会变。 */
   const dirMtime = (dir) => {
     try {
       return statSync(dir).mtimeMs
     } catch {
       return 0
     }
+  }
+
+  /**
+   * 规则文件最大 mtime（R8-07 缓存键的一部分）：编辑器原地改内容不改目录项，
+   * 只靠 dir mtime 会吃到过期缓存。readdir+stat 只碰元数据，不解析规则正文。
+   * @param {string} dir @returns {number}
+   */
+  const rulesMaxMtime = (dir) => {
+    let max = 0
+    try {
+      for (const name of readdirSync(dir)) {
+        if (!name.endsWith('.md')) continue
+        try {
+          const m = statSync(join(dir, name)).mtimeMs
+          if (m > max) max = m
+        } catch { /* 刚好被换掉/删除：跳过这一项 */ }
+      }
+    } catch { /* 目录读不到：指纹 0，buildRulesPrefix 自己 fail-open */ }
+    return max
   }
 
   /** 清规则前缀缓存（service.invalidateCache 清整表时也顺带清掉）。 */
@@ -297,12 +352,27 @@ export function installHook(ctx, {
     return cleared
   }
 
+  /** TTL 淘汰：规则前缀条目过期即删（会话条目由 readCached 按需删）。 */
+  const evictExpiredRules = () => {
+    const nowMs = Date.now()
+    for (const [key, entry] of cache) {
+      if (!String(key).startsWith(RULES_KEY_PREFIX)) continue
+      if (!entry || !(nowMs < entry.exp)) cache.delete(key)
+    }
+  }
+
   /**
-   * 取作用域前缀（30s 缓存）：缓存键 = dirMtime|roleId|workspace|AGENTS标记态。
+   * 取作用域前缀（30s 缓存）：键 = 目录 mtime + 规则文件最大 mtime + 预算 + role/workspace
+   * + AGENTS 标记态（R8-07：改预算/改规则内容都会换键，1s 内生效；写后由键变化失效，
+   * 面板写入口调 invalidateRulesCache 可立即清）。
    * 读完就存；规则读失败 fail-open 空串（注入永远不能让对话失败）。
    */
   const getRulesPrefix = ({ identity, rulesDir, agentsPath }) => {
-    const key = `${RULES_KEY_PREFIX}${dirMtime(rulesDir)}|${trimmed(identity.roleId)}|${trimmed(identity.workspace)}|${fileHasMarkers(agentsPath) ? 1 : 0}`
+    evictExpiredRules()
+    const budget = Math.max(0, Math.floor(num(config?.rules?.injectChars, RULE_INJECT_DEFAULT)))
+    const key = `${RULES_KEY_PREFIX}v2|d:${dirMtime(rulesDir)}|f:${rulesMaxMtime(rulesDir)}|b:${budget}`
+      + `|r:${trimmed(identity.roleId)}|w:${normalizeScopePath(identity.workspace)}`
+      + `|m:${fileHasMarkers(agentsPath) ? 1 : 0}`
     const hit = cache.get(key)
     // 空结果也缓存：没有适用规则时每步重扫目录（读+校验全部规则文件）是纯浪费。
     if (hit && Date.now() < hit.exp) return { ...hit.meta, text: hit.text, cached: true }
@@ -423,10 +493,9 @@ export function installHook(ctx, {
           return
         }
         setSessionPending(sid, created.proposal.id)
-        const summary = created.proposal.summary || { label: created.proposal.draft?.key, title: '', relation: 'new' }
-        const relationText = created.proposal.relation?.relation === 'new' ? '草稿'
-          : `${created.proposal.relation?.relation}/${created.proposal.relation?.targets?.length || 0} 条既有规则`
-        const line = `【规则候选】${summary.label} · ${summary.title}（${relationText}）——请在回复末尾用一句话询问用户是否收进铁律；用户确认后下一轮自动收录。`
+        // 提示行必须由 proposal 的单一口径生成：带 `收录 <nonce>`，聊天确认只认它（R8-05）。
+        // 不要在这里另拼文案——两处文案会漂移成"提示说确认、服务端只认 nonce"的死链。
+        const line = buildProposalAskLine(created.proposal)
         const entry = cache.get(sid)
         if (entry && Date.now() < entry.exp) entry.text = `${entry.text}\n${line}`
         else cache.set(sid, { text: line, exp: Date.now() + CACHE_TTL_MS })

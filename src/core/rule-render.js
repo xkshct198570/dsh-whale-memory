@@ -1,25 +1,29 @@
 /**
- * 规则渲染产物（R3b）：`AGENTS.md` 摘要块 + 台账 §2 块。
+ * 规则渲染产物（R3b/R8-06）：`AGENTS.md` 摘要块 + 台账 §2 块。
  *
  * 职责：
- * - `renderAgentsDigest`：把「global active 铁律」渲染成一行一条的摘要，只替换管理块内部；
+ * - `renderAgentsDigest`：把「global + active」规则渲染成一行一条的摘要，只替换管理块内部；
  * - `renderLedgerDigest`：把台账 §2 表体（iron-rule 全文本）渲染进台账管理块；
  * - `inspectMarkers` / `fileMarkers`：标记块探测（缺失/重复都返回失败码，不猜、不追加）；
- * - 原子写 + 写前 `.bak` + 幂等（内容不变不写，保留 mtime，避免无意义的文件变更事件）。
+ * - 原子写 + `.bak` 轮转（保留最近 5 份）+ 写前 `stat` 比对 + 仓库锁内读-改-写 + 幂等
+ *   （内容不变不写，保留 mtime，避免无意义的文件变更事件）。
  *
  * 边界：
  * - **绝不追加/覆盖全文**：标记不存在返回 `no_markers`，标记重复返回 `duplicate_markers`；
- *   这两条是"块外一个字节不碰"的硬保证（架构书 §3.6）。
+ *   这两条是"块外一个字节不碰"的硬保证（架构书 §3.6/§4.1）。
  * - 只读规则数组或规则目录（listRules）；不写规则、不碰 DB、不调模型。
- * - R3b 只提供 `renderLedgerDigest` 函数与测试；台账标记块由 R6/R7 加，R3b 不主动调用。
+ * - CRLF 保持原文件 EOL：摘要块的行分隔符跟随目标文件，块外字节一字不动。
+ * - 正文单行化（`\n`→空格、控制字符剔除）后入摘要；管理块标记字面量在写入闸之外再做一次
+ *   防御性剔除——写入闸是 task-1 的职责，这里只保证"即使绕过闸，摘要也不能被撕开"。
  *
  * Why 管理块：AGENTS/台账是人工也在编辑的文件，渲染必须可增量、可自愈、可回滚；
  * 用显式标记把"机器负责的字节区间"钉死，才能在用户手改块外内容后依然安全重渲染。
  */
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import { atomicWriteFile, listRules } from './rule-store.js'
+import * as ruleStore from './rule-store.js'
 
 /** AGENTS 摘要块标记（勿改：客户端/R6 文档同步引用同一字面量）。 */
 export const RULES_BEGIN = '<!-- whale-memory:rules:begin -->'
@@ -29,9 +33,25 @@ export const LEDGER_BEGIN = '<!-- whale-memory:ledger:begin -->'
 export const LEDGER_END = '<!-- whale-memory:ledger:end -->'
 
 /** 摘要里正文摘录长度（一行一条，太长会把 AGENTS 读成本体）。 */
-// 摘要要能独立读懂：60 字只剩半句，真机 AGENTS 实测看不到例外/判据。200 字≈全条正文本体，
+// 摘要要能独立读懂：60 字只剩半句，真机 AGENTS 实测看不到例外/判据。200 字≈全条正文，
 // 超长铁律才截断并给省略号 + 文件指针；17 条全量约 3.4K 字符，可接受。
 const EXCERPT_CHARS = 200
+/** front.summary 上限（架构书 §2.2：≤120 字，只用于摘要/列表）。 */
+const SUMMARY_MAX = 120
+/** 标题展示上限（码点）。 */
+const TITLE_MAX = 80
+/** `.bak` 保留份数：`.bak`（最新）+ `.bak.1` … `.bak.4`。 */
+const BACKUP_KEEP = 5
+/** 读-改-写最多重试次数：块外被并发修改时重读再改，不覆盖别人的字节。 */
+const WRITE_ATTEMPTS = 3
+/** 句末标点（架构书 §4.1）：截断回退到最后一个句末，不切半句。 */
+const SENTENCE_END_RE = /[。；！？]/
+/** 控制字符（保留 \t \n \r，先做 EOL 归一再折叠空白）。 */
+const CONTROL_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g
+/** 管理块标记字面量：写入闸在 task-1，这里只做渲染侧防御。 */
+const MARKER_LITERAL_RE = /<!--\s*whale-memory\s*:\s*rules:/i
+/** 优先级排序权重：未知值排最后。 */
+const PRIORITY_RANK = Object.freeze({ P0: 0, P1: 1, P2: 2, P3: 3 })
 
 /** @param {any} value @returns {string} */
 function textOf(value) {
@@ -41,6 +61,69 @@ function textOf(value) {
 /** @param {any} value @returns {string} */
 function trimmed(value) {
   return textOf(value).trim()
+}
+
+/** 码点切片：绝不切半句/切代理对。 @param {string} text @param {number} max */
+function sliceCodepoints(text, max) {
+  const chars = Array.from(textOf(text))
+  return chars.length > max ? `${chars.slice(0, max).join('')}…` : chars.join('')
+}
+
+/**
+ * 防御性剔除管理块标记字面量（含未闭合的孤立标记）。
+ * 已闭合的注释整段去掉；未闭合的从标记处截尾——宁可少一句，也不让摘要块被撕开。
+ * @param {string} text @returns {string}
+ */
+export function stripMarkerLiterals(text) {
+  let out = textOf(text).replace(/<!--[\s\S]*?-->/g,
+    (comment) => (MARKER_LITERAL_RE.test(comment) ? '' : comment))
+  const at = out.search(MARKER_LITERAL_RE)
+  return at === -1 ? out : out.slice(0, at)
+}
+
+/**
+ * 单行化：标记剔除 → EOL 归空格 → 控制字符剔除 → 空白折叠。
+ * @param {string} text @returns {string}
+ */
+export function singleLine(text) {
+  return stripMarkerLiterals(textOf(text))
+    .replace(/\r\n|\r|\n/g, ' ')
+    .replace(CONTROL_RE, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+/** 最后一个句末标点的码点下标；没有返回 -1。 @param {string} text @returns {number} */
+function lastSentenceEnd(text) {
+  const chars = Array.from(textOf(text))
+  let found = -1
+  for (let i = 0; i < chars.length; i += 1) if (SENTENCE_END_RE.test(chars[i])) found = i
+  return found
+}
+
+/**
+ * 正文摘录：≤200 码点直接全给；超长取前 200 码点并回退到最后一个句末，否则硬截 + `…`。
+ * @param {string} body @returns {string}
+ */
+export function excerptOf(body) {
+  const flat = singleLine(body)
+  const chars = Array.from(flat)
+  if (chars.length <= EXCERPT_CHARS) return flat
+  const headChars = chars.slice(0, EXCERPT_CHARS)
+  const end = lastSentenceEnd(headChars.join(''))
+  const cut = end >= 0 ? headChars.slice(0, end + 1).join('') : headChars.join('')
+  return `${cut}…`
+}
+
+/**
+ * 摘要正文：`summary`（≤120 码点）优先，否则正文 200 码点回退句末。
+ * @param {object} front @param {string} body @returns {string}
+ */
+export function summaryOfRule(front, body) {
+  const declared = singleLine(front?.summary ?? '')
+  // 硬切 ≤120（不加省略号）：架构书 §2.2 的硬顶是「字」，防御手写超长文件时也不能越界。
+  if (declared) return Array.from(declared).slice(0, SUMMARY_MAX).join('')
+  return excerptOf(body)
 }
 
 /**
@@ -65,7 +148,7 @@ function splitDoc(doc) {
 
 /**
  * 标题：`action` 优先（结构化字段最稳定），否则正文首个 `# ` 行，否则首句。
- * 只用于展示，绝不回写规则正文。
+ * 只用于展示，绝不回写规则正文；单行化并按码点切片（不切代理对）。
  * @param {object} front @param {string} body @returns {string}
  */
 export function titleOfRule(front, body) {
@@ -77,11 +160,12 @@ export function titleOfRule(front, body) {
   // 模态必须体现在标题里：否则「禁止 X」会读成「X」，「只准 X」会读成「X」（真机 AGENTS 摘要实测）。
   if (base) {
     const titled = modality === 'must_not' ? `禁止${base}` : modality === 'only' ? `只准${base}` : base
-    return titled.slice(0, 80)
+    return sliceCodepoints(singleLine(titled), TITLE_MAX)
   }
   const heading = textOf(body).split('\n').map((line) => line.trim()).find((line) => line.startsWith('#'))
-  if (heading) return heading.replace(/^#+\s*/, '').slice(0, 80)
-  return (textOf(body).split(/[。；;\n]/).map((s) => s.trim()).filter(Boolean)[0] || '').slice(0, 80)
+  if (heading) return sliceCodepoints(singleLine(heading.replace(/^#+\s*/, '')), TITLE_MAX)
+  const first = textOf(body).split(/[。；;\n]/).map((s) => s.trim()).filter(Boolean)[0] || ''
+  return sliceCodepoints(singleLine(first), TITLE_MAX)
 }
 
 /** 路径展示：$HOME 下的绝对路径压成 `~/…`，避免把本机绝对路径写进 AGENTS。 */
@@ -104,20 +188,34 @@ function digestLine(doc) {
   const { front, text } = splitDoc(doc)
   const type = trimmed(front.type)
   const number = Number(front.number)
+  // safety（number=0）不占号：用 key 展示，避免出现「铁律0」。
   const label = type === 'iron-rule' && Number.isInteger(number) && number > 0
     ? `铁律${number}`
     : trimmed(front.key)
-  const chars = Array.from(text)
-  const cut = chars.slice(0, EXCERPT_CHARS).join('')
-  const excerpt = chars.length > EXCERPT_CHARS ? `${cut}…` : cut
+  const excerpt = summaryOfRule(front, text)
   // 摘要必须指到「哪一条文件」：只给目录时用户还得自己找文件（真机 AGENTS 实测暴露）。
   const file = trimmed(doc.file) || (trimmed(front.key) ? `${trimmed(front.key)}.md` : '')
   const tail = file ? `（文件：${basename(file)}）` : ''
   return `- ${label} · ${titleOfRule(front, text)}（${scopeLabel(front.scope)}）：${excerpt}${tail}`
 }
 
+/** 注入/摘要排序：铁律按编号 → priority → key；普通规则 priority → key。 */
+function compareDigestDocs(a, b) {
+  const ironA = trimmed(a.front.type) === 'iron-rule' ? 0 : 1
+  const ironB = trimmed(b.front.type) === 'iron-rule' ? 0 : 1
+  if (ironA !== ironB) return ironA - ironB
+  const numA = Number(a.front.number) || 0
+  const numB = Number(b.front.number) || 0
+  if (numA !== numB) return numA - numB
+  const rankA = PRIORITY_RANK[trimmed(a.front.priority).toUpperCase()] ?? 9
+  const rankB = PRIORITY_RANK[trimmed(b.front.priority).toUpperCase()] ?? 9
+  if (rankA !== rankB) return rankA - rankB
+  return trimmed(a.front.key).localeCompare(trimmed(b.front.key))
+}
+
 /**
- * 摘要块正文（不含标记行）：global + active + iron-rule，按编号升序。
+ * 摘要块正文（不含标记行）：global + active 全收——铁律按编号在前，
+ * 普通规则按 priority→key 在后（R8-06：普通全局规则也必须出现在 AGENTS）。
  * @param {any} rules 规则集合（数组/目录/`{rules}`）
  * @returns {{content:string, count:number, keys:string[]}}
  */
@@ -125,9 +223,9 @@ export function rulesDigestContent(rules, opts = {}) {
   const docs = normalizeDocs(rules)
     .map(splitDoc)
     .filter(({ front }) => trimmed(front.status || 'active') === 'active'
-      && trimmed(front.type) === 'iron-rule'
+      && trimmed(front.type) !== 'rule-candidate'
       && (trimmed(front.scope) || 'global') === 'global')
-    .sort((a, b) => (Number(a.front.number) || 0) - (Number(b.front.number) || 0))
+    .sort(compareDigestDocs)
   const lines = ['## 规则摘要（自动生成，勿手改）']
   for (const doc of docs) lines.push(digestLine(doc))
   const dir = trimmed(opts.dir) || dirnameOfRules(rules)
@@ -196,63 +294,164 @@ export function fileHasMarkers(path, begin = RULES_BEGIN, end = RULES_END) {
   return inspectMarkers(content, begin, end).ok
 }
 
-/**
- * 替换标记块内部（保留块外全部字节 + 标记行本身）。
- * @param {string} content 旧全文
- * @param {string} marker 探测结果（ok=true）
- * @param {string} body 新块内容
- * @returns {string}
- */
-function replaceBlock(content, markers, body, begin, end) {
-  const head = content.slice(0, markers.start)
-  const tail = content.slice(markers.stop + end.length)
-  return `${head}${begin}\n${body}\n${end}${tail}`
+/** 目标文件的 EOL 风格（CRLF 文件继续保持 CRLF，块外字节不因换行符被改写）。 */
+function detectEol(content) {
+  return textOf(content).includes('\r\n') ? '\r\n' : '\n'
 }
 
 /**
- * 原子写 + 写前 `.bak`；内容不变返回 changed:false 且不落盘（保留 mtime）。
+ * 替换标记块内部（保留块外全部字节 + 标记行本身）；块内行分隔符跟随原文件 EOL。
+ * @param {string} content 旧全文
+ * @param {string} markers 探测结果（ok=true）
+ * @param {string} body 新块内容（`\n` 分隔）
+ * @returns {string}
+ */
+function replaceBlock(content, markers, body, begin, end, eol = '\n') {
+  const head = content.slice(0, markers.start)
+  const tail = content.slice(markers.stop + end.length)
+  const blockBody = body.split('\n').join(eol)
+  return `${head}${begin}${eol}${blockBody}${eol}${end}${tail}`
+}
+
+/** 写前 `stat` 指纹：size+mtime+inode，用来发现"读完之后别人又改了文件"。 */
+function statSignature(path) {
+  try {
+    const st = statSync(path)
+    return `${st.ino}|${st.size}|${Number(st.mtimeMs)}`
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 写前 `.bak` 轮转（保留最近 5 份：`.bak` 最新 + `.bak.1` … `.bak.4`）。
+ * 轮转先做 rename（同目录原子），最后原子写 `.bak` 本体。
+ * @param {string} path @param {string} oldText
+ * @returns {{ok:boolean, error?:string}}
+ */
+function rotateBackup(path, oldText) {
+  try {
+    const overflow = `${path}.bak.${BACKUP_KEEP - 1}` // `.bak.5` 是第 6 份：写新备份前先淘汰
+    if (existsSync(overflow)) rmSync(overflow, { force: true })
+    for (let i = BACKUP_KEEP - 2; i >= 1; i -= 1) {
+      const from = `${path}.bak.${i}`
+      if (existsSync(from)) renameSync(from, `${path}.bak.${i + 1}`)
+    }
+    if (existsSync(`${path}.bak`)) renameSync(`${path}.bak`, `${path}.bak.1`)
+    return atomicWriteFile(`${path}.bak`, oldText)
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) }
+  }
+}
+
+/**
+ * 原子写 + 写前 `.bak` 轮转；内容不变返回 changed:false 且不落盘（保留 mtime）。
  * @param {string} path @param {string} oldText @param {string} newText
  * @returns {{ok:boolean, changed:boolean, error?:string}}
  */
 function writeWithBackup(path, oldText, newText) {
   if (newText === oldText) return { ok: true, changed: false }
-  const backup = atomicWriteFile(`${path}.bak`, oldText)
+  const backup = rotateBackup(path, oldText)
   if (!backup.ok) return { ok: false, changed: false, error: `backup_failed:${backup.error}` }
   const written = atomicWriteFile(path, newText)
   if (!written.ok) return { ok: false, changed: false, error: `write_failed:${written.error}` }
   return { ok: true, changed: true }
 }
 
+/** 仓库锁缺失只提示一次，避免每个渲染周期刷日志。 */
+let warnedMissingRepoLock = false
+
+/**
+ * 读-改-写包在仓库锁内：优先用 task-1 的 `withRepoLock`（契约 §1）。
+ * store 尚未落地时降级为直接执行并留痕（单进程渲染仍是原子写；锁到位后自动接管，无需改这里）。
+ * @param {string} root @param {Function} fn @param {{lock?:Function, log?:Function}} [opts]
+ */
+function runWithRepoLock(root, fn, { lock = null, log = () => {} } = {}) {
+  const impl = typeof lock === 'function'
+    ? lock
+    : (typeof ruleStore.withRepoLock === 'function' ? ruleStore.withRepoLock : null)
+  if (impl && root) return impl(root, fn)
+  if (!impl && !warnedMissingRepoLock) {
+    warnedMissingRepoLock = true
+    log('[whale-memory] render repo lock unavailable（store 尚未提供 withRepoLock），单进程原子写降级')
+  }
+  return fn()
+}
+
+/**
+ * 锁内渲染一次标记块：读 → 探测 → 渲染 → 写前 stat 比对 → 原子写（并发变更则重读重试）。
+ * @param {{path:string, begin:string, end:string, body:(content:string)=>string,
+ *   log:Function, label:string}} args
+ * @returns {{ok:boolean, changed?:boolean, content?:string, error?:string, code?:string}}
+ */
+function rewriteBlock({ path, begin, end, body, log, label }) {
+  for (let attempt = 0; attempt < WRITE_ATTEMPTS; attempt += 1) {
+    // 先取读前指纹：读→比对→写三步之间任何一步被别人改过，都重读重来。
+    const before = statSignature(path)
+    let content
+    try {
+      content = readFileSync(path, 'utf8')
+    } catch (err) {
+      const missing = err?.code === 'ENOENT'
+      return { ok: false, code: missing ? 'no_markers' : `${label}_unreadable` }
+    }
+    const afterRead = statSignature(path)
+    if (afterRead !== before) continue
+    const markers = inspectMarkers(content, begin, end)
+    if (!markers.ok) return { ok: false, code: markers.code }
+    const nextBody = body(content)
+    const next = replaceBlock(content, markers, nextBody, begin, end, detectEol(content))
+    if (next === content) return { ok: true, changed: false }
+    // 读完到写完之间块外（或块内）被别人改了：重读再改，别拿旧快照覆盖。
+    if (statSignature(path) !== afterRead) continue
+    const result = writeWithBackup(path, content, next)
+    if (!result.ok) {
+      log(`[whale-memory] render ${label} failed: ${result.error}`)
+      return { ok: false, code: 'write_failed', error: result.error }
+    }
+    return { ok: true, changed: true }
+  }
+  return { ok: false, code: 'concurrent_write' }
+}
+
 /**
  * 重渲染 AGENTS 摘要块。
  *
- * @param {{rules:any, agentsPath:string, log?:Function}} args
+ * @param {{rules:any, agentsPath:string, rulesDir?:string, root?:string,
+ *   lock?:Function, log?:Function}} args
  * @returns {{ok:boolean, changed?:boolean, count?:number, keys?:string[], chars?:number,
  *   path?:string, code?:string, error?:string}}
  */
-export function renderAgentsDigest({ rules, agentsPath, rulesDir = '', log = () => {} } = {}) {
+export function renderAgentsDigest({
+  rules, agentsPath, rulesDir = '', root = '', lock = null, log = () => {},
+} = {}) {
   const path = trimmed(agentsPath)
   if (!path) return { ok: false, code: 'no_agents_path' }
-  let content
-  try {
-    content = readFileSync(path, 'utf8')
-  } catch (err) {
-    // 目标文件不存在时**不创建**：AGENTS 是宿主/用户资产，插件只改既有管理块。
-    return { ok: false, code: err?.code === 'ENOENT' ? 'no_markers' : 'agents_unreadable' }
-  }
-  const markers = inspectMarkers(content, RULES_BEGIN, RULES_END)
-  if (!markers.ok) return { ok: false, code: markers.code }
+  const lockRoot = trimmed(root) || trimmed(rulesDir) || dirnameOfRules(rules)
   const digest = rulesDigestContent(rules, { dir: rulesDir })
-  const next = replaceBlock(content, markers, digest.content, RULES_BEGIN, RULES_END)
-  const result = writeWithBackup(path, content, next)
-  if (!result.ok) {
-    log(`[whale-memory] render agents failed: ${result.error}`)
-    return { ok: false, code: 'write_failed', error: result.error }
+  let outcome
+  try {
+    outcome = runWithRepoLock(lockRoot, () => rewriteBlock({
+      path,
+      begin: RULES_BEGIN,
+      end: RULES_END,
+      body: () => digest.content,
+      log,
+      label: 'agents',
+    }), { lock, log })
+  } catch (err) {
+    log(`[whale-memory] render agents failed: ${err?.name || err?.message || err}`)
+    return { ok: false, code: 'render_failed', error: String(err?.message || err) }
   }
-  log(`[whale-memory] render agents changed=${result.changed} rules=${digest.count}`)
+  if (!outcome || outcome.ok !== true) {
+    // withRepoLock 抢锁失败返回 {ok:false,error:'repo_locked'}（不是抛错）：映射成显式错误码，
+    // 让调用方/面板知道这次是"没拿到锁"而不是"文件写坏"。
+    return { ok: false, code: outcome?.code || (outcome?.error ? 'lock_failed' : 'render_failed'), error: outcome?.error }
+  }
+  log(`[whale-memory] render agents changed=${outcome.changed} rules=${digest.count}`)
   return {
     ok: true,
-    changed: result.changed,
+    changed: outcome.changed,
     count: digest.count,
     keys: digest.keys,
     chars: Array.from(digest.content).length,
@@ -262,6 +461,7 @@ export function renderAgentsDigest({ rules, agentsPath, rulesDir = '', log = () 
 
 /**
  * 台账 §2 表体（iron-rule 全文本；无编号的 P0 规则排表尾）。
+ * 正文必须先单行化再进表格行，否则换行会把 Markdown 表格撕成两段。
  * @param {any} rules
  * @returns {{content:string, count:number, keys:string[]}}
  */
@@ -281,7 +481,7 @@ export function ledgerDigestContent(rules) {
   for (const { front, text } of [...numbered, ...tail]) {
     const number = Number.isInteger(Number(front.number)) && Number(front.number) > 0 ? String(front.number) : '—'
     const scope = trimmed(front.scope) || 'global'
-    rows.push(`| ${number} | ${titleOfRule(front, text)} | ${scope} | ${text.replace(/\|/g, '\\|')} |`)
+    rows.push(`| ${number} | ${titleOfRule(front, text)} | ${scope} | ${singleLine(text).replace(/\|/g, '\\|')} |`)
   }
   return {
     content: rows.join('\n'),
@@ -292,34 +492,39 @@ export function ledgerDigestContent(rules) {
 
 /**
  * 重渲染台账 §2 表体块（同 AGENTS 机制：缺标记/重复标记都拒绝，绝不追加）。
- * R3b 只提供函数；台账标记块由 R6/R7 落。
- *
- * @param {{rules:any, ledgerPath:string, log?:Function}} args
+ * @param {{rules:any, ledgerPath:string, rulesDir?:string, root?:string,
+ *   lock?:Function, log?:Function}} args
  * @returns {{ok:boolean, changed?:boolean, count?:number, keys?:string[], chars?:number,
  *   path?:string, code?:string, error?:string}}
  */
-export function renderLedgerDigest({ rules, ledgerPath, log = () => {} } = {}) {
+export function renderLedgerDigest({
+  rules, ledgerPath, rulesDir = '', root = '', lock = null, log = () => {},
+} = {}) {
   const path = trimmed(ledgerPath)
   if (!path) return { ok: false, code: 'no_ledger_path' }
-  let content
-  try {
-    content = readFileSync(path, 'utf8')
-  } catch (err) {
-    return { ok: false, code: err?.code === 'ENOENT' ? 'no_markers' : 'ledger_unreadable' }
-  }
-  const markers = inspectMarkers(content, LEDGER_BEGIN, LEDGER_END)
-  if (!markers.ok) return { ok: false, code: markers.code }
+  const lockRoot = trimmed(root) || trimmed(rulesDir) || dirnameOfRules(rules)
   const digest = ledgerDigestContent(rules)
-  const next = replaceBlock(content, markers, digest.content, LEDGER_BEGIN, LEDGER_END)
-  const result = writeWithBackup(path, content, next)
-  if (!result.ok) {
-    log(`[whale-memory] render ledger failed: ${result.error}`)
-    return { ok: false, code: 'write_failed', error: result.error }
+  let outcome
+  try {
+    outcome = runWithRepoLock(lockRoot, () => rewriteBlock({
+      path,
+      begin: LEDGER_BEGIN,
+      end: LEDGER_END,
+      body: () => digest.content,
+      log,
+      label: 'ledger',
+    }), { lock, log })
+  } catch (err) {
+    log(`[whale-memory] render ledger failed: ${err?.name || err?.message || err}`)
+    return { ok: false, code: 'render_failed', error: String(err?.message || err) }
   }
-  log(`[whale-memory] render ledger changed=${result.changed} rules=${digest.count}`)
+  if (!outcome || outcome.ok !== true) {
+    return { ok: false, code: outcome?.code || (outcome?.error ? 'lock_failed' : 'render_failed'), error: outcome?.error }
+  }
+  log(`[whale-memory] render ledger changed=${outcome.changed} rules=${digest.count}`)
   return {
     ok: true,
-    changed: result.changed,
+    changed: outcome.changed,
     count: digest.count,
     keys: digest.keys,
     chars: Array.from(digest.content).length,

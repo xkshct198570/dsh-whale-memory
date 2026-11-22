@@ -299,3 +299,30 @@ test('worker 源码成对透传 diffusion/minConf（静态防回归）', () => {
   assert.match(workerSrc, /diffusion:\s*msg\?\.diffusion/)
   assert.match(workerSrc, /minConf:\s*msg\?\.minConf/)
 })
+
+// ---------------------------------------------------------------------------
+// R8-08：召回候选集排除规则镜像（origin rule:*）
+// ---------------------------------------------------------------------------
+
+test('召回排除规则镜像行：FTS 命中与扩散都不得返回 origin rule:*', () => {
+  const f = freshSearchDb('whale-search-rule-')
+  try {
+    const text = '网关 回调 失败 日志'
+    addNodeTo(f.db, 'n1', text, { level: 'core', source: 'owner', type: 'procedural' })
+    const ts = now()
+    // 镜像行：正文与普通节点完全相同，唯一区别是 origin 前缀（v3.7 的召回污染复现场景）。
+    f.db.prepare(`INSERT INTO nodes
+      (id,text,text_hash,text_bigrams,level,memory_type,source,status,
+       role_id,user_id,workspace,tags,context_note,weight,hits,pinned,origin,trace_id,created_at,updated_at)
+      VALUES (?,?,?,?,'core','procedural','owner','active','','','',?,?,1.0,0,1,?,'rules',?,?)`)
+      .run('nrule', text, contentHash(text), bigrams(text), '[]', '规则镜像', 'rule:iron-rule-13', ts, ts)
+    // 扩散边：普通节点 → 规则镜像行；扩散路径也必须被排除。
+    upsertEdge(f.db, { fromId: 'n1', toId: 'nrule', etype: 'topic', source: 'reflect', conf: 1.0 })
+
+    const r = search(f.db, { query: text, identity: ALICE, minRel: 0.3 })
+    assert.equal(r.hits.some((hit) => hit.id === 'nrule'), false, '规则镜像不得进召回')
+    assert.equal(r.hits.some((hit) => hit.id === 'n1'), true, '普通记忆照常召回')
+  } finally {
+    disposeSearchDb(f)
+  }
+})

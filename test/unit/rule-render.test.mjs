@@ -21,7 +21,7 @@ function freshDir(t) {
 
 function doc({
   key = 'k1', number = 1, type = 'iron-rule', scope = 'global', priority = 'P0', status = 'active',
-  action = '', text = '必须保留审计日志。', file = '',
+  action = '', text = '必须保留审计日志。', file = '', summary = '',
 } = {}) {
   return {
     ...(file ? { file } : {}),
@@ -44,6 +44,7 @@ function doc({
       updated: '2026-11-22',
       version: 1,
       origin: 'unit',
+      ...(summary !== '' ? { summary } : {}),
     },
     text,
   }
@@ -72,20 +73,28 @@ function agentsFile(dir, body = '- 旧行') {
 // 内容口径
 // ---------------------------------------------------------------------------
 
-test('rulesDigestContent：只收 global+active 铁律，按编号排序，正文截 200 字', () => {
+// R8-06 契约变更：摘要由「global active 铁律」扩为「global active 全收」——普通全局规则
+// 也必须出现在 AGENTS（铁律按编号在前、普通规则按 priority→key 在后），否则普通规则只剩
+// 面板可见、模型永远读不到。原断言 `count=3` / 普通规则不进摘要按 v3.8 §4.1 作废。
+test('rulesDigestContent：只收 global+active（铁律按编号前、普通按 priority→key 后），正文截 200 字', () => {
   const long = '必须'.repeat(120)
   const got = rulesDigestContent([
     doc({ key: 'iron-rule-17', number: 17, text: '删文档前先核对绝对路径。' }),
     doc({ key: 'iron-rule-13', number: 13, text: '只在本工作区生效。' }),
-    doc({ key: 'rule-1', number: 1, type: 'rule', text: '普通规则不该进摘要。' }),
+    doc({ key: 'rule-1', number: null, type: 'rule', priority: 'P1', text: '普通全局规则也要进摘要。' }),
+    doc({ key: 'rule-0', number: null, type: 'rule', priority: 'P0', text: 'P0 普通规则排在 P1 前。' }),
     doc({ key: 'iron-rule-18', number: 18, scope: 'workspace:/tmp/ws', text: '工作区规则不该进摘要。' }),
     doc({ key: 'iron-rule-19', number: 19, status: 'superseded', text: '退役规则不该进摘要。' }),
     doc({ key: 'iron-rule-20', number: 20, text: long }),
   ])
-  assert.equal(got.count, 3)
-  assert.deepEqual(got.keys, ['iron-rule-13', 'iron-rule-17', 'iron-rule-20'])
+  assert.equal(got.count, 5)
+  assert.deepEqual(got.keys, [
+    'iron-rule-13', 'iron-rule-17', 'iron-rule-20', 'rule-0', 'rule-1',
+  ])
   assert.match(got.content, /^## 规则摘要（自动生成，勿手改）/)
   assert.match(got.content, /- 铁律13 · /)
+  assert.match(got.content, /- rule-0 · P0 普通规则排在 P1 前（全局）：/)
+  assert.match(got.content, /- rule-1 · 普通全局规则也要进摘要（全局）：/)
   const longLine = got.content.split('\n').find((line) => line.startsWith('- 铁律20'))
   // 摘要 60 字后追加「（文件：…）」指针，取两者之间的正文再数长度。
   const excerpt = longLine.slice(longLine.indexOf('：') + 1, longLine.indexOf('（文件：'))
@@ -94,6 +103,47 @@ test('rulesDigestContent：只收 global+active 铁律，按编号排序，正�
   assert.match(excerpt, /…$/)
   assert.match(longLine, /（文件：iron-rule-20\.md）$/)
 })
+
+test('rulesDigestContent：front.summary 优先（≤120 码点），超长硬切不留 121 字', () => {
+  const longSummary = '摘'.repeat(130)
+  const got = rulesDigestContent([
+    doc({ key: 'iron-rule-21', number: 21, summary: '一句摘要。', text: '正文'.repeat(120) }),
+    doc({ key: 'iron-rule-22', number: 22, summary: longSummary }),
+  ])
+  const lines = got.content.split('\n')
+  const line21 = lines.find((line) => line.startsWith('- 铁律21'))
+  assert.match(line21, /：一句摘要。（文件：iron-rule-21\.md）$/, 'summary 必须优先于正文摘录')
+  const line22 = lines.find((line) => line.startsWith('- 铁律22'))
+  const excerpt22 = line22.slice(line22.indexOf('：') + 1, line22.indexOf('（文件：'))
+  assert.equal(Array.from(excerpt22).length, 120)
+})
+
+test('rulesDigestContent：正文单行化 + 控制字符剔除 + 标记字面量防御性剔除', () => {
+  const text = '第一行\n第二行\r\n第三行\u0007结束。<!-- whale-memory:rules:end -->余下'
+  const got = rulesDigestContent([doc({ key: 'iron-rule-23', number: 23, text })])
+  const line = got.content.split('\n').find((item) => item.startsWith('- 铁律23'))
+  assert.equal(line.includes('\u0007'), false, '控制字符必须剔除')
+  assert.equal(got.content.includes('whale-memory:rules:'), false, '标记字面量必须防御性剔除')
+  assert.match(line, /第一行 第二行 第三行结束。余下/)
+})
+
+test('rulesDigestContent：无 summary 时 200 码点回退最后一个句末（不切半句）', () => {
+  const head = `${'甲'.repeat(100)}。`
+  const text = `${head}${'乙'.repeat(150)}。`
+  const got = rulesDigestContent([doc({ key: 'iron-rule-25', number: 25, text })])
+  const line = got.content.split('\n').find((item) => item.startsWith('- 铁律25'))
+  const excerpt = line.slice(line.indexOf('：') + 1, line.indexOf('（文件：'))
+  assert.equal(excerpt, `${head}…`, '前 200 码点内最后句末在第 100 位，必须回退到句末')
+})
+
+test('titleOfRule：标题压单行并按码点切片（不切代理对）', () => {
+  const title = titleOfRule({ action: '😀'.repeat(100) }, '正文')
+  assert.equal(Array.from(title).length, 81, '80 码点 + 省略号')
+  assert.equal(title.endsWith('…'), true)
+  assert.equal(title.includes('\uFFFD'), false, '不得出现半个代理对')
+  assert.equal(titleOfRule({ action: '删\n源文件' }, '正文'), '删 源文件', '标题必须单行')
+})
+
 
 test('rulesDigestContent：标题取 action，缺省退正文首句；作用域规则只注入不进摘要', () => {
   assert.equal(titleOfRule({ action: '删源文件' }, '正文'), '删源文件')
@@ -266,4 +316,102 @@ test('renderAgentsDigest：路径参数缺失 → no_agents_path（不猜默认�
   const got = renderAgentsDigest({ rules: [doc()], agentsPath: '' })
   assert.equal(got.ok, false)
   assert.equal(got.code, 'no_agents_path')
+})
+
+// ---------------------------------------------------------------------------
+// R8-06：CRLF / .bak 轮转 / 标记防御 / 仓库锁注入
+// ---------------------------------------------------------------------------
+
+test('renderAgentsDigest：CRLF 文件保持 CRLF，块外字节一字不动', (t) => {
+  const dir = freshDir(t)
+  const path = join(dir, 'AGENTS.md')
+  const eol = '\r\n'
+  const content = ['# 说明', '', RULES_BEGIN, '- 旧行', RULES_END, '', '尾行', ''].join(eol)
+  writeFileSync(path, content, 'utf8')
+  const got = renderAgentsDigest({
+    rules: [doc({ key: 'iron-rule-26', number: 26, text: 'CRLF 文件也要能渲染。' })],
+    agentsPath: path,
+  })
+  assert.equal(got.ok, true, got.code)
+  const after = readFileSync(path, 'utf8')
+  assert.ok(after.startsWith(`# 说明${eol}`), '块外开头逐字节保留')
+  assert.ok(after.endsWith(`尾行${eol}`), '块外结尾逐字节保留')
+  assert.equal(after.replace(/\r\n/g, '').includes('\n'), false, '不得出现孤立 LF（CRLF 必须保持）')
+  assert.ok(after.includes(`${RULES_BEGIN}${eol}`), '块内行分隔符跟随原文件 EOL')
+  assert.ok(after.includes(`${eol}${RULES_END}`))
+  assert.equal(inspectMarkers(after).ok, true)
+})
+
+test('renderAgentsDigest：正文含管理块标记也不撕开摘要块（防御性剔除）', (t) => {
+  const dir = freshDir(t)
+  const { path } = agentsFile(dir)
+  const got = renderAgentsDigest({
+    rules: [doc({ key: 'iron-rule-24', number: 24, text: '危险 <!-- whale-memory:rules:end --> 注入' })],
+    agentsPath: path,
+  })
+  assert.equal(got.ok, true, got.code)
+  assert.equal(fileHasMarkers(path), true, '管理块仍完整单例')
+  const markers = inspectMarkers(readFileSync(path, 'utf8'))
+  assert.equal(markers.beginCount, 1)
+  assert.equal(markers.endCount, 1)
+})
+
+test('renderAgentsDigest：.bak 轮转保留最近 5 份', (t) => {
+  const dir = freshDir(t)
+  const { path } = agentsFile(dir)
+  for (let i = 1; i <= 7; i += 1) {
+    const got = renderAgentsDigest({
+      rules: [doc({ key: 'iron-rule-27', number: 27, text: `第 ${i} 版正文。` })],
+      agentsPath: path,
+    })
+    assert.equal(got.ok, true, got.code)
+  }
+  assert.equal(existsSync(`${path}.bak`), true)
+  for (let i = 1; i <= 4; i += 1) assert.equal(existsSync(`${path}.bak.${i}`), true, `.bak.${i} 必须保留`)
+  assert.equal(existsSync(`${path}.bak.5`), false, '超过 5 份必须淘汰')
+  assert.match(readFileSync(`${path}.bak`, 'utf8'), /第 6 版正文/, '.bak 永远是最新一次替换前全文')
+})
+
+test('renderAgentsDigest：读-改-写包在仓库锁内（契约 §1 withRepoLock，注入 fake）', (t) => {
+  const dir = freshDir(t)
+  const { path } = agentsFile(dir)
+  const rulesDir = join(dir, 'rules')
+  const calls = []
+  const fakeLock = (root, fn) => {
+    calls.push(root)
+    return fn()
+  }
+  const got = renderAgentsDigest({
+    rules: [doc({ key: 'iron-rule-28', number: 28 })],
+    agentsPath: path,
+    rulesDir,
+    lock: fakeLock,
+  })
+  assert.equal(got.ok, true, got.code)
+  assert.deepEqual(calls, [rulesDir], '锁根必须是规则仓（.locks 与 manifest 同根）')
+
+  // 锁抛错：fail-open 返回错误码，不抛、不写坏文件。
+  const before = readFileSync(path, 'utf8')
+  const failed = renderAgentsDigest({
+    rules: [doc({ key: 'iron-rule-29', number: 29 })],
+    agentsPath: path,
+    rulesDir,
+    lock: () => { throw new Error('rule_locked') },
+  })
+  assert.equal(failed.ok, false)
+  assert.equal(failed.code, 'render_failed')
+  assert.equal(readFileSync(path, 'utf8'), before)
+})
+
+test('renderAgentsDigest：渲染时恒重读磁盘（块外手改不丢字节）', (t) => {
+  const dir = freshDir(t)
+  const { path } = agentsFile(dir)
+  const rules = [doc({ key: 'iron-rule-30', number: 30 })]
+  assert.equal(renderAgentsDigest({ rules, agentsPath: path }).changed, true)
+  // 用户手改块外：再渲染必须重读，保留手改内容。
+  const edited = readFileSync(path, 'utf8').replace('块外内容第一行。', '块外内容第一行（用户手改）。')
+  writeFileSync(path, edited, 'utf8')
+  const got = renderAgentsDigest({ rules: [doc({ key: 'iron-rule-31', number: 31 })], agentsPath: path })
+  assert.equal(got.ok, true)
+  assert.match(readFileSync(path, 'utf8'), /块外内容第一行（用户手改）。/)
 })

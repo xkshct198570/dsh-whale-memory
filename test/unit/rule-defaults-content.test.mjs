@@ -15,6 +15,7 @@ import {
   RULE_FIELDS,
   normalizeRuleDoc,
   parseRuleDocument,
+  serializeRuleDocument,
   validateRule,
 } from '../../src/core/rule-store.js'
 import { detectSignals } from '../../src/core/rules.js'
@@ -55,15 +56,24 @@ test('rules-local 只有本机专用的 iron-rule-13.md', () => {
   assert.deepEqual(localDocs.map(({ name }) => name), ['iron-rule-13.md'])
 })
 
-test('17 个文件全部可解析，且 front 字段与 serializeRuleDocument 顺序一致（18 字段）', () => {
+test('17 个文件全部可解析，且 front 字段与 serializeRuleDocument 顺序一致（19 字段，summary 可选）', () => {
   assert.equal(allDocs.length, 17)
   for (const { name, parsed } of allDocs) {
     assert.ok(parsed.ok, `${name} 解析失败：${parsed.error}`)
   }
+  // summary 是可选展示字段（R8-06）：默认文件不带它，因此期望字段 = RULE_FIELDS 去掉 summary，
+  // 顺序必须与序列化口径一致（append 在 origin 之后，不扰动既有文件的字段顺序）。
+  const expected = RULE_FIELDS.filter((field) => field !== 'summary')
   for (const { name, doc } of allDocs) {
-    assert.deepEqual(Object.keys(doc.front), [...RULE_FIELDS], `${name} 字段集/顺序不符合序列化口径`)
+    assert.deepEqual(Object.keys(doc.front), expected, `${name} 字段集/顺序不符合序列化口径`)
     assert.equal(Number(doc.front.version), 1, `${name} version 必须是 1`)
   }
+  // 追加断言：带 summary 的文档按 RULE_FIELDS 全序序列化并能 round-trip，且 summary 在末尾。
+  const sample = serializeRuleDocument({ front: { ...allDocs[0].doc.front, summary: '一句话摘要' }, text: allDocs[0].doc.text })
+  assert.equal(sample.ok, true, sample.error)
+  const reparsed = parseRuleDocument(sample.text)
+  assert.equal(reparsed.front.summary, '一句话摘要')
+  assert.deepEqual(Object.keys(reparsed.front), [...RULE_FIELDS])
 })
 
 test('全部文件通过 validateRule（numbers Map 排除自身）', () => {

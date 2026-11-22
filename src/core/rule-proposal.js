@@ -18,29 +18,31 @@
  * 就会出现"面板能确认、聊天也能确认，但两条路径落盘逻辑不同"的分叉——同一入口才能保证
  * 守卫、编号、commit、镜像、审计五件事一次全做或全不做。
  */
-import { mkdirSync, readFileSync, readdirSync, unlinkSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync } from 'node:fs'
 import { join, resolve } from 'node:path'
-import { dedupeKey, detectSignals, normalizeRuleText } from './rules.js'
+import { dedupeKey, detectSignals } from './rules.js'
 import {
   buildMergePrompt,
   classifyRelation,
   compileStructured,
-  guardRewrite,
-  normalizeForGuard,
   parseMergeReply,
-  retainsClause,
 } from './rule-reconcile.js'
 import {
   atomicWriteFile,
   computeManifest,
   defaultRuleRoot,
-  readManifest,
   ensureRuleRepo,
   gitCommit,
   listRules,
+  readManifest,
   regenerateManifest,
   writeRule,
 } from './rule-store.js'
+// R8-03 的存储层契约（锁/事务日志/显式路径提交）由 store owner 落地；未落地时按下面的
+// `*Safe` 降级函数退回旧路径（同一事务语义，只是没有跨进程仓库锁与 .txn 日志）。
+import * as storeApi from './rule-store.js'
+import { buildApplyPlan } from './rule-plan.js'
 import { agentsPathOf, renderAgentsDigest, titleOfRule } from './rule-render.js'
 import { mirrorRules } from './rule-mirror.js'
 
@@ -85,6 +87,19 @@ function trimmed(value) {
 
 function chars(text) {
   return Array.from(textOf(text)).length
+}
+
+/**
+ * 候选去重 hash（架构书 §3.2）：**必须含 scope+role**——同一句话在不同工作区是两条候选，
+ * 不能互相占用命中计数/冷却窗口。文本先走 `dedupeKey` 归一化，scope/role 单独进盐。
+ * @param {string} text 用户原句
+ * @param {string|{scope?:string,role?:string}} [scopeOrDraft] 作用域（或草案）
+ * @returns {string} 16 hex
+ */
+export function proposalHashOf(text, scopeOrDraft = {}) {
+  const scope = trimmed(typeof scopeOrDraft === 'string' ? scopeOrDraft : scopeOrDraft?.scope) || 'global'
+  const role = trimmed(typeof scopeOrDraft === 'object' && scopeOrDraft ? scopeOrDraft.role : '')
+  return createHash('sha256').update(`${dedupeKey(text)}|${scope}|${role}`, 'utf8').digest('hex').slice(0, 16)
 }
 
 function today() {
@@ -212,7 +227,10 @@ function appendRejected(dir, entry) {
 }
 
 /**
- * 是否在冷却期：同 hash 在 `rules.askCooldownDays`(30) 天内被拒绝过。
+ * 是否在冷却期：同 hash 在 `rules.askCooldownDays`(30) 天的**绝对窗口**内被拒绝过。
+ *
+ * 为什么按 `expiresAt` 而不是 `now - ts`：时钟回拨时 `now - ts` 会变成负数（永远 ≤ 窗口），
+ * 冷却/会话 TTL 就被永久冻住；落绝对到期时间后，回拨只是延长到原到期点，前跳则正常解冻。
  * @returns {boolean}
  */
 function isCooling(dir, hash, days, now) {
@@ -220,9 +238,11 @@ function isCooling(dir, hash, days, now) {
   const windowMs = days * 24 * 3600 * 1000
   for (const entry of readRejected(dir)) {
     if (trimmed(entry.hash) !== hash) continue
-    const ts = Number(entry.ts)
-    if (!Number.isFinite(ts)) continue
-    if (now - ts <= windowMs) return true
+    const expiresAt = Number.isFinite(Number(entry.expiresAt))
+      ? Number(entry.expiresAt)
+      : (Number.isFinite(Number(entry.ts)) ? Number(entry.ts) + windowMs : NaN)
+    if (!Number.isFinite(expiresAt)) continue
+    if (now < expiresAt) return true
   }
   return false
 }
@@ -292,13 +312,15 @@ export function createProposal({
     nextNumber: manifest.nextNumber,
     source,
     workspace: trimmed(ident.workspace),
+    // role 必须进草案：候选 hash 含 role（架构书 §3.2），否则跨角色会共用命中去重/冷却。
+    role: trimmed(ident.roleId),
   })
   if (!compiled.ok) return { ok: false, code: compiled.error, detail: compiled.detail }
   const draft = compiled.draft
   const relation = classifyRelation(draft, activeRules)
   const affected = snapshotAffected(activeRules, relation.targets)
 
-  const hash = dedupeKey(raw)
+  const hash = proposalHashOf(raw, draft)
   const hash8 = hash.slice(0, 8)
   const dir = join(base, 'proposals')
   const cooling = isCooling(dir, hash, cfgNum(config?.rules?.askCooldownDays, 30), now)
@@ -404,6 +426,8 @@ export function rejectProposal({ id, reason = '', identity = {}, rulesDir, confi
   const entry = {
     hash: textOf(proposal.hash),
     ts: now,
+    // 绝对到期时间：时钟回拨不会让冷却永久冻结（isCooling 只比 now < expiresAt）。
+    expiresAt: now + Math.max(0, cfgNum(config?.rules?.askCooldownDays, 30)) * 24 * 3600 * 1000,
     id: textOf(proposal.id),
     reason: trimmed(reason).slice(0, 200),
     userId: trimmed(ident.userId),
@@ -502,7 +526,18 @@ export async function confirmPendingForSession({
   if (!cfgBool(config?.rules?.enabled, true)) return { ok: false, code: 'rules_disabled' }
   const pending = getSessionPending(sid, now)
   if (!pending) return { ok: false, code: 'no_pending' }
-  if (detectConfirmIntent(query) !== 'confirm') return { ok: false, code: 'no_confirm' }
+  // 只认 `收录 <id8>`（大小写/空格容忍）：「好/可以/确认」这类模糊句**不动状态**
+  // （架构书 §3.4）。面板按钮是唯一显式入口；聊天只作快捷通道，必须有 nonce 指名候选。
+  const nonce = confirmNonceOf(query)
+  if (!nonce) return { ok: false, code: 'no_confirm' }
+  const got = readProposal({ rulesDir, config, id: pending.proposalId })
+  if (!got.ok) {
+    clearSessionPending(sid)
+    return { ok: false, code: 'no_pending' }
+  }
+  // nonce 必须指向本会话映射的那一条：不许用面板里另一条的 nonce 顶替（会收录没给用户看过口径的候选）。
+  const expected = proposalNonce(got.proposal)
+  if (!expected || expected !== nonce) return { ok: false, code: 'nonce_mismatch', proposal: got.proposal }
   const result = await applyProposal({
     id: pending.proposalId,
     decisions: {},
@@ -529,38 +564,139 @@ export async function confirmPendingForSession({
 }
 
 // ---------------------------------------------------------------------------
-// 应用事务
+// 应用事务：存储层契约接线（锁 / 事务日志 / 显式路径提交）
 // ---------------------------------------------------------------------------
 
-/** 记录文件原样（回滚快照）；file 不存在时 content=null。 */
-function trackFile(planned, file) {
-  if (!file || planned.some((item) => item.file === file)) return
-  let content = null
-  try {
-    content = readFileSync(file, 'utf8')
-  } catch { content = null }
-  planned.push({ file, content })
+/** 读文件当前内容：不存在返回 null（坏盘/权限错误必须抛，不能当空文件）。 */
+function readIfExists(file) {
+  if (!file) return null
+  if (!existsSync(file)) return null
+  return readFileSync(file, 'utf8')
 }
 
-/** 回滚：逐文件恢复（null=删除新文件），再重建 manifest；返回失败清单不抛。 */
-function rollbackFiles(base, planned) {
-  const failures = []
-  for (const item of planned) {
+/** @param {string} text @returns {string} sha256 hex（与 rule-plan 的 oldHash 同口径）。 */
+function sha256(text) {
+  return createHash('sha256').update(textOf(text), 'utf8').digest('hex')
+}
+
+/**
+ * 仓库级写锁（R8-02 契约）：store owner 未落地时降级为"函数内同步执行"。
+ *
+ * Why 降级而不是自己造锁：锁/事务日志是存储层资产（stale 清理、跨进程语义都在 store 侧），
+ * 这里再造一份就会两套真源。降级态下 TS-CAS（oldHash 复核 + 候选状态重读）仍在，只是
+ * 跨进程窗口没有互斥；store 落地后本函数自动走真锁。
+ * @returns {{ok:true,value:any}|{ok:false,lockError:string}}
+ */
+function withStoreLock(base, fn, exec) {
+  if (typeof storeApi.withRepoLock === 'function') {
     try {
-      if (item.content === null) {
-        unlinkSync(item.file)
+      const value = storeApi.withRepoLock(base, fn, exec ? { exec } : {})
+      // 契约：抢锁失败返回 {ok:false,error:'repo_locked',lock}（不抛）。要在这里分流，
+      // 否则会被当成"事务失败"回给面板，用户就看不到 lock_failed 这个可重试原因。
+      if (value && value.ok === false && value.error === 'repo_locked') {
+        return { ok: false, lockError: 'repo_locked' }
+      }
+      return { ok: true, value }
+    } catch (err) {
+      return { ok: false, lockError: String(err?.message || err) }
+    }
+  }
+  try {
+    return { ok: true, value: fn() }
+  } catch (err) {
+    return { ok: false, lockError: String(err?.message || err) }
+  }
+}
+
+/** 写事务日志（契约：`.txn/<id>.json`）；未落地时跳过（回滚仍靠内存快照）。 */
+function writeTxnSafe(base, txn) {
+  if (typeof storeApi.writeTxn !== 'function') return { ok: true, skipped: true }
+  try {
+    return storeApi.writeTxn(base, txn)
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) }
+  }
+}
+
+/** 清事务日志；未落地时 no-op。 */
+function clearTxnSafe(base, id) {
+  if (typeof storeApi.clearTxn !== 'function') return
+  try {
+    storeApi.clearTxn(base, id)
+  } catch { /* 事务已提交：日志清不掉只影响自愈，不该让已落盘的规则失败 */ }
+}
+
+/**
+ * 单次提交（契约：显式路径；paths 空则不提交）。store 未落地时退回 `gitCommit`（add -A），
+ * 语义仍是"这一笔的所有文件进同一个 commit"，差别只在显式路径清单。
+ * @returns {{ok:boolean,committed?:boolean,error?:string}}
+ */
+function commitChanges(base, message, paths, exec) {
+  const opts = exec ? { exec } : {}
+  if (typeof storeApi.commitRuleChanges === 'function') {
+    try {
+      return storeApi.commitRuleChanges(base, message, { paths, ...opts })
+    } catch (err) {
+      return { ok: false, error: String(err?.message || err) }
+    }
+  }
+  // 兜底也必须带显式 paths：store 已删除 `add -A` 兼容，缺 paths 会变成"静默不提交"。
+  return gitCommit(base, message, { paths, ...opts })
+}
+
+/** 历史目录当前快照名（事务回滚要删掉本笔新增的快照文件）。 */
+function historyNames(base, key) {
+  try {
+    return readdirSync(join(base, 'history', key))
+  } catch {
+    return []
+  }
+}
+
+/**
+ * 回滚本笔写入：逐文件恢复旧全文（null=本笔新建 → 删除），删本笔新增 history 条目，
+ * 最后按现存规则重建 manifest。返回失败清单（不抛：回滚失败本身要留痕给 health）。
+ */
+function rollbackPlan(base, plan, historyBefore, { exec = null, gitAvailable = false } = {}) {
+  const failures = []
+  for (const file of plan.files) {
+    try {
+      if (file.oldText === null) {
+        if (existsSync(file.path)) unlinkSync(file.path)
       } else {
-        const written = atomicWriteFile(item.file, item.content)
-        if (!written.ok) failures.push({ file: item.file, error: written.error })
+        const written = atomicWriteFile(file.path, file.oldText)
+        if (!written.ok) failures.push({ file: file.path, error: written.error })
       }
     } catch (err) {
-      failures.push({ file: item.file, error: String(err?.message || err) })
+      failures.push({ file: file.path, error: String(err?.message || err) })
+    }
+  }
+  for (const [key, before] of historyBefore) {
+    const keep = new Set(before)
+    for (const name of historyNames(base, key)) {
+      if (keep.has(name)) continue
+      try { unlinkSync(join(base, 'history', key, name)) } catch (err) {
+        failures.push({ file: join(base, 'history', key, name), error: String(err?.message || err) })
+      }
     }
   }
   try {
     regenerateManifest(base)
   } catch (err) {
     failures.push({ file: join(base, 'manifest.json'), error: String(err?.message || err) })
+  }
+  // 清 index：commit 失败时 store 的 gitCommit 已把新内容 `git add` 进暂存区，只恢复工作树
+  // 不清暂存，下一次任意 commit 会把"已回滚的规则"重新带进历史（lead 审出的回滚缺口）。
+  if (gitAvailable) {
+    const paths = [...plan.files.map((file) => file.path), join(base, 'manifest.json')]
+    if (typeof storeApi.resetGitIndex === 'function') {
+      try {
+        const reset = storeApi.resetGitIndex(base, paths, exec ? { exec } : {})
+        if (reset && reset.ok === false) failures.push({ file: 'git-index', error: String(reset.error || 'reset_failed') })
+      } catch (err) {
+        failures.push({ file: 'git-index', error: String(err?.message || err) })
+      }
+    }
   }
   return failures
 }
@@ -606,8 +742,15 @@ async function callLlmMerge({ llm, prompt, selection = null, log = () => {} }) {
   }
 }
 
-/** 候选落回 needs_manual（失败留痕，不落规则文件）。 */
+/**
+ * 候选落回 needs_manual（失败留痕，不落规则文件）。
+ *
+ * 带状态 CAS：并发下另一只手已经把候选改成 accepted/rejected 时不得覆盖——否则会出现
+ * 「规则已落盘、候选却显示 needs_manual」的两套事实。
+ */
 function markNeedsManual({ rulesDir, config, proposal, code, detail, failures, now }) {
+  const fresh = readProposal({ rulesDir, config, id: proposal.id })
+  if (fresh.ok && !['pending', 'needs_manual'].includes(textOf(fresh.proposal.status))) return fresh.proposal
   const next = {
     ...proposal,
     status: 'needs_manual',
@@ -680,43 +823,27 @@ function auditApply({
 }
 
 /**
- * 子句并集（归一化去重；保留原文形态）。
- * 只收**正文里确实还在**的子句：owner 显式 acknowledgeDropped 丢弃的例外不能被 front 字段
- * 偷偷留着，否则结构化字段与正文就是两套事实。
- */
-function unionClauses(base, extra, mergedText) {
-  const mergedNorm = normalizeForGuard(mergedText)
-  const out = []
-  const seen = new Set()
-  for (const item of [...base, ...extra]) {
-    const text = trimmed(item)
-    if (!text) continue
-    if (mergedNorm && !retainsClause(mergedNorm, text)) continue
-    const key = normalizeRuleText(text)
-    if (!key || seen.has(key)) continue
-    seen.add(key)
-    out.push(text)
-  }
-  return out
-}
-
-/**
- * 唯一应用事务（架构书 §4.7）：守卫 → 落盘 → 单次 commit → 镜像 → 渲染 → 审计。
+ * 唯一应用事务（架构书 §3.5 / R8-03）：plan → 仓库锁 → CAS → 事务日志 → 逐文件落盘 → 单次 commit → 清日志。
  *
- * 失败语义（与文档的 commit_pending 不同，按 R3b 任务书收紧）：
- * 任何一步失败都**回滚已写文件**并返回错误；只有"镜像/渲染/审计"失败不回滚（它们可重试，
- * 且不回滚才能让面板看到 pending 状态）。
+ * 顺序不可换：
+ * 1. `buildApplyPlan` 先算计划与守卫（纯函数），失败一律不写盘、候选转 needs_manual 并留 failures；
+ * 2. 锁内**重读候选**做状态 CAS（双击/并发只有一次能拿到 pending）；
+ * 3. 锁内逐文件复核 `oldHash`（TOCTOU：计划之后有人手改 → plan_stale，不写）；
+ * 4. 写 `.txn` → 逐文件 `writeRule(lockHeld:true, git:false)` → `commitRuleChanges(显式路径)`；
+ * 5. **commit 成功后**才写候选 accepted / 清事务日志；镜像/AGENTS/审计失败不回滚真源。
  *
  * @param {{id:string, decisions?:object, identity?:object, traceId?:string, rulesDir?:string,
  *   config?:any, getLlm?:Function, getSelection?:Function, backend?:any,
  *   mirror?:Function, renderAgents?:Function, git?:boolean, exec?:Function, log?:Function,
- *   now?:number}} args
+ *   now?:number, planHash?:string}} args
+ *   planHash: 面板 `/rules/plan` 发回来的指纹；给了就必须与本次重算一致（plan_hash_mismatch）。
  * @returns {Promise<object>}
  */
 export async function applyProposal({
   id, decisions = {}, identity = {}, traceId = '', rulesDir, config = {},
   getLlm = () => null, getSelection = () => null, backend = null,
   mirror = null, renderAgents = null, git = true, exec = null, log = () => {}, now = Date.now(),
+  planHash = '',
 } = {}) {
   const base = resolveRuleRoot(rulesDir, config)
   const got = readProposal({ rulesDir: base, config, id })
@@ -728,7 +855,7 @@ export async function applyProposal({
   if (!['pending', 'needs_manual'].includes(textOf(proposal.status))) {
     return { ok: false, error: 'proposal_not_pending', code: 'proposal_not_pending', proposal }
   }
-  const decided = decisions && typeof decisions === 'object' ? decisions : {}
+  const decided = { ...(decisions && typeof decisions === 'object' ? decisions : {}) }
   const draft = proposal.draft && typeof proposal.draft === 'object' ? proposal.draft : null
   if (!draft || !textOf(draft.key)) return { ok: false, error: 'proposal_corrupt', code: 'proposal_corrupt', proposal }
   const relation = textOf(proposal.relation?.relation) || 'new'
@@ -742,236 +869,303 @@ export async function applyProposal({
     return { ok: false, error: 'git_required', code: 'git_required', proposal }
   }
 
-  const currentRules = listRules(base).rules.filter((doc) => textOf(doc.front.status) === 'active'
-    && textOf(doc.front.type) !== 'rule-candidate')
-  const byKey = new Map(currentRules.map((doc) => [textOf(doc.front.key), doc]))
-  // 受影响旧规则：磁盘真源优先（提案后文件可能被手改），缺失时退回提案快照。
-  const affectedDocs = []
-  for (const snap of Array.isArray(proposal.affected) ? proposal.affected : []) {
-    const key = textOf(snap?.key)
-    if (!key) continue
-    const live = byKey.get(key)
-    if (live) affectedDocs.push({ key, front: live.front, text: textOf(live.text), file: live.file })
-    else if (snap.front) affectedDocs.push({ key, front: snap.front, text: textOf(snap.text), file: textOf(snap.file) })
+  // 1) 措辞改写：面板 decisions.text/affected 优先；需要改写又没给 → rules.llm 问模型，否则转面板。
+  //    模型输出只当**候选措辞**：它和面板输入一样只能进 decisions，随后由 plan 逐文件守卫。
+  const rewrites = new Map()
+  for (const item of Array.isArray(decided.affected) ? decided.affected : []) {
+    const key = trimmed(item?.key)
+    const next = trimmed(item?.new_text ?? item?.text)
+    if (key && next) rewrites.set(key, next)
   }
-
-  // 3) duplicate：不新建文件，只把裁定结果记下来（hits 累加属于候选侧，规则正文不动）。
-  if (relation === 'duplicate') {
-    const targetDoc = byKey.get(textOf(proposal.relation?.targets?.[0]?.key))
-    const applied = {
-      key: targetDoc ? textOf(targetDoc.front.key) : textOf(proposal.relation?.targets?.[0]?.key),
-      file: targetDoc?.file || '',
-      number: targetDoc ? Number(targetDoc.front.number) : null,
-      commit: null,
-      duplicate: true,
-      mirror: null,
-      agents: null,
-    }
-    const next = { ...proposal, status: 'accepted', updated: isoNow(now), applied: { ...applied, at: isoNow(now) } }
-    writeProposalFile(next.file || join(proposalsDirOf(base, config), `${next.id}.json`), next)
-    auditApply({
-      backend, proposal, relation, target: applied, beforeText: targetDoc?.text, afterText: targetDoc?.text || '',
-      affectedChanges: [], commit: null, mirrorResult: null, agentsResult: null, traceId, identity, log,
-    })
-    return { ok: true, applied, proposal: next, duplicate: true }
-  }
-
-  // 1) 措辞改写：面板 decisions.text 优先；否则 rules.llm 打开时问模型。
-  let mergedText = trimmed(decided.text)
-  const rewrites = []
-  if (!mergedText && needsRewrite) {
-    if (!cfgBool(config?.rules?.llm, false)) {
+  if (!trimmed(decided.text)) {
+    if (!needsRewrite) {
+      decided.text = trimmed(draft.text)
+    } else if (!cfgBool(config?.rules?.llm, false)) {
       const manual = markNeedsManual({
         rulesDir: base, config, proposal, code: 'llm_unavailable',
         detail: '需要改写但 rules.llm=false', now,
       })
       return { ok: false, error: 'llm_unavailable', code: 'llm_unavailable', status: 'needs_manual', proposal: manual }
+    } else {
+      const llm = typeof getLlm === 'function' ? getLlm() : null
+      if (!llm) {
+        const manual = markNeedsManual({ rulesDir: base, config, proposal, code: 'llm_unavailable', detail: '模型不可用', now })
+        return { ok: false, error: 'llm_unavailable', code: 'llm_unavailable', status: 'needs_manual', proposal: manual }
+      }
+      const affectedDocs = (Array.isArray(proposal.affected) ? proposal.affected : [])
+        .map((snap) => ({ key: trimmed(snap?.key), front: snap?.front || {}, text: textOf(snap?.text) }))
+        .filter((doc) => doc.key)
+      const prompt = buildMergePrompt({ draft, affected: affectedDocs })
+      const out = await callLlmMerge({ llm, prompt, selection: getSelection?.(), log })
+      if (!out.ok) {
+        const manual = markNeedsManual({ rulesDir: base, config, proposal, code: out.error, detail: '模型改写失败', now })
+        return { ok: false, error: out.error, code: out.error, status: 'needs_manual', proposal: manual }
+      }
+      const parsed = parseMergeReply(out.text)
+      if (!parsed.ok) {
+        const manual = markNeedsManual({
+          rulesDir: base, config, proposal, code: 'llm_unparseable', detail: parsed.error, now,
+        })
+        return { ok: false, error: 'llm_unparseable', code: 'llm_unparseable', status: 'needs_manual', proposal: manual }
+      }
+      decided.text = parsed.value.merged_text
+      // 面板显式给过的 affected 改写优先，模型的不覆盖 owner。
+      for (const item of parsed.value.affected) {
+        const key = trimmed(item?.key)
+        const next = trimmed(item?.new_text)
+        if (key && next && !rewrites.has(key)) rewrites.set(key, next)
+      }
     }
-    const llm = typeof getLlm === 'function' ? getLlm() : null
-    if (!llm) {
-      const manual = markNeedsManual({ rulesDir: base, config, proposal, code: 'llm_unavailable', detail: '模型不可用', now })
-      return { ok: false, error: 'llm_unavailable', code: 'llm_unavailable', status: 'needs_manual', proposal: manual }
-    }
-    const prompt = buildMergePrompt({ draft, affected: affectedDocs })
-    const out = await callLlmMerge({ llm, prompt, selection: getSelection?.(), log })
-    if (!out.ok) {
-      const manual = markNeedsManual({ rulesDir: base, config, proposal, code: out.error, detail: '模型改写失败', now })
-      return { ok: false, error: out.error, code: out.error, status: 'needs_manual', proposal: manual }
-    }
-    const parsed = parseMergeReply(out.text)
-    if (!parsed.ok) {
-      const manual = markNeedsManual({
-        rulesDir: base, config, proposal, code: 'llm_unparseable', detail: parsed.error, now,
-      })
-      return { ok: false, error: 'llm_unparseable', code: 'llm_unparseable', status: 'needs_manual', proposal: manual }
-    }
-    mergedText = parsed.value.merged_text
-    for (const item of parsed.value.affected) rewrites.push(item)
   }
-  for (const item of Array.isArray(decided.affected) ? decided.affected : []) {
-    const key = trimmed(item?.key)
-    const newText = trimmed(item?.new_text ?? item?.text)
-    if (!key || !newText) continue
-    const existing = rewrites.find((rw) => rw.key === key)
-    if (existing) existing.new_text = newText
-    else rewrites.push({ key, new_text: newText })
-  }
-  if (!mergedText) mergedText = trimmed(draft.text)
-  if (!mergedText) {
+  decided.affected = [...rewrites.entries()].map(([key, new_text]) => ({ key, new_text }))
+  if (!trimmed(decided.text)) {
     const manual = markNeedsManual({ rulesDir: base, config, proposal, code: 'empty_rewrite', now })
     return { ok: false, error: 'empty_rewrite', code: 'empty_rewrite', status: 'needs_manual', proposal: manual }
   }
 
-  // 2) 守卫：改写正文必须保住旧例外/模态/作用域；新规则也要过长度/隐私/模糊词。
-  const strict = cfgBool(config?.rules?.guardStrict, true)
-  // 面板发的是布尔（勾选确认= true），聊天/脚本发的是 key 数组；两种都接受，但只在非 strict
-  // 模式才放行「丢例外」——strict 是硬闸，勾选也不许绕（架构书 §4.5）。
-  const ackRaw = decided.acknowledgeDropped
-  const acknowledgeDropped = Array.isArray(ackRaw)
-    ? ackRaw
-    : (ackRaw === true ? affectedDocs.map((doc) => doc.key) : [])
-  // 面板「只接受这几条受影响规则」：不在白名单里的旧规则保持原样（不 supersede、不改写）。
-  const acceptAffected = Array.isArray(decided.acceptAffected) && decided.acceptAffected.length
-    ? new Set(decided.acceptAffected.map((key) => trimmed(key)).filter(Boolean))
-    : null
-  const acceptedAffected = acceptAffected ? affectedDocs.filter((doc) => acceptAffected.has(doc.key)) : affectedDocs
-  const guard = guardRewrite({ affected: affectedDocs, mergedText, draft, strict, acknowledgeDropped })
-  if (!guard.ok) {
+  // 2) 计划（含逐文件守卫 + planHash）；守卫失败必须把失败项留到候选上（needs_manual 可见可改）。
+  const built = buildApplyPlan({ proposal, rulesDir: base, config, decisions: decided, now, log, exec })
+  if (!built.ok) {
+    if (built.code === 'proposal_corrupt') {
+      return { ok: false, error: built.code, code: built.code, proposal }
+    }
     const manual = markNeedsManual({
-      rulesDir: base, config, proposal, code: 'rule_guard_failed', failures: guard.failures, now,
+      rulesDir: base, config, proposal, code: built.code, detail: built.detail,
+      failures: built.failures, now,
     })
-    log(`[whale-memory] rule apply guard failed proposal=${proposal.id} failures=${guard.failures.length}`)
+    if (built.code === 'rule_guard_failed') {
+      log(`[whale-memory] rule apply guard failed proposal=${proposal.id} failures=${built.failures?.length || 0}`)
+    }
     return {
       ok: false,
-      error: 'rule_guard_failed',
-      code: 'rule_guard_failed',
-      failures: guard.failures,
+      error: built.code,
+      code: built.code,
+      failures: built.failures || [],
       status: 'needs_manual',
       proposal: manual,
     }
   }
-
-  // 4) 编号/文件名：refine 沿用旧号，其余用草案号（空号 6 由 writeRule 挡住）。
-  const targetKey = textOf(draft.key)
-  const existingTarget = byKey.get(targetKey)
-  const manifest = computeManifest(currentRules, readManifest(base)?.retired)
-  const targetNumber = existingTarget
-    ? Number(existingTarget.front.number)
-    : (Number.isInteger(Number(draft.number)) && Number(draft.number) > 0 ? Number(draft.number) : manifest.nextNumber)
-
-  const planned = []
-  trackFile(planned, existingTarget?.file || join(base, `${targetKey}.md`))
-  for (const doc of affectedDocs) {
-    if (doc.key !== targetKey && doc.file) trackFile(planned, doc.file)
+  const plan = built.plan
+  // 墓碑编号不复用（R8-01）：锁外快路径先挡一次；锁内重算还会再挡（purge 可能发生在两步之间）。
+  const planNumber = plan.target.number
+  if (Number.isInteger(planNumber) && planNumber > 0
+    && typeof storeApi.isRetiredNumber === 'function'
+    && storeApi.isRetiredNumber(base, planNumber)) {
+    const manual = markNeedsManual({
+      rulesDir: base, config, proposal, code: 'number_retired',
+      detail: `编号 ${planNumber} 已被墓碑占位（永不复用）`, now,
+    })
+    return { ok: false, error: 'number_retired', code: 'number_retired', status: 'needs_manual', proposal: manual }
   }
-
-  const supersedable = ['merge', 'conflict', 'refine'].includes(relation)
-  const writeOpts = { git: false, ...(exec ? { exec } : {}) }
-  const created = existingTarget ? textOf(existingTarget.front.created) || today() : today()
-  const version = existingTarget ? Number(existingTarget.front.version || 1) + 1 : 1
-  const front = {
-    key: targetKey,
-    type: textOf(draft.type) || 'rule',
-    number: targetNumber,
-    priority: textOf(draft.priority) || 'P1',
-    scope: textOf(draft.scope) || 'global',
-    role: textOf(draft.role),
-    modality: textOf(draft.modality) || 'must',
-    action: textOf(draft.action),
-    object: textOf(draft.object),
-    // 合并/冲突/改写时例外与条件必须取并集：守卫已要求旧例外留在正文里，
-    // front 里若只留草案的例外，就会出现"正文有、结构化字段没有"的漂移。
-    conditions: unionClauses(
-      Array.isArray(draft.conditions) ? draft.conditions : [],
-      supersedable ? affectedDocs.flatMap((doc) => doc.front.conditions || []) : [],
-      mergedText,
-    ),
-    exceptions: unionClauses(
-      Array.isArray(draft.exceptions) ? draft.exceptions : [],
-      supersedable ? affectedDocs.flatMap((doc) => doc.front.exceptions || []) : [],
-      mergedText,
-    ),
-    status: 'active',
-    merged_into: '',
-    superseded_by: '',
-    created: created || today(),
-    updated: today(),
-    version,
-    origin: `proposal:${textOf(proposal.id)}`,
-  }
-  const firstWrite = writeRule(base, { front, text: mergedText }, writeOpts)
-  if (!firstWrite.ok) {
-    const rolledBack = rollbackFiles(base, planned)
+  const expectedPlanHash = trimmed(planHash)
+  // 锁外先比一次：能早退就早退（面板 hash 明显过期，不必抢锁）。
+  if (expectedPlanHash && expectedPlanHash !== plan.planHash) {
     return {
       ok: false,
-      error: 'write_failed',
-      code: textOf(firstWrite.error) || 'write_failed',
-      detail: firstWrite.detail,
-      rolledBack: true,
-      rollbackFailures: rolledBack,
+      error: 'plan_hash_mismatch',
+      code: 'plan_hash_mismatch',
+      proposal,
+      expectedPlanHash,
+      planHash: plan.planHash,
+    }
+  }
+
+  // 3) 锁内事务：CAS → **锁内重算 plan** → oldHash 复核 → 事务日志 → 逐文件写 → 单次 commit → accepted。
+  const runApply = () => {
+    const fresh = readProposal({ rulesDir: base, config, id: proposal.id })
+    if (!fresh.ok) return { ok: false, code: 'proposal_not_found' }
+    if (!['pending', 'needs_manual'].includes(textOf(fresh.proposal.status))) {
+      return { ok: false, code: 'proposal_not_pending', proposal: fresh.proposal }
+    }
+    // 编号/墓碑/oldHash 必须在**锁内**重算：锁外的 plan 可能已被另一笔 apply/purge 改掉
+    // （两提案同抢一个号 → 第二笔会撞号 write_failed；plan 后 purge 目标号 → 会复用墓碑号）。
+    const rebuilt = buildApplyPlan({
+      proposal: fresh.proposal, rulesDir: base, config, decisions: decided, now, log, exec,
+    })
+    if (!rebuilt.ok) {
+      if (rebuilt.code === 'proposal_corrupt') return { ok: false, code: 'proposal_corrupt' }
+      const manual = markNeedsManual({
+        rulesDir: base, config, proposal: fresh.proposal, code: rebuilt.code,
+        detail: rebuilt.detail, failures: rebuilt.failures, now,
+      })
+      return {
+        ok: false,
+        code: rebuilt.code,
+        error: rebuilt.code,
+        failures: rebuilt.failures || [],
+        status: 'needs_manual',
+        proposal: manual,
+      }
+    }
+    const plan = rebuilt.plan // 锁内计划是唯一真源；下面所有旧 hash/编号/提交都取它
+    // 面板 hash 以锁内重算为准：两者不一致说明计划已过期，必须让用户重新预览。
+    if (expectedPlanHash && expectedPlanHash !== plan.planHash) {
+      return { ok: false, code: 'plan_hash_mismatch', expectedPlanHash, planHash: plan.planHash }
+    }
+    const stale = []
+    for (const file of plan.files) {
+      let current
+      try {
+        current = readIfExists(file.path)
+      } catch (err) {
+        stale.push({ key: file.key, code: 'plan_stale', detail: `读取失败：${err?.message || err}` })
+        continue
+      }
+      const hash = current === null ? null : sha256(current)
+      if (hash !== file.oldHash) {
+        stale.push({ key: file.key, code: 'plan_stale', detail: '计划后磁盘内容已变化（oldHash 不匹配）' })
+      }
+    }
+    if (stale.length) return { ok: false, code: 'plan_stale', failures: stale }
+
+    // duplicate：不建文件、不 commit，只把裁定写进候选（同一入口，锁内状态 CAS）。
+    if (plan.duplicate) {
+      const applied = {
+        key: plan.target.key,
+        file: '',
+        number: plan.target.number,
+        commit: null,
+        duplicate: true,
+        mirror: null,
+        agents: null,
+        at: isoNow(now),
+      }
+      const next = { ...fresh.proposal, status: 'accepted', updated: isoNow(now), applied }
+      writeProposalFile(next.file || join(proposalsDirOf(base, config), `${next.id}.json`), next)
+      return { ok: true, duplicate: true, applied, proposal: next, commit: null, affectedChanges: [] }
+    }
+
+    // 事务日志是崩溃恢复锚点：写不进去就不许落盘（否则崩溃后没法按 oldText 回滚）。
+    const txnId = `apply-${proposal.id}-${now}-${process.pid}`
+    const txn = writeTxnSafe(base, {
+      id: txnId,
+      planHash: plan.planHash,
+      proposalId: proposal.id,
+      createdAt: isoNow(now),
+      files: plan.files.map((file) => ({
+        key: file.key, path: file.path, oldText: file.oldText, newText: file.newText,
+      })),
+    })
+    if (!txn.ok && !txn.skipped) {
+      return { ok: false, code: 'txn_failed', error: 'txn_failed', detail: txn.error, failures: [{ code: 'txn_failed' }] }
+    }
+    const historyBefore = new Map(plan.files.map((file) => [file.key, historyNames(base, file.key)]))
+    const written = []
+    for (const file of plan.files) {
+      const out = writeRule(base, { front: file.front, text: file.text }, {
+        git: false, lockHeld: true, ...(exec ? { exec } : {}),
+      })
+      if (!out.ok) {
+        const rolledBack = rollbackPlan(base, plan, historyBefore, { exec, gitAvailable })
+        // 回滚后必须清本笔事务日志：留着会让下次启动 recover 把之后合法写入当成未完成事务。
+        clearTxnSafe(base, txnId)
+        return {
+          ok: false,
+          error: 'write_failed',
+          code: textOf(out.error) || 'write_failed',
+          detail: out.detail,
+          key: file.key,
+          rolledBack: true,
+          rollbackFailures: rolledBack,
+          failures: [{ code: textOf(out.error) || 'write_failed', key: file.key, detail: textOf(out.detail) }],
+        }
+      }
+      written.push({ key: file.key, path: out.path || file.path })
+    }
+
+    // 单次 commit（显式路径；paths 为空即不提交，git 不可用时整笔跳过）。
+    let commit = null
+    if (gitAvailable) {
+      // 显式路径：规则文件 + manifest（manifest 每次写都会重建，必须同一笔提交里）。
+      const commitPaths = [...plan.files.map((file) => file.path), join(base, 'manifest.json')]
+      const committed = commitChanges(base, plan.commitMessage, commitPaths, exec)
+      if (!committed.ok) {
+        const rolledBack = rollbackPlan(base, plan, historyBefore, { exec, gitAvailable })
+        // 同上：commit 失败回滚后清事务日志（restore 已把文件写回 oldText，不再有待恢复项）。
+        clearTxnSafe(base, txnId)
+        return {
+          ok: false,
+          error: 'commit_failed',
+          code: 'commit_failed',
+          detail: committed.error,
+          rolledBack: true,
+          rollbackFailures: rolledBack,
+        }
+      }
+      commit = { message: plan.commitMessage, committed: Boolean(committed.committed) }
+    }
+    clearTxnSafe(base, txnId)
+
+    const targetFile = written.find((item) => item.key === plan.target.key) || written[0] || { path: '' }
+    const affectedChanges = plan.affected
+      .filter((item) => item.key !== plan.target.key)
+      .map((item) => ({ key: item.key, before: item.oldText, after: item.newText, status: item.status }))
+    // 候选 accepted 只在 commit 成功后写（失败/崩溃时候选仍是 pending/needs_manual，可重试）。
+    const applied = {
+      key: plan.target.key,
+      file: targetFile.path,
+      number: plan.target.number,
+      commit: commit ? commit.message : null,
+      mirror: null,
+      agents: null,
+      affected: affectedChanges.map((item) => item.key),
+      // 编号被顺延过（提案号被占/保留号）必须让面板看得见，不能静默改成另一个号。
+      ...(plan.numberAdjusted ? { numberAdjusted: plan.numberAdjusted } : {}),
+      at: isoNow(now),
+    }
+    const next = { ...fresh.proposal, status: 'accepted', updated: isoNow(now), applied, relationSummary: relation }
+    const acceptedWritten = writeProposalFile(next.file || join(proposalsDirOf(base, config), `${next.id}.json`), next)
+    if (!acceptedWritten.ok) {
+      log(`[whale-memory] rules accepted write failed id=${proposal.id} code=${acceptedWritten.error}`)
+    }
+    return { ok: true, applied, proposal: next, commit, affectedChanges }
+  }
+
+  const locked = withStoreLock(base, runApply, exec)
+  if (!locked.ok) {
+    return { ok: false, error: 'lock_failed', code: 'lock_failed', detail: locked.lockError, proposal }
+  }
+  const outcome = locked.value || { ok: false, code: 'apply_failed' }
+  if (!outcome.ok) {
+    if (outcome.code === 'proposal_not_pending') {
+      return { ok: false, error: 'proposal_not_pending', code: 'proposal_not_pending', proposal: outcome.proposal }
+    }
+    if (outcome.code === 'plan_stale') {
+      return {
+        ok: false,
+        error: 'plan_stale',
+        code: 'plan_stale',
+        failures: outcome.failures || [],
+        proposal,
+      }
+    }
+    if (outcome.code === 'plan_hash_mismatch') {
+      return {
+        ok: false,
+        error: 'plan_hash_mismatch',
+        code: 'plan_hash_mismatch',
+        ...(outcome.expectedPlanHash ? { expectedPlanHash: outcome.expectedPlanHash } : {}),
+        ...(outcome.planHash ? { planHash: outcome.planHash } : {}),
+        proposal: outcome.proposal || proposal,
+      }
+    }
+    return {
+      ok: false,
+      error: textOf(outcome.error) || textOf(outcome.code) || 'apply_failed',
+      code: textOf(outcome.code) || textOf(outcome.error) || 'apply_failed',
+      ...(outcome.detail ? { detail: outcome.detail } : {}),
+      ...(outcome.rolledBack ? { rolledBack: true } : {}),
+      ...(outcome.rollbackFailures ? { rollbackFailures: outcome.rollbackFailures } : {}),
+      ...(outcome.failures ? { failures: outcome.failures } : {}),
       proposal,
     }
   }
 
-  // 5) 受影响旧规则：合并→merged_into；冲突→superseded_by；逐条留历史快照（writeRule 内）。
-  const supersede = relation === 'merge' || relation === 'conflict'
-  const affectedChanges = []
-  for (const doc of acceptedAffected) {
-    if (doc.key === targetKey) continue
-    const rw = rewrites.find((item) => item.key === doc.key)
-    const nextText = rw ? rw.new_text : doc.text
-    const nextFront = {
-      ...doc.front,
-      updated: today(),
-      version: Number(doc.front.version || 1) + 1,
-    }
-    if (supersede) {
-      nextFront.status = 'superseded'
-      if (relation === 'merge') nextFront.merged_into = targetKey
-      else nextFront.superseded_by = targetKey
-    }
-    const written = writeRule(base, { front: nextFront, text: nextText }, writeOpts)
-    if (!written.ok) {
-      const rolledBack = rollbackFiles(base, planned)
-      return {
-        ok: false,
-        error: 'affected_write_failed',
-        code: textOf(written.error) || 'affected_write_failed',
-        detail: written.detail,
-        key: doc.key,
-        rolledBack: true,
-        rollbackFailures: rolledBack,
-        proposal,
-      }
-    }
-    affectedChanges.push({ key: doc.key, before: doc.text, after: nextText, status: nextFront.status })
-  }
-
-  // 6) 单次 git commit：所有规则文件 + manifest 同一个提交，便于整笔回退。
-  let commit = null
-  if (gitAvailable) {
-    const message = `rule: apply ${textOf(proposal.id)} ${targetKey} (#${targetNumber})`
-    const committed = gitCommit(base, message, exec ? { exec } : {})
-    if (!committed.ok) {
-      const rolledBack = rollbackFiles(base, planned)
-      return {
-        ok: false,
-        error: 'commit_failed',
-        code: 'commit_failed',
-        detail: committed.error,
-        rolledBack: true,
-        rollbackFailures: rolledBack,
-        proposal,
-      }
-    }
-    commit = { message, committed: Boolean(committed.committed) }
-  }
-
-  // 7) 后处理：镜像（rules.mirrorAuto）→ AGENTS 摘要（rules.renderAgents）→ 审计。
+  // 4) 后处理：镜像 → AGENTS 摘要 → 审计。失败不回滚真源（可重试；候选已 accepted）。
   const postRules = listRules(base).rules
   let mirrorResult = null
   const mirrorFn = typeof mirror === 'function' ? mirror : mirrorRules
-  if (cfgBool(config?.rules?.mirrorAuto, true) && backend) {
+  if (!outcome.duplicate && cfgBool(config?.rules?.mirrorAuto, true) && backend) {
     try {
       mirrorResult = mirrorFn({ backend, rules: postRules, log })
     } catch (err) {
@@ -980,7 +1174,7 @@ export async function applyProposal({
   }
   let agentsResult = null
   const agentsFn = typeof renderAgents === 'function' ? renderAgents : renderAgentsDigest
-  if (cfgBool(config?.rules?.renderAgents, true)) {
+  if (!outcome.duplicate && cfgBool(config?.rules?.renderAgents, true)) {
     try {
       agentsResult = agentsFn({ rules: postRules, agentsPath: agentsPathOf(base), rulesDir: base, log })
     } catch (err) {
@@ -991,11 +1185,11 @@ export async function applyProposal({
     backend,
     proposal,
     relation,
-    target: { key: targetKey, number: targetNumber },
-    beforeText: existingTarget ? textOf(existingTarget.text) : '',
-    afterText: mergedText,
-    affectedChanges,
-    commit,
+    target: { key: outcome.applied.key, number: outcome.applied.number },
+    beforeText: outcome.duplicate ? textOf(plan.affected[0]?.oldText) : '',
+    afterText: outcome.duplicate ? textOf(plan.affected[0]?.newText) : textOf(plan.target.text),
+    affectedChanges: outcome.affectedChanges || [],
+    commit: outcome.commit,
     mirrorResult,
     agentsResult,
     traceId,
@@ -1004,24 +1198,65 @@ export async function applyProposal({
   })
 
   const applied = {
-    key: targetKey,
-    file: textOf(firstWrite.path),
-    number: targetNumber,
-    commit: commit ? commit.message : null,
+    ...outcome.applied,
     mirror: mirrorResult ? { ok: Boolean(mirrorResult.ok), mirrored: mirrorResult.mirrored ?? null } : null,
     agents: agentsResult ? { ok: Boolean(agentsResult.ok), code: agentsResult.code || '', changed: agentsResult.changed ?? null } : null,
-    affected: affectedChanges.map((item) => item.key),
-    at: isoNow(now),
   }
-  const nextProposal = {
-    ...proposal,
-    status: 'accepted',
-    updated: isoNow(now),
-    applied,
-    relationSummary: relation,
-  }
-  writeProposalFile(nextProposal.file || join(proposalsDirOf(base, config), `${nextProposal.id}.json`), nextProposal)
+  const finalProposal = { ...outcome.proposal, applied }
+  writeProposalFile(finalProposal.file || join(proposalsDirOf(base, config), `${finalProposal.id}.json`), finalProposal)
   clearSessionPending(proposal.sessionId || '')
-  log(`[whale-memory] rule applied id=${proposal.id} key=${targetKey} #${targetNumber} relation=${relation}`)
-  return { ok: true, applied, proposal: nextProposal }
+  log(`[whale-memory] rule applied id=${proposal.id} key=${applied.key} #${applied.number ?? '-'} relation=${relation}`)
+  return {
+    ok: true,
+    applied,
+    proposal: finalProposal,
+    ...(outcome.duplicate ? { duplicate: true } : {}),
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 确认提示行（nonce）
+// ---------------------------------------------------------------------------
+
+/**
+ * 候选 nonce：`p` + hash8（面板/聊天同一枚，8 位足够短且与候选 id 同源）。
+ * @param {object} proposal @returns {string} 无 hash8 时返回空串（退化到面板处理）。
+ */
+export function proposalNonce(proposal) {
+  const hash8 = trimmed(proposal?.hash8)
+    || (trimmed(proposal?.id).match(/_([0-9a-z]{8})$/)?.[1] || '')
+  return hash8 ? `p${hash8.toLowerCase()}` : ''
+}
+
+/**
+ * 候选提示行（聊天用）：必须带 `收录 <id8>`，不要让用户猜「确认」指哪条。
+ * @param {object} proposal @returns {string}
+ */
+export function buildProposalAskLine(proposal = {}) {
+  const nonce = proposalNonce(proposal)
+  const summary = proposal.summary && typeof proposal.summary === 'object' ? proposal.summary : {}
+  const label = trimmed(summary.label) || trimmed(proposal.draft?.key)
+  const title = trimmed(summary.title)
+  const relation = trimmed(proposal.relation?.relation) || 'new'
+  const count = Array.isArray(proposal.relation?.targets) ? proposal.relation.targets.length : 0
+  const kind = relation === 'new' ? '草稿' : `${relation}/${count} 条既有规则`
+  const head = `【规则候选】${label}${title ? ` · ${title}` : ''}（${kind}）`
+  if (!nonce) return `${head}——请在规则页签「待确认」面板处理。`
+  return `${head}——回复「收录 ${nonce}」确认收进铁律，或到规则页签「待确认」面板处理。`
+}
+
+/** 聊天确认的唯一合法形态：`收录 <p + 8 位>`（大小写/空格容忍；不接受「好/可以/确认」）。 */
+const CONFIRM_NONCE_RE = /收录\s*[pP]\s*([0-9a-zA-Z]{4,16})/
+
+/**
+ * 从一句话里取确认 nonce（带 `p` 前缀，小写）。
+ * @param {string} query @returns {string} 空串=不是合法确认句
+ */
+export function confirmNonceOf(query) {
+  const raw = trimmed(query)
+  if (!raw) return ''
+  // 否定优先：「先不收录 p1234」包含确认形态，必须先挡掉（与 detectConfirmIntent 同口径）。
+  if (/(不收录|先不|不要|不用|别|算了|取消|拒绝)/.test(raw)) return ''
+  const match = raw.match(CONFIRM_NONCE_RE)
+  return match ? `p${match[1].toLowerCase()}` : ''
 }

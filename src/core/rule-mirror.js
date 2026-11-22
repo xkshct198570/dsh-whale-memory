@@ -20,7 +20,10 @@
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { contentHash, bigrams } from './tokenize.js'
-import { defaultRuleRoot, isValidRuleKey, listRules, writeRule } from './rule-store.js'
+import {
+  acquireRepoLock, allocatableRuleNumber, defaultRuleRoot, isRetiredNumber, isValidRuleKey, listRules,
+  readTombstones, writeRule,
+} from './rule-store.js'
 
 /** 旧铁律节点（迁移前已知 id）；没有该节点时按 tags/origin 兜底查找。 */
 export const LEGACY_IRON_RULE_ID = 'n1795335656522_ba2f7fa325'
@@ -58,14 +61,17 @@ function originOf(front) {
 }
 
 function tagsOf(front) {
-  return [
+  const tags = [
     'rule',
     `rule-key:${textOf(front.key)}`,
-    `rule-no:${front.number}`,
     `rule-type:${textOf(front.type)}`,
     `rule-scope:${textOf(front.scope)}`,
     `rule-priority:${textOf(front.priority)}`,
   ]
+  // 普通规则/候选没有 number（R8-01）：不写 `rule-no:null` 这种假标签。
+  const number = Number(front?.number)
+  if (Number.isInteger(number) && number > 0) tags.splice(2, 0, `rule-no:${number}`)
+  return tags
 }
 
 /** 作用域摘要 ≤200（schema 硬顶），只放 scope/role/updated，不放正文。 */
@@ -74,6 +80,31 @@ function contextOf(front) {
   if (front.role) parts.push(`role:${front.role}`)
   parts.push(`updated:${textOf(front.updated)}`)
   return parts.join(' · ').slice(0, 200)
+}
+
+/**
+ * `front.scope` → 镜像行的 `role_id` / `workspace`（R8-08）。
+ * global 两者都留空（架构书 §5：global 留空，便于面板按作用域过滤）；
+ * 镜像不再读 `front.role`（冗余字段），只认 scope，避免 global 规则被写进某个角色分区。
+ * @param {any} scope @returns {{role_id:string, workspace:string}}
+ */
+export function scopeColumns(scope) {
+  const raw = textOf(scope).trim() || 'global'
+  if (raw.startsWith('role:')) return { role_id: raw.slice('role:'.length).trim(), workspace: '' }
+  if (raw.startsWith('workspace:')) {
+    return { role_id: '', workspace: raw.slice('workspace:'.length).trim().replace(/[\\/]+$/, '') }
+  }
+  return { role_id: '', workspace: '' }
+}
+
+/** tags 解析失败只当空数组（旧行/手改行不能拖垮漂移判定）。 */
+function parseTags(raw) {
+  try {
+    const parsed = JSON.parse(textOf(raw))
+    return Array.isArray(parsed) ? parsed.map((item) => String(item)) : []
+  } catch {
+    return []
+  }
 }
 
 function mirrorId() {
@@ -132,25 +163,30 @@ export function mirrorRules({ backend, rules, log = () => {} } = {}) {
       const insert = db.prepare(`
         INSERT INTO nodes (id,text,text_hash,text_bigrams,level,memory_type,source,status,
           role_id,user_id,workspace,tags,context_note,weight,hits,pinned,origin,trace_id,created_at,updated_at)
-        VALUES (?,?,?,?,?,'procedural','owner',?,?,'','',?,?,?,0,?,?,'rules',?,?)
+        VALUES (?,?,?,?,?,'procedural','owner',?,?,'',?,?,?,?,0,?,?,'rules',?,?)
       `)
       const update = db.prepare(`
         UPDATE nodes SET text=?, text_hash=?, text_bigrams=?, level=?, memory_type='procedural',
-          source='owner', status=?, role_id=?, user_id='', workspace='', tags=?, context_note=?,
+          source='owner', status=?, role_id=?, user_id='', workspace=?, tags=?, context_note=?,
           weight=?, pinned=?, origin=?, trace_id='rules', updated_at=?
         WHERE id=?
       `)
       let created = 0
       let updated = 0
+      let candidates = 0
+      let total = 0
       const keys = new Set()
       for (const doc of docs) {
         const front = doc?.front && typeof doc.front === 'object' ? doc.front : doc
         const key = textOf(front?.key).trim()
         const body = textOf(doc?.text ?? doc?.body)
+        // 候选不镜像（R8-08）：待裁定草稿不该进召回镜像；已有行由下面的孤儿逻辑归档。
+        if (textOf(front?.type) === 'rule-candidate') { candidates += 1; continue }
         if (!key || !body) {
           log(`[whale-memory] mirror skip invalid rule: ${key || '<no-key>'}`)
           continue
         }
+        total += 1
         keys.add(key)
         const origin = originOf(front)
         const tags = JSON.stringify(tagsOf(front))
@@ -159,17 +195,18 @@ export function mirrorRules({ backend, rules, log = () => {} } = {}) {
         const status = expectedStatus(front)
         const weight = WEIGHT_OF[String(front.priority || 'P1').toUpperCase()] ?? 0.8
         const pinned = pinnedOf(front)
+        const scopeCols = scopeColumns(front.scope)
         const row = findByOrigin.get(origin)
         if (row) {
           update.run(
-            body, contentHash(body), bigrams(body), level, status, textOf(front.role), tags, context,
-            weight, pinned, origin, now, row.id,
+            body, contentHash(body), bigrams(body), level, status, scopeCols.role_id, scopeCols.workspace,
+            tags, context, weight, pinned, origin, now, row.id,
           )
           updated += 1
         } else {
           insert.run(
-            mirrorId(), body, contentHash(body), bigrams(body), level, status, textOf(front.role),
-            tags, context, weight, pinned, origin, now, now,
+            mirrorId(), body, contentHash(body), bigrams(body), level, status, scopeCols.role_id,
+            scopeCols.workspace, tags, context, weight, pinned, origin, now, now,
           )
           created += 1
         }
@@ -185,21 +222,52 @@ export function mirrorRules({ backend, rules, log = () => {} } = {}) {
         if (row.status !== 'archived') archive.run(now, row.id)
         orphaned += 1
       }
-      return { created, updated, orphaned, total: docs.length }
+      return { created, updated, orphaned, total, candidates }
     })
-    return { ok: true, mirrored: result.created + result.updated, ...result, checkedAt: Date.now() }
+    return {
+      ok: true,
+      mirrored: result.created + result.updated,
+      created: result.created,
+      updated: result.updated,
+      orphaned: result.orphaned,
+      total: result.total,
+      candidatesSkipped: result.candidates,
+      checkedAt: Date.now(),
+    }
   } catch (err) {
     return { ok: false, error: String(err?.message || err) }
   }
 }
 
 /**
+ * 漂移判定（R8-08）：正文一致性之外还必须比 front 关键字段——scope/priority/status/pinned
+ * 与镜像行的 tags/status/pinned/scope 列。只比 text_hash+updated_at 会漏掉"改了 scope 但正文
+ * 没变"的假一致（架构书 §5）。
+ * @param {object} row 镜像行 @param {object} front 文件 front
+ * @returns {boolean} true = 漂移
+ */
+function driftOf(row, front) {
+  const scope = textOf(front?.scope).trim() || 'global'
+  const cols = scopeColumns(scope)
+  if (textOf(row.status) !== expectedStatus(front)) return true
+  if (Number(row.pinned || 0) !== pinnedOf(front)) return true
+  if (textOf(row.workspace) !== cols.workspace) return true
+  if (textOf(row.role_id) !== cols.role_id) return true
+  const tags = parseTags(row.tags)
+  if (!tags.includes(`rule-scope:${scope}`)) return true
+  if (!tags.includes(`rule-priority:${textOf(front.priority)}`)) return true
+  return false
+}
+
+/**
  * 一致性视图：文件 vs 镜像行（计数，不返回正文）。
  *
- * - mirrored：文件有行且 text_hash 一致；
+ * - mirrored：文件有行且 text_hash / front 关键字段一致；
  * - missing：文件有、镜像无；
- * - stale：镜像有、文件有，但文本 hash 或 updated 时间落后；
+ * - stale：镜像有、文件有，但文本 hash、updated 时间或 front 关键字段（scope/priority/
+ *   status/pinned）与镜像行不一致；
  * - orphaned：镜像有、文件无（含尚未归档的）。
+ * - 候选（rule-candidate）不镜像，也不计入 missing（R8-08）。
  *
  * @param {{backend:any, rules:any}} args
  * @returns {{ok:boolean,error?:string,mirrored?:number,missing?:number,stale?:number,
@@ -211,7 +279,7 @@ export function mirrorStatus({ backend, rules } = {}) {
   const docs = resolveDocs(rules)
   const now = Date.now()
   try {
-    const rows = db.prepare('SELECT id, origin, text_hash, status, updated_at FROM nodes WHERE origin LIKE \'rule:%\'').all()
+    const rows = db.prepare('SELECT id, origin, text_hash, status, updated_at, tags, workspace, role_id, pinned FROM nodes WHERE origin LIKE \'rule:%\'').all()
     const byKey = new Map()
     for (const row of rows) byKey.set(textOf(row.origin).slice(RULE_ORIGIN_PREFIX.length), row)
     const fileKeys = new Set()
@@ -220,6 +288,7 @@ export function mirrorStatus({ backend, rules } = {}) {
     let missing = 0
     for (const doc of docs) {
       const front = doc?.front && typeof doc.front === 'object' ? doc.front : doc
+      if (textOf(front?.type) === 'rule-candidate') continue
       const key = textOf(front?.key).trim()
       const body = textOf(doc?.text ?? doc?.body)
       if (!key) continue
@@ -229,7 +298,7 @@ export function mirrorStatus({ backend, rules } = {}) {
       const hashOk = row.text_hash === contentHash(body)
       const fileUpdated = Date.parse(textOf(front?.updated))
       const newerFile = Number.isFinite(fileUpdated) && row.updated_at < fileUpdated
-      if (hashOk && !newerFile) mirrored += 1
+      if (hashOk && !newerFile && !driftOf(row, front)) mirrored += 1
       else stale += 1
     }
     let orphaned = 0
@@ -303,9 +372,53 @@ export function importLegacyRule({
   const node = findNode(backend, { key: requestedKey, id: requestedKey ? '' : legacyId })
   if (!node) return { ok: false, error: 'legacy_not_found' }
 
+  // 编号分配 + 墓碑复核 + 落盘必须在同一把仓库锁内：锁外算号会让并发导入撞号/分配器重复。
+  const lock = acquireRepoLock(base)
+  if (!lock.ok) return { ok: false, error: lock.error }
+  try {
+    return importLocked({ backend, base, requestedKey, number, node, key, git, legacyId })
+  } finally {
+    lock.release()
+  }
+}
+
+/**
+ * `importLegacyRule` 的锁内实现（分配号 → 墓碑复核 → 幂等查既有 origin → 落盘）。
+ * @param {{backend:any,base:string,requestedKey:string,number:any,node:any,key:string,
+ *   git:boolean,legacyId:string}} args
+ * @returns {object}
+ */
+function importLocked({ backend, base, requestedKey, number, node, git, legacyId }) {
+
+  // 幂等：同一个旧节点已经导出过（origin=`legacy:<node id>`）就直接返回既有文件，
+  // 不能再走分配器（每次分配都会得一个新编号，重复生成 iron-rule-N 副本）。
+  const already = listRules(base).rules.find((doc) => textOf(doc.front.origin) === `legacy:${node.id}`)
+  if (already) {
+    return {
+      ok: true,
+      path: already.file,
+      key: String(already.front.key),
+      number: Number.isInteger(Number(already.front.number)) ? Number(already.front.number) : null,
+      legacy: true,
+      skipped: true,
+      nodeId: node.id,
+    }
+  }
+
   const hinted = parseNumberHint(requestedKey, node.tags, node.origin, node.text)
-  const resolvedNumber = Number(number) > 0 ? Number(number) : (hinted || 17)
+  // 编号来源只有三种：调用方显式 → 正文/标签 hint → 仓储分配器。**没有 `|| 17` 回落**：
+  // 17 只是某台机器的历史号，回落会让所有旧节点挤进同一编号并被判撞号。
+  const explicit = Number(number) > 0 ? Number(number) : (hinted && Number.isInteger(hinted) ? hinted : null)
+  // 墓碑占号：显式/推断的编号已彻底删除过 → 拒绝，不得用迁移把已作废编号复活。
+  if (explicit && isRetiredNumber(base, explicit)) {
+    return { ok: false, error: 'number_retired', detail: { number: explicit } }
+  }
+  const resolvedNumber = explicit || allocatableRuleNumber(base)
   const resolvedKey = requestedKey || `iron-rule-${resolvedNumber}`
+  // 墓碑按 key 复核（不只是显式 number）：同 key 历史编号可能已被作废，复活 key 等于复活规则。
+  if (readTombstones(base).some((item) => String(item.key) === resolvedKey)) {
+    return { ok: false, error: 'number_retired', detail: { key: resolvedKey, number: resolvedNumber } }
+  }
   const path = join(base, `${resolvedKey}.md`)
   if (existsSync(path)) {
     return { ok: true, path, key: resolvedKey, number: resolvedNumber, legacy: true, skipped: true, nodeId: node.id }
@@ -355,7 +468,7 @@ export function importLegacyRule({
       origin: `legacy:${node.id}`,
     },
     text: body,
-  }, { git: git !== false })
+  }, { git: git !== false, lockHeld: true })
   if (!saved.ok) return { ok: false, error: saved.error, detail: saved.detail }
   return {
     ok: true,

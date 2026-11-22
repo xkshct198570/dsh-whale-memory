@@ -171,7 +171,7 @@ test('列表/详情请求走 /rules 契约，缺字段有兜底，失败态可�
   assert.ok(view.includes("h(StateBlock, { t, status: 'error', err: list.err, onRetry: rerun })"), '列表失败未走可重试错误态')
   const drawer = sliceFrom('function RuleDrawer(props) {', '// ----------------------------------------------------------------- recall')
   assert.match(drawer, /Array\.isArray\(body && body\.history\)/, '详情缺 history 兜底')
-  assert.ok(drawer.includes("h(StateBlock, { t, status: 'error', err: loaded.err })"), '详情失败未走错误态')
+  assert.ok(drawer.includes("h(StateBlock, { t, status: 'error', err: loaded.err, onRetry:"), '详情失败未走错误态/缺重试')
   assert.ok(drawer.includes('ruleFieldText(rule.origin)'), 'origin 未做对象/缺失降级')
 })
 
@@ -194,7 +194,7 @@ test('git 状态条三态文案 + 安装指引含 brew/apt/winget/下载/快照�
 })
 
 test('待确认区：404 软降级空态，其它失败给卡片内错误态与重试', () => {
-  assert.ok(CLIENT.includes("callJson('/rules/proposals?status=pending')"), '缺少提案请求')
+  assert.ok(CLIENT.includes("callJson('/rules/proposals?status=pending,needs_manual')"), '缺少提案请求')
   const view = sliceFrom('function RulesView(props) {', 'function RulesGitBar(props) {')
   assert.ok(view.includes("err.code === 'not_found' || err.status === 404"), '404 未软降级为空态')
   assert.ok(view.includes("setProposals({ status: 'empty', items: [] })"), '404 未回到空态')

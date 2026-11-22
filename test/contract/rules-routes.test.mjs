@@ -137,8 +137,9 @@ test('GET /rules：dir/git/rules/manifest 形状完整，规则字段齐全', as
   assert.equal(body.rules[0].chars, Array.from('必须先验证再覆盖正式库。').length)
   assert.match(body.rules[0].excerpt, /必须/)
   assert.deepEqual(body.manifest.byStatus, { active: 2 })
-  assert.equal(body.manifest.total, 2)
-  assert.equal(body.manifest.nextNumber, 3)
+  // 编号契约（R8）：只有 iron-rule 占号；普通 rule 的 number=null，不计入 total/nextNumber。
+  assert.equal(body.manifest.total, 1, 'manifest.total 只数铁律编号')
+  assert.equal(body.manifest.nextNumber, 2)
 })
 
 test('GET /rules/:key：front/text/bodyStart + history 数组', async () => {
@@ -206,10 +207,11 @@ test('POST /rules/import-legacy：铁律节点→文件；第二次 skipped', as
   const first = await call('POST', '/whale-memory/api/rules/import-legacy', {})
   assert.equal(first.status, 200)
   assert.equal(first.body.ok, true)
-  assert.equal(first.body.key, 'iron-rule-17')
+  // 编号契约（R8）：legacy 导入不再回落历史号 17，由仓储分配器取号（本仓已有 iron-rule-1 → 2）。
+  assert.equal(first.body.key, 'iron-rule-2')
   assert.equal(first.body.legacy, true)
   assert.equal(first.body.skipped, false)
-  assert.equal(nodeFs.existsSync(join(root, 'iron-rule-17.md')), true)
+  assert.equal(nodeFs.existsSync(join(root, 'iron-rule-2.md')), true)
 
   const second = await call('POST', '/whale-memory/api/rules/import-legacy', {})
   assert.equal(second.body.ok, true)
@@ -281,9 +283,10 @@ test('纯函数详情：坏的 key 直接 rule_not_found，不抛', () => {
   const got = ruleDetailPayload({ root, config, key: '../etc/passwd' })
   assert.equal(got.ok, false)
   assert.equal(got.error, 'invalid_key')
-  const imported = importLegacyPayload({ root, config, backend, key: 'iron-rule-17' })
+  // 幂等按 origin=`legacy:<node id>` 判定：同一旧节点再次导入必须 skipped（不再重新取号）。
+  const imported = importLegacyPayload({ root, config, backend })
   assert.equal(imported.ok, true)
-  assert.equal(imported.skipped, true, '已有文件时幂等跳过')
+  assert.equal(imported.skipped, true, '同一 legacy 节点再次导入应幂等跳过')
 })
 
 // ---------------------------------------------------------------------------
@@ -530,7 +533,7 @@ test('POST /rules/update：正文编辑 version+1，镜像/AGENTS/审计全部�
   assert.equal(body.rule.text, '必须先备份再覆盖正式库。')
   assert.match(body.rule.path, /rule-1\.md$/)
   assert.equal(body.agents.ok, true, JSON.stringify(body.agents))
-  assert.equal(body.agents.count, 2, 'global active iron-rule 两条计入摘要')
+  assert.equal(body.agents.count, 3, 'global active 全收（铁律+普通规则）')
   assert.equal(body.mirror.ok, true)
   assert.equal(body.audit.ok, true)
 
@@ -811,7 +814,9 @@ function seedNumbered(fx, { max = 17, skip = 6 } = {}) {
   for (let n = 1; n <= max; n += 1) {
     if (n === skip) continue
     const text = n === 13 ? '必须保留本机专用规则正文。' : `必须保留第 ${n} 条规则。`
-    assert.equal(writeRule(fx.dir, { front: frontOf(n), text }, { git: false }).ok, true, `写入第 ${n} 条失败`)
+    // 编号只属于 iron-rule：要铺满 1–17 必须写成铁律，普通 rule 不占号（R8 契约）。
+    const front = frontOf(n, { type: 'iron-rule', key: `iron-rule-${n}` })
+    assert.equal(writeRule(fx.dir, { front, text }, { git: false }).ok, true, `写入第 ${n} 条失败`)
   }
 }
 
@@ -889,7 +894,8 @@ test('POST /rules/create：普通规则 key=rule-<domain>-<hash8>；同正文重
   const first = await callWith(fx.handler, 'POST', '/whale-memory/api/rules/create', { draft })
   assert.equal(first.status, 200, JSON.stringify(first.body))
   assert.match(first.body.key, /^rule-memory-[0-9a-f]{8}$/, 'key 形状 rule-<domain>-<hash8>')
-  assert.equal(first.body.number, 2)
+  // 编号契约（R8）：普通规则不占号，响应 number=null。
+  assert.equal(first.body.number, null, '普通规则 number=null')
   assert.equal(first.body.rule.front.type, 'rule')
   assert.equal(first.body.rule.front.priority, 'P1')
   assert.equal(first.body.rule.front.origin, 'manual:', '无身份时 origin=manual:')

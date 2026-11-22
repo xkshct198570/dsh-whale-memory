@@ -15,6 +15,7 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   SEED_MARKER,
+  SEED_VERSION,
   readSeedMarker,
   defaultRulesAvailable,
   defaultRulesDir,
@@ -23,7 +24,10 @@ import {
 import {
   MANIFEST_FILE,
   computeManifest,
+  createRule,
   listRules,
+  purgeRule,
+  readManifest,
   nextRuleNumber,
   readRule,
   serializeRuleDocument,
@@ -402,4 +406,101 @@ test('git 仓库不存在：先 init（不提交）再单次提交，首启只�
     false,
     '不得先做一次 init commit（那会让 history 多一条只有 README 的噪音）',
   )
+})
+
+// ---------------------------------------------------------------------------
+// R8-10：播种版本化 + invalid 重试 + 升级补播
+// ---------------------------------------------------------------------------
+
+test('坏默认文件下轮重试：invalid 进 marker，修好后只补播缺失 key', (t) => {
+  const base = freshRoot(t)
+  const rulesRoot = join(base, 'rules')
+  const defaults = join(base, 'defaults', 'rules')
+  mkdirSync(defaults, { recursive: true })
+  threeDefaults(defaults)
+  writeFileSync(join(defaults, 'iron-rule-9.md'), '没有 front matter 的坏文件。\n', 'utf8')
+
+  const first = seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { git: false })
+  assert.equal(first.ok, true, first.error)
+  assert.equal(first.seeded, 3)
+  assert.equal(first.skippedInvalid, 1)
+  const marker = readSeedMarker(rulesRoot)
+  assert.equal(marker.version, SEED_VERSION, 'marker 必须记 SEED_VERSION')
+  assert.deepEqual(marker.keys, ['iron-rule-1', 'iron-rule-2', 'iron-rule-3'])
+  assert.deepEqual(marker.invalid.map((item) => item.key), ['iron-rule-9'], 'invalid 必须进 marker 供下轮重试')
+
+  // 修好坏文件：下轮只补这条，已播的不重播。
+  writeDefault(defaults, frontOf({ key: 'iron-rule-9', number: 9, origin: 'default:iron-rule-9' }), '必须保留审计日志。')
+  const second = seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { git: false })
+  assert.equal(second.ok, true, second.error)
+  assert.equal(second.seeded, 1, '只补上轮 invalid 的那一条')
+  assert.equal(second.skippedInvalid, 0)
+  assert.deepEqual(second.invalid, [])
+  assert.deepEqual(readSeedMarker(rulesRoot).invalid, [])
+  assert.deepEqual(listRules(rulesRoot).rules.map((doc) => doc.front.key).sort(), ['iron-rule-1', 'iron-rule-2', 'iron-rule-3', 'iron-rule-9'])
+})
+
+test('升级新增默认 key：只补新增项，不覆盖已有正文', (t) => {
+  const base = freshRoot(t)
+  const rulesRoot = join(base, 'rules')
+  const defaults = join(base, 'defaults', 'rules')
+  mkdirSync(defaults, { recursive: true })
+  threeDefaults(defaults)
+  assert.equal(seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { git: false }).seeded, 3)
+
+  // 用户手改第一条正文：升级补播不得覆盖它。
+  const edited = join(rulesRoot, 'iron-rule-1.md')
+  writeFileSync(edited, readFileSync(edited, 'utf8').replace('必须先验证再覆盖正式库。', '必须只做用户自己那条。'), 'utf8')
+  // 包升级新增一条默认规则。
+  writeDefault(defaults, frontOf({ key: 'iron-rule-4', number: 4, origin: 'default:iron-rule-4' }), '必须保留审计日志。')
+  const upgraded = seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { git: false })
+  assert.equal(upgraded.ok, true, upgraded.error)
+  assert.equal(upgraded.seeded, 1, '升级只补新增 key，不重播旧 key')
+  assert.equal(readRule(rulesRoot, 'iron-rule-1').rule.text.trim(), '必须只做用户自己那条。')
+  assert.equal(listRules(rulesRoot).rules.length, 4)
+})
+
+test('SEED_VERSION 参与判据：marker 版本落后 → 即使无新文件也升级写回', (t) => {
+  const base = freshRoot(t)
+  const rulesRoot = join(base, 'rules')
+  const defaults = join(base, 'defaults', 'rules')
+  mkdirSync(defaults, { recursive: true })
+  threeDefaults(defaults)
+  assert.equal(seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { git: false }).seeded, 3)
+
+  const markerFile = join(rulesRoot, SEED_MARKER)
+  const marker = JSON.parse(readFileSync(markerFile, 'utf8'))
+  marker.version = SEED_VERSION - 1
+  writeFileSync(markerFile, `${JSON.stringify(marker, null, 2)}\n`, 'utf8')
+
+  const again = seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { git: false })
+  assert.equal(again.ok, true, again.error)
+  assert.equal(again.skipped, 'already_seeded')
+  assert.equal(again.seeded, 0)
+  assert.equal(readSeedMarker(rulesRoot).version, SEED_VERSION, '落后的 marker 必须被升级，版本号不能只写不读')
+})
+
+test('首播不复活墓碑：purge #17 后（无 marker）重播跳过 17，编号不回退', (t) => {
+  const base = freshRoot(t)
+  const rulesRoot = join(base, 'rules')
+  const defaults = join(base, 'defaults', 'rules')
+  mkdirSync(rulesRoot, { recursive: true })
+  mkdirSync(defaults, { recursive: true })
+  writeDefault(defaults, frontOf({ key: 'iron-rule-1', number: 1 }), '必须先验证再覆盖正式库。')
+  writeDefault(defaults, frontOf({ key: 'iron-rule-17', number: 17, origin: 'default:iron-rule-17' }), '必须保留审计日志。')
+  // 用户先装了 17 又彻底删除（墓碑 17），随后 marker 不存在（新装/换机/手删 marker）。
+  writeDefault(rulesRoot, frontOf({ key: 'iron-rule-17', number: 17, origin: 'default:iron-rule-17' }), '必须保留审计日志。')
+  assert.equal(purgeRule({ root: rulesRoot, key: 'iron-rule-17' }, { git: false }).ok, true)
+  assert.equal(existsSync(join(rulesRoot, SEED_MARKER)), false)
+
+  const result = seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { git: false })
+  assert.equal(result.ok, true, result.error)
+  assert.equal(result.seeded, 1, '墓碑 key 必须跳过')
+  assert.equal(result.tombstoned, 1)
+  assert.equal(existsSync(join(rulesRoot, 'iron-rule-17.md')), false, '首播不得复活已 purge 的默认铁律')
+  assert.equal(readManifest(rulesRoot).nextNumber, 18, '已作废的 17 继续占号')
+
+  const created = createRule({ root: rulesRoot, draft: { text: '必须保留审计日志。', type: 'iron-rule' } }, { git: false })
+  assert.equal(created.ok, true, created.error)
+  assert.equal(created.number, 18, '重播后新规则仍从 18 起，不复用 17')
 })

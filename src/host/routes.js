@@ -7,7 +7,7 @@
  * 本层不 import core：存储能力全部经注入的 backend 接口调用。
  */
 import { Buffer } from 'node:buffer'
-import { clamp, isLoopback, readJson, sendJson } from './http-kit.js'
+import { clamp, isLoopback, readJson, sendJson, isWriteMethod, writeRequestProblem } from './http-kit.js'
 import { resolveIdentity } from './identity.js'
 import { bool, value } from './config-values.js'
 import { Config } from './config.js'
@@ -154,6 +154,19 @@ export function createRoutes({
   migration = null,
   ctx, reflect, log = () => {},
 }) {
+  /**
+   * 面板写入口写后立即清召回缓存：规则正文/AGENTS 摘要已变，下一步注入不能吃 30s 旧前缀。
+   * 走 service.invalidateCache（清整表，含规则前缀与会话条目），与 hook 的 invalidateRulesCache 等价。
+   */
+  const invalidateRulesCache = () => {
+    try {
+      const service = typeof ctx?.get === 'function' ? ctx.get('whaleMemory') : null
+      if (service && typeof service.invalidateCache === 'function') service.invalidateCache()
+    } catch (err) {
+      log(`[whale-memory] rules cache invalidate fail-open: ${err?.message || err}`)
+    }
+  }
+
   /** 迁移只读视图（/stats）：没有安装迁移时给空值，键始终存在。 */
   const migrationView = () => {
     const state = migration?.state || null
@@ -170,6 +183,13 @@ export function createRoutes({
     const addr = req.socket?.remoteAddress
     if (!bool(config?.panel?.allowRemote, false) && !isLoopback(addr)) {
       return sendJson(res, 403, { ok: false, error: 'not_loopback' })
+    }
+
+    // 写接口安全闸（R8-09）：在所有端点分发之前拦下跨源/非 JSON 简单请求，
+    // 保证拒绝发生在读 body、建规则仓、写库等任何副作用之前。
+    if (isWriteMethod(req.method)) {
+      const problem = writeRequestProblem(req)
+      if (problem) return sendJson(res, problem.status, { ok: false, error: problem.error })
     }
 
     const traceId = traceIdOf(req)
@@ -686,7 +706,11 @@ export function createRoutes({
 
     // 规则只读/管理端点（R3a）：命中即返回 true，未命中继续走 404。
     // getLlm 透传给规则 apply：面板手改合并/冲突时需要模型只改措辞（R3b）。
-    if (await handleRules({ req, res, path, config, backend, log, getLlm: () => (ctx?.get?.('llm') ?? null) })) return undefined
+    if (await handleRules({
+      req, res, path, config, backend, log,
+      getLlm: () => (ctx?.get?.('llm') ?? null),
+      invalidateCache: invalidateRulesCache,
+    })) return undefined
 
     log(`[whale-memory] 404 ${req.method} ${path}`)
     return sendJson(res, 404, { ok: false, error: 'not_found' })

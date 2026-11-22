@@ -16,6 +16,9 @@ import { installReflectScheduler } from './src/core/reflect.js'
 import { installKeeper } from './src/core/keeper.js'
 import { installOutboxWatchdog } from './src/core/hybrid.js'
 import { defaultRuleRoot, listRules } from './src/core/rule-store.js'
+// 命名空间导入：仓库锁/事务恢复按 R8 契约在 task-1 落地，插件必须在已落地/未落地两种
+// 安装状态下都能加载（命名导入缺失会在 ESM link 阶段直接抛，插件起不来）。
+import * as ruleStore from './src/core/rule-store.js'
 import { seedDefaultRules } from './src/core/rule-defaults.js'
 import { mirrorRules } from './src/core/rule-mirror.js'
 import { agentsPathOf, renderAgentsDigest } from './src/core/rule-render.js'
@@ -120,6 +123,84 @@ export function createWhaleMemoryService({ ctx, backendRef, getHook = () => null
   return service
 }
 
+/**
+ * 规则启动自愈（R8-06/R8-10）：崩溃恢复 → 默认播种 → 镜像 → AGENTS 摘要。
+ *
+ * - 镜像只受 `rules.mirrorAuto` 控制，摘要只受 `rules.renderAgents` 控制，互不绑定；
+ * - 每一步独立 fail-open：某步失败只记日志，不影响后续步骤（启动不能被规则仓拖死）；
+ * - `recoverPendingTxn` 由 task-1 按契约落地，未落地时静默跳过（命名空间属性探测，不抛）；
+ * - 播种在后台（init 不再同步写 16 个文件 + git），marker 是判据，用户删/停用后不重播。
+ *
+ * @param {{config:any, backend:any, log?:Function, store?:any}} [deps]
+ *   store 默认真实 rule-store；测试注入 fake 以断言 recoverPendingTxn 接线。
+ * @returns {{skipped?:string, dir:string, rules:number, recovered?:object|null,
+ *   seeded?:object|null, mirror?:object|null, agents?:object|null}}
+ */
+export function runRulesSelfHeal({ config, backend, log = () => {}, store = ruleStore } = {}) {
+  const dir = String(config?.rules?.dir || '').trim() || defaultRuleRoot()
+  const result = { dir, rules: 0, recovered: null, seeded: null, mirror: null, agents: null }
+  if (bool(config?.rules?.enabled, true) === false) return { ...result, skipped: 'rules_disabled' }
+
+  // 0) 崩溃恢复：未完成事务先恢复旧文件，后面的镜像/摘要才看到真源。
+  if (typeof store.recoverPendingTxn === 'function') {
+    try {
+      result.recovered = store.recoverPendingTxn(dir, { log })
+      if (result.recovered && result.recovered.recovered) {
+        log(`[whale-memory] rules txn recovered id=${result.recovered.id || '-'}`)
+      }
+    } catch (err) {
+      log(`[whale-memory] rules txn recover fail-open: ${err?.message || err}`)
+    }
+  }
+
+  // 1) 默认铁律播种（后台；播种本身不阻塞 init）。
+  try {
+    result.seeded = seedDefaultRules({ root: dir, log })
+    if (result.seeded && result.seeded.ok === false) {
+      log(`[whale-memory] rules seed skipped: ${result.seeded.error || 'error'}${result.seeded.skippedInvalid ? ` (invalid=${result.seeded.skippedInvalid})` : ''}`)
+    } else if (result.seeded && result.seeded.seeded) {
+      log(`[whale-memory] rules seeded defaults: ${result.seeded.seeded} (invalid=${result.seeded.skippedInvalid || 0})`)
+    }
+  } catch (err) {
+    log(`[whale-memory] rules seed fail-open: ${err?.message || err}`)
+  }
+
+  // 2) 一次读盘，镜像与摘要共用同一批规则（避免两次 listRules 读到不同快照）。
+  let listed = null
+  try {
+    listed = listRules(dir)
+  } catch (err) {
+    log(`[whale-memory] rules list fail-open: ${err?.message || err}`)
+  }
+  if (!listed?.ok || !Array.isArray(listed.rules) || listed.rules.length === 0) return result
+  result.rules = listed.rules.length
+
+  // 3) 镜像自愈：只看 rules.mirrorAuto。
+  if (bool(config?.rules?.mirrorAuto, true)) {
+    try {
+      result.mirror = mirrorRules({ backend, rules: listed.rules, log })
+      if (result.mirror && result.mirror.ok === false) {
+        log(`[whale-memory] rules mirror self-heal skipped: ${result.mirror.error || result.mirror.code || 'error'}`)
+      }
+    } catch (err) {
+      log(`[whale-memory] rules mirror fail-open: ${err?.message || err}`)
+    }
+  }
+
+  // 4) AGENTS 摘要自愈：只看 rules.renderAgents（无标记时 render 返回 no_markers，静默跳过）。
+  if (bool(config?.rules?.renderAgents, true)) {
+    try {
+      result.agents = renderAgentsDigest({ rules: listed.rules, agentsPath: agentsPathOf(dir), rulesDir: dir, log })
+      if (result.agents && result.agents.ok === false && result.agents.code !== 'no_markers') {
+        log(`[whale-memory] rules agents self-heal skipped: ${result.agents.code || result.agents.error || 'error'}`)
+      }
+    } catch (err) {
+      log(`[whale-memory] rules agents fail-open: ${err?.message || err}`)
+    }
+  }
+  return result
+}
+
 export function apply(ctx, config) {
   const backend = createBackend(config?.backend, {
     log,
@@ -221,33 +302,13 @@ export function apply(ctx, config) {
     return () => hook?.dispose()
   }, 'whale-memory: recall hook')
 
-  // 规则文件启动自愈（R7）：规则真源在文件仓，DB 镜像/AGENTS 摘要是投影。
-  // 插件重启或换机后，文件还在但镜像可能为空/过期，这里异步补一次（fail-open，不阻塞启动）。
+  // 规则文件启动自愈（R7/R8）：规则真源在文件仓，DB 镜像/AGENTS 摘要只是投影。
+  // init 只建定时器；恢复/播种/镜像/摘要全部放到后台执行（不阻塞 DSH 启动）。
   ctx.effect(() => {
     if (bool(config?.rules?.enabled, true) === false) return () => {}
-    if (bool(config?.rules?.mirrorAuto, true) === false) return () => {}
-    const dir = String(config?.rules?.dir || '').trim() || defaultRuleRoot()
-    // 首次播种默认铁律放在定时器**之前**：面板第一屏就要看到默认铁律（1.2s 后播种会让首开空列表）。
-    // marker 是判据，用户删/停用后重启不会重播；失败只记日志，不挡镜像/摘要自愈。
-    try {
-      const seeded = seedDefaultRules({ root: dir, log })
-      if (seeded && seeded.ok === false) {
-        log(`[whale-memory] rules seed skipped: ${seeded.error || 'error'}${seeded.skippedInvalid ? ` (invalid=${seeded.skippedInvalid})` : ''}`)
-      } else if (seeded && seeded.seeded) {
-        log(`[whale-memory] rules seeded defaults: ${seeded.seeded} (invalid=${seeded.skippedInvalid || 0})`)
-      }
-    } catch (err) {
-      log(`[whale-memory] rules seed fail-open: ${err?.message || err}`)
-    }
     const timer = setTimeout(() => {
       try {
-        const listed = listRules(dir)
-        if (!listed?.ok || !Array.isArray(listed.rules) || listed.rules.length === 0) return
-        const mirror = mirrorRules({ backend: backendProxy, rules: listed.rules, log })
-        if (mirror && mirror.ok === false) log(`[whale-memory] rules mirror self-heal skipped: ${mirror.error || mirror.code || 'error'}`)
-        // 文件真源有变而 AGENTS 管理块存在 → 顺手校准摘要（无标记时 render 会返回 no_markers，静默跳过）。
-        const agents = renderAgentsDigest({ rules: listed.rules, agentsPath: agentsPathOf(dir), rulesDir: dir, log })
-        if (agents && agents.ok === false && agents.code !== 'no_markers') log(`[whale-memory] rules agents self-heal skipped: ${agents.code || agents.error || 'error'}`)
+        runRulesSelfHeal({ config, backend: backendProxy, log })
       } catch (err) {
         log(`[whale-memory] rules self-heal fail-open: ${err?.message || err}`)
       }

@@ -75,7 +75,7 @@ const drawerSource = () => sliceFrom('function RuleDrawer(props) {', '// -------
 const emptyGuideSource = () => sliceFrom('function RulesEmptyGuide(props) {', 'function RulesGitGuide(props) {')
 
 test('提案端点与契约：GET ?status=pending / propose / apply / reject', () => {
-  assert.ok(CLIENT.includes("callJson('/rules/proposals?status=pending')"), '缺少 GET /rules/proposals?status=pending')
+  assert.ok(CLIENT.includes("callJson('/rules/proposals?status=pending,needs_manual')"), '缺少 GET /rules/proposals?status=pending,needs_manual')
   assert.ok(CLIENT.includes("callJson('/rules/propose', {"), '缺少 POST /rules/propose')
   assert.ok(CLIENT.includes("callJson('/rules/apply', {"), '缺少 POST /rules/apply')
   assert.ok(CLIENT.includes("callJson('/rules/reject', {"), '缺少 POST /rules/reject')
@@ -287,7 +287,7 @@ test('待确认计数实时刷新：动作成功后重载列表+详情+git', () 
   assert.ok(view.includes('onChanged: onProposalChanged'), '提案卡未接动作回调')
   assert.ok(view.includes('refreshTick: reloadTick'), '详情抽屉未接刷新 tick')
   const drawer = drawerSource()
-  assert.match(drawer, /\}, \[ruleKey, refreshTick\]\)/, '详情抽屉未随刷新重载')
+  assert.match(drawer, /\}, \[ruleKey, refreshTick, retryTick\]\)/, '详情抽屉未随刷新重载')
   assert.ok(view.includes("callJson('/rules')"), '列表（含 git 状态）刷新缺失')
 })
 

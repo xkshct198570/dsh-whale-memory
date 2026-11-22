@@ -22,16 +22,16 @@
 import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import * as nodeFs from 'node:fs'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { homedir } from 'node:os'
-import { join, relative, resolve } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { detectSignals, normalizeRuleText, ruleKeyOf } from './rules.js'
 
 /** 已知 front matter 字段（顺序即序列化顺序）。未知字段一律报错，不静默丢弃。 */
 export const RULE_FIELDS = Object.freeze([
   'key', 'type', 'number', 'priority', 'scope', 'role', 'modality', 'action', 'object',
   'conditions', 'exceptions', 'status', 'merged_into', 'superseded_by', 'created',
-  'updated', 'version', 'origin',
+  'updated', 'version', 'origin', 'summary',
 ])
 
 export const RULE_TYPES = Object.freeze(['iron-rule', 'rule', 'rule-candidate'])
@@ -58,6 +58,12 @@ export function isUnnumberedRule(front) {
 
 export const RULE_BODY_MAX = 500
 export const HISTORY_KEEP = 20
+/** 单条规则文件硬顶：超过即拒绝解析（含 front matter + 正文），防止一次误粘贴拖垮面板/注入。 */
+export const RULE_FILE_MAX = 64 * 1024
+/** AGENTS 摘要字段上限（码点）：只用于展示，正文仍是唯一规范文本。 */
+export const SUMMARY_MAX = 120
+/** 编号上限：iron-rule 只占 1–999；超出返回 number_exhausted，不静默写 1000。 */
+export const RULE_NUMBER_MAX = 999
 /**
  * 可编辑字段白名单：owner 只能改正文/条件/例外/作用域/角色/优先级/状态。
  * key/type/number/created 是身份与历史引用锚点，改了会让历史快照/镜像/引用全部指向错的东西，
@@ -73,9 +79,21 @@ export const RULE_STATUS_TRANSITIONS = Object.freeze({
 /** 单次 diff 的行数硬顶（5000 行 ≈ 面板可读上限，超出直接报错而不是卡死浏览器）。 */
 export const DIFF_LINE_LIMIT = 5000
 export const MANIFEST_FILE = 'manifest.json'
-export const RULE_DIRS = Object.freeze(['proposals', 'history'])
-/** 跨进程同 key 串行锁目录（生成物，不进 git）。 */
+export const RULE_DIRS = Object.freeze(['proposals', 'history', 'retired', '.txn'])
+/** 墓碑目录：已彻底删除规则的 `{key,number,at,reason}` 台账，append-only，可重建 manifest。 */
+export const RETIRED_DIR = 'retired'
+/** 应用事务日志目录（短命；启动恢复后删除；不进 git）。 */
+export const TXN_DIR = '.txn'
+/** 跨进程仓库级写锁目录（生成物，不进 git）。 */
 export const LOCK_DIR = '.locks'
+/** 仓库级锁名：manifest/commit/编号都是全仓资源，一把锁避免假并发。 */
+export const REPO_LOCK = 'repo.lock'
+/** 锁失效阈值（不续租）：覆盖最长 git 操作；接口冻结为 120s。 */
+export const REPO_LOCK_STALE_MS = 120000
+/** 规则仓 `.gitignore` 必须包含的条目（候选/快照/事务/锁/播种 marker 都是本机生成物）。 */
+export const GITIGNORE_LINES = Object.freeze([
+  '*.tmp-*', '.locks/', '.txn/', '.seeded.json', 'proposals/', 'history/',
+])
 const GIT_TIMEOUT_MS = 5000
 const GIT_IDENT = Object.freeze(['-c', 'user.name=dsh-whale-memory', '-c', 'user.email=rules@local'])
 
@@ -106,8 +124,19 @@ export function defaultRuleRoot(opts = {}) {
   return dshHome ? join(resolve(dshHome), 'rules') : join(home, '.dsh', 'rules')
 }
 
-/** @param {string} [root] @returns {string} */
+/**
+ * 规则根归一：空 → 默认根；字符串 → 绝对路径。
+ *
+ * 非字符串（对象/数组/数字）**抛 TypeError**：`resolve({})` 曾把对象静默转成 `"[object Object]"`
+ * 目录，规则被写到垃圾路径且无人报错。宁可当场红，也不接受"猜一个根"。
+ *
+ * @param {string} [root] @returns {string}
+ * @throws {TypeError} root 既不是字符串也不是 null/undefined
+ */
 function baseDir(root) {
+  if (root !== undefined && root !== null && typeof root !== 'string') {
+    throw new TypeError('rules root must be a string')
+  }
   const raw = String(root ?? '').trim()
   return raw ? resolve(raw) : defaultRuleRoot()
 }
@@ -207,6 +236,11 @@ export function parseRuleDocument(source) {
     if (!m) return { ok: false, error: `invalid_line:${i + 1}` }
     const field = m[1]
     if (Object.prototype.hasOwnProperty.call(front, field)) return { ok: false, error: `duplicate_field:${field}` }
+    const valueRaw = String(m[2] ?? '').trim()
+    // 严格子集只吃单行标量/行内数组：块标量（| / >）与锚点/标签一律拒绝并给行号，
+    // 不能让"看起来像 YAML"的多行写法被解析成半个字段。
+    if (/^[|>][+-]?\s*$/.test(valueRaw)) return { ok: false, error: `block_scalar_unsupported:${i + 1}` }
+    if (/^[&*!]/.test(valueRaw)) return { ok: false, error: `unsupported_value:${i + 1}` }
     const got = parseValue(m[2], i + 1)
     if (!got.ok) return { ok: false, error: got.error }
     front[field] = got.value
@@ -222,6 +256,42 @@ export function parseRuleDocument(source) {
   const body = bodyLines.join('\n').replace(/\n+$/, '')
   const headerLen = lines.slice(0, end + 1).reduce((sum, line) => sum + line.length + 1, 0)
   return { ok: true, front, text: body, bodyStart: headerLen + skippedBlank }
+}
+
+// ---------------------------------------------------------------------------
+// 文件读取闸（大小 / UTF-8 fatal）
+// ---------------------------------------------------------------------------
+
+const UTF8_FATAL = new TextDecoder('utf-8', { fatal: true })
+
+/** 文件名 → key（去掉 `.md`；路径由调用方保证已安全）。 */
+export function ruleKeyOfFile(file) {
+  return String(file ?? '').replace(/^.*[\\/]/, '').replace(/\.md$/i, '')
+}
+
+/**
+ * 读一个规则文件源文本，带上限与编码闸。
+ *
+ * 为什么不用 `readFileSync(path,'utf8')`：node 会把非法字节静默替换成 U+FFFD，
+ * 于是坏文件变成"正文里多几个问号"，规则被改写而不自知。这里 fatal 解码 + 64KB 上限，
+ * 失败即 `invalid_encoding` / `file_too_large`，由调用方标红。
+ *
+ * @param {string} file @param {{fs?: typeof nodeFs}} [opts]
+ * @returns {{ok:boolean,text?:string,error?:string}}
+ */
+export function readRuleSource(file, opts = {}) {
+  const fs = opts.fs || nodeFs
+  let buf
+  try { buf = fs.readFileSync(file) } catch (err) {
+    return { ok: false, error: err?.code === 'ENOENT' ? 'rule_not_found' : 'read_failed' }
+  }
+  const bytes = Buffer.isBuffer(buf) ? buf : Buffer.from(String(buf ?? ''), 'utf8')
+  if (bytes.length > RULE_FILE_MAX) return { ok: false, error: 'file_too_large' }
+  try {
+    return { ok: true, text: UTF8_FATAL.decode(bytes) }
+  } catch {
+    return { ok: false, error: 'invalid_encoding' }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -280,8 +350,9 @@ export function serializeRuleDocument(doc) {
 // 归一化与校验
 // ---------------------------------------------------------------------------
 
+/** 本机时区取日（YYYY-MM-DD）：规则 created/updated 是"人看的日期"，不是 UTC 时间戳。 */
 function today() {
-  return new Date().toISOString().slice(0, 10)
+  return dateOf(Date.now())
 }
 
 /** 补默认值（不改入参）；序列化前必须调用，避免文件里少字段导致每处各猜一遍。 */
@@ -293,7 +364,12 @@ export function normalizeRuleDoc(front, text) {
   const type = String(out.type ?? '').trim()
   out.key = String(out.key ?? '').trim()
   out.type = type
-  out.number = out.number === undefined || out.number === null || out.number === '' ? null : Number(out.number)
+  // 编号只属于 iron-rule：普通规则/候选的 number 归一为 null（不占号、不参与唯一性）。
+  // 手写文件若给 rule 带了 number，这里静默丢弃而不是报错——它从来不占用编号，报错只会
+  // 让一份历史文件从列表消失；编号语义由 validateRule 对 iron-rule 严格校验。
+  out.number = type !== 'iron-rule'
+    ? null
+    : (out.number === undefined || out.number === null || out.number === '' ? null : Number(out.number))
   out.priority = String(out.priority ?? 'P1').trim().toUpperCase()
   out.scope = String(out.scope ?? 'global').trim() || 'global'
   out.role = String(out.role ?? '').trim()
@@ -309,6 +385,13 @@ export function normalizeRuleDoc(front, text) {
   out.updated = String(out.updated ?? today()).trim()
   out.version = out.version === undefined || out.version === null || out.version === '' ? 1 : Number(out.version)
   out.origin = String(out.origin ?? '').trim()
+  // summary 只用于 AGENTS 摘要/列表：空值直接省略（不留一行空字段污染 diff），
+  // 换行压成单行——摘要渲染要求每条规则一行，这里先归一，validateRule 再判长度。
+  if (out.summary !== undefined && out.summary !== null) {
+    const summary = String(out.summary).replace(/[\r\n]+/g, ' ').trim()
+    if (summary) out.summary = summary
+    else delete out.summary
+  }
   return { front: out, text: String(text ?? '') }
 }
 
@@ -355,12 +438,20 @@ export function validateRule(front, text, opts = {}) {
 
   if (!KEY_RE.test(String(f.key ?? ''))) push('invalid_key', 'key', 'key 必须是 1–64 位小写字母/数字/._-')
   if (!RULE_TYPES.includes(f.type)) push('invalid_type', 'type', `type 必须是 ${RULE_TYPES.join('|')}`)
-  // 无编号铁律（安全行）是唯一允许 number=0 的规则；其余任何 key 都必须是正整数。
-  if (isUnnumberedRule(f)) {
+  // 编号只属于 iron-rule（1–999，跳过空号 6）；安全行 number=0 是唯一例外。
+  // 普通规则/候选必须 number=null——它们不占号，也不参与唯一性/nextNumber。
+  if (f.type !== 'iron-rule') {
+    if (!(f.number === null || f.number === undefined)) {
+      push('number_not_allowed', 'number', '只有 iron-rule 允许编号；rule/rule-candidate 的 number 必须为 null')
+    }
+  } else if (isUnnumberedRule(f)) {
     // number=0 合法：不占号、不参与唯一性（numbers Map 里也不会出现 0）。
   } else if (!Number.isInteger(f.number) || f.number <= 0) {
     push('invalid_number', 'number', 'number 必须是正整数（仅允许 iron-rule-safety 为 0）')
   } else if (RESERVED_NUMBERS.includes(f.number)) push('number_reserved', 'number', `编号 ${f.number} 是保留空号，永不复用`)
+  else if (f.number > RULE_NUMBER_MAX) {
+    push('number_too_large', 'number', `编号 ${f.number} 超过上限 ${RULE_NUMBER_MAX}`)
+  }
   if (!RULE_PRIORITIES.includes(String(f.priority ?? '').toUpperCase())) {
     push('invalid_priority', 'priority', `priority 必须是 ${RULE_PRIORITIES.join('|')}`)
   }
@@ -383,10 +474,24 @@ export function validateRule(front, text, opts = {}) {
   const chars = charsOf(body)
   if (chars === 0) push('body_empty', null, '正文不能为空')
   if (chars > RULE_BODY_MAX) push('body_too_long', null, `正文 ${chars} 字，超过硬顶 ${RULE_BODY_MAX}`)
+  // R8-06 写入闸：正文不得含 HTML 注释标记字面量——规则正文会进 AGENTS 摘要，一条 `<!--...-->`
+  // 就能把管理块撕开，让后续摘要渲染落在标记外（注入/渲染侧另有防御，但入口必须拒）。
+  if (/<!--|-->/.test(body)) push('html_comment_marker', null, '正文不得含 HTML 注释标记（<!-- / -->）')
 
   const numbers = opts.numbers instanceof Map ? opts.numbers : new Map()
   if (Number.isInteger(f.number) && numbers.has(f.number) && numbers.get(f.number) !== f.key) {
     push('duplicate_number', 'number', `编号 ${f.number} 已被 ${numbers.get(f.number)} 占用`)
+  }
+
+  // summary：可选；只用于摘要展示，因此强制单行 + 硬顶 120 码点（超了就是把正文塞进摘要）。
+  if (f.summary !== undefined && f.summary !== null) {
+    if (typeof f.summary !== 'string') {
+      push('invalid_summary', 'summary', 'summary 必须是字符串')
+    } else if (/[\r\n]/.test(f.summary)) {
+      push('invalid_summary', 'summary', 'summary 必须是单行文本')
+    } else if (charsOf(f.summary) > SUMMARY_MAX) {
+      push('summary_too_long', 'summary', `summary ${charsOf(f.summary)} 字，超过上限 ${SUMMARY_MAX}`)
+    }
   }
 
   // 隐私口径复用 rules.js：密钥/手机号/身份证/口令命中即拒绝（所有类型）。
@@ -424,9 +529,149 @@ export function atomicWriteFile(file, text, opts = {}) {
   }
 }
 
+/** 文本 sha256（事务恢复用：判断文件是否仍是本事务写下的中间态）。 */
+function hashText(text) {
+  return createHash('sha256').update(String(text ?? ''), 'utf8').digest('hex')
+}
+
 /** 同步等待（主线程无 await 可用；锁只持有毫秒级，阻塞可接受）。 */
 function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(1, ms))
+}
+
+/**
+ * 落盘到磁盘（tmp + fsync + rename + fsync 目录）：墓碑必须先于删文件真正持久化。
+ *
+ * 为什么不用 atomicWriteFile：rename 只保证"要么旧要么新"，不保证内容到盘。断电后
+ * 「文件已删、墓碑没落盘」会让编号被复用——这是 R8 的核心不变式，必须 fsync。
+ *
+ * @param {string} file @param {string} text @param {{fs?: typeof nodeFs}} [opts]
+ * @returns {{ok:boolean,error?:string}}
+ */
+export function durableWriteFile(file, text, opts = {}) {
+  const fs = opts.fs || nodeFs
+  const tmp = `${file}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`
+  let fd = null
+  try {
+    const handle = fs.openSync(tmp, 'w')
+    fd = handle
+    fs.writeFileSync(handle, String(text), 'utf8')
+    try { fs.fsyncSync(handle) } catch { /* 部分文件系统/假 fs 不支持 fsync：尽力而为，不掩盖写入 */ }
+    fs.closeSync(handle)
+    fd = null
+    fs.renameSync(tmp, file)
+    fsyncDir(dirnameOf(file), fs)
+    return { ok: true }
+  } catch (err) {
+    if (fd !== null) { try { fs.closeSync(fd) } catch { /* 句柄可能已关 */ } }
+    try { fs.unlinkSync(tmp) } catch { /* tmp 可能没建出来 */ }
+    return { ok: false, error: String(err?.message || err) }
+  }
+}
+
+/** 目录 fsync（best effort）：rename 的目录项也要到盘，否则崩溃后墓碑文件名可能丢。 */
+function fsyncDir(dir, fs = nodeFs) {
+  let fd = null
+  try {
+    fd = fs.openSync(dir, 'r')
+    fs.fsyncSync(fd)
+  } catch { /* 目录 fsync 在部分平台不支持，尽力而为 */ } finally {
+    if (fd !== null) { try { fs.closeSync(fd) } catch { /* 已关 */ } }
+  }
+}
+
+/** @param {string} file @returns {string} */
+function dirnameOf(file) {
+  return dirname(String(file))
+}
+
+/**
+ * 仓库级写锁：`.locks/repo.lock`（mkdir 原子），`owner.json` 记 pid/ts。
+ *
+ * 为什么一把锁而不是每 key 一把：manifest/commit/编号都是**全仓**资源，多把锁只会制造
+ * "看起来能并发、实际互相覆盖"的假并发。锁不续租（接口冻结 staleMs=120s）：持锁期间的
+ * git commit 最长也就秒级，用一个大阈值覆盖整个临界区，比每 2s touch 更简单可靠。
+ *
+ * @param {string} root
+ * @param {{fs?: typeof nodeFs, timeoutMs?: number, staleMs?: number}} [opts]
+ * @returns {{ok:boolean, release?:Function, owner?:object, error?:string}}
+ */
+export function acquireRepoLock(root, opts = {}) {
+  const fs = opts.fs || nodeFs
+  const base = baseDir(root)
+  const lockRoot = join(base, LOCK_DIR)
+  const lock = join(lockRoot, REPO_LOCK)
+  const ownerFile = join(lock, 'owner.json')
+  const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : 5000
+  const staleMs = Number.isFinite(opts.staleMs) ? opts.staleMs : REPO_LOCK_STALE_MS
+  const started = Date.now()
+  try { fs.mkdirSync(lockRoot, { recursive: true }) } catch (err) {
+    return { ok: false, error: `lock_dir_failed:${err?.message || err}` }
+  }
+  for (;;) {
+    const owner = { pid: process.pid, ts: Date.now(), nonce: randomBytes(8).toString('hex') }
+    try {
+      fs.mkdirSync(lock)
+      try { fs.writeFileSync(ownerFile, `${JSON.stringify(owner)}\n`, 'utf8') } catch (err) {
+        try { fs.rmdirSync(lock) } catch { /* 清不掉也继续报错，不吞 */ }
+        return { ok: false, error: `lock_owner_failed:${err?.message || err}` }
+      }
+      return {
+        ok: true,
+        owner,
+        /**
+         * 只删"自己那一把"：stale 接管后旧持有者的 release 晚到，若直接 rmdir 会把
+         * 新持有者的锁删掉（两个进程同时进临界区）。nonce 不匹配即视为已被接管，不删。
+         */
+        release() {
+          let held = null
+          try { held = JSON.parse(fs.readFileSync(ownerFile, 'utf8')) } catch { held = null }
+          if (!held || held.nonce !== owner.nonce) return false
+          try { fs.unlinkSync(ownerFile) } catch { /* owner 可能已被接管 */ }
+          try { fs.rmdirSync(lock) } catch { /* 已被清理/权限变化：不应掩盖写入结果 */ }
+          return true
+        },
+      }
+    } catch (err) {
+      if (err?.code !== 'EEXIST') return { ok: false, error: `lock_failed:${err?.message || err}` }
+      let held = null
+      try {
+        held = JSON.parse(fs.readFileSync(ownerFile, 'utf8'))
+      } catch { held = null }
+      let heldAt = Number(held?.ts)
+      if (!Number.isFinite(heldAt)) {
+        // owner.json 没写成（持锁进程刚 mkdir 就崩）：退回目录 mtime 判活。
+        try { heldAt = fs.statSync(lock).mtimeMs } catch { heldAt = 0 }
+      }
+      if (Number.isFinite(heldAt) && Date.now() - heldAt > staleMs) {
+        try {
+          if (typeof fs.rmSync === 'function') fs.rmSync(lock, { recursive: true, force: true })
+          else fs.rmdirSync(lock)
+        } catch { /* 被别的进程刚接管/清理：回到循环重抢 */ }
+        continue
+      }
+      if (Date.now() - started > timeoutMs) return { ok: false, error: 'repo_locked', owner: held }
+      sleepSync(10)
+    }
+  }
+}
+
+/**
+ * 在仓库级锁内执行同步函数；抛错也释放。
+ *
+ * @template T
+ * @param {string} root @param {() => T} fn
+ * @param {{fs?: typeof nodeFs, timeoutMs?: number, staleMs?: number}} [opts]
+ * @returns {T | {ok:false, error:string}}
+ */
+export function withRepoLock(root, fn, opts = {}) {
+  const lock = acquireRepoLock(root, opts)
+  if (!lock.ok) return { ok: false, error: lock.error, lock: lock.owner || null }
+  try {
+    return fn()
+  } finally {
+    lock.release()
+  }
 }
 
 /**
@@ -443,6 +688,7 @@ export function acquireRuleLock(root, key, opts = {}) {
   const fs = opts.fs || nodeFs
   const lockRoot = join(baseDir(root), LOCK_DIR)
   const lock = join(lockRoot, `${key}.lock`)
+  const ownerFile = join(lock, 'owner.json')
   const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : 3000
   const staleMs = Number.isFinite(opts.staleMs) ? opts.staleMs : 10000
   const started = Date.now()
@@ -450,19 +696,40 @@ export function acquireRuleLock(root, key, opts = {}) {
     return { ok: false, error: `lock_dir_failed:${err?.message || err}` }
   }
   for (;;) {
+    const owner = { pid: process.pid, key, ts: Date.now(), nonce: randomBytes(8).toString('hex') }
     try {
       fs.mkdirSync(lock)
+      try { fs.writeFileSync(ownerFile, `${JSON.stringify(owner)}\n`, 'utf8') } catch (err) {
+        try { fs.rmdirSync(lock) } catch { /* 清不掉也继续报错 */ }
+        return { ok: false, error: `lock_owner_failed:${err?.message || err}` }
+      }
       return {
         ok: true,
+        owner,
         release() {
+          // nonce 不匹配 = 锁已被 stale 接管，不能删别人的锁（见 repo lock 同注释）。
+          let held = null
+          try { held = JSON.parse(fs.readFileSync(ownerFile, 'utf8')) } catch { held = null }
+          if (!held || held.nonce !== owner.nonce) return false
+          try { fs.unlinkSync(ownerFile) } catch { /* owner 可能已被接管 */ }
           try { fs.rmdirSync(lock) } catch { /* 已被清理/权限变化：不应掩盖写入结果 */ }
+          return true
         },
       }
     } catch (err) {
       if (err?.code !== 'EEXIST') return { ok: false, error: `lock_failed:${err?.message || err}` }
-      try {
-        if (Date.now() - fs.statSync(lock).mtimeMs > staleMs) { fs.rmdirSync(lock); continue }
-      } catch { continue } // 锁刚被释放/stat 失败：立刻重试
+      let heldAt = 0
+      try { heldAt = JSON.parse(fs.readFileSync(ownerFile, 'utf8')).ts } catch {
+        try { heldAt = fs.statSync(lock).mtimeMs } catch { heldAt = 0 }
+      }
+      if (Number.isFinite(heldAt) && Date.now() - heldAt > staleMs) {
+        try {
+          // 锁目录里现在有 owner.json，rmdir 会 ENOTEMPTY → 必须递归删。
+          if (typeof fs.rmSync === 'function') fs.rmSync(lock, { recursive: true, force: true })
+          else { try { fs.unlinkSync(ownerFile) } catch { /* 无 owner */ }; fs.rmdirSync(lock) }
+        } catch { /* 刚被接管/清理：回到循环重抢 */ }
+        continue
+      }
       if (Date.now() - started > timeoutMs) return { ok: false, error: 'rule_locked' }
       sleepSync(10)
     }
@@ -487,9 +754,32 @@ function existsSyncSafe(path, fs = nodeFs) {
   try { return fs.existsSync(path) } catch { return false }
 }
 
+/**
+ * 快照名排序键：`(17 位戳, 同毫秒序号)`，序号缺省=1。
+ *
+ * 为什么不能用字典序：`...000-10.md` 字典序小于 `...000-2.md`，pruneHistory 会把"最新"
+ * 当"最旧"删掉、历史列表顺序也会错。数值比较才不会把同毫秒的第 10 份当第 2 份。
+ * @param {string} name @returns {number[]|null}
+ */
+function revSortKey(name) {
+  const m = String(name).replace(/\.md$/i, '').match(/^(\d{17})(?:-(\d+))?$/)
+  if (!m) return null
+  return [Number(m[1]), m[2] ? Number(m[2]) : 1]
+}
+
+/** 快照名比较：合法戳按数值，非法名退回字典序（不把坏名混进数值序列）。 */
+function compareRevs(a, b) {
+  const ka = revSortKey(a)
+  const kb = revSortKey(b)
+  if (ka && kb) return ka[0] - kb[0] || ka[1] - kb[1]
+  if (ka) return 1
+  if (kb) return -1
+  return String(a).localeCompare(String(b))
+}
+
 function pruneHistory(dir, fs) {
   let names
-  try { names = fs.readdirSync(dir).filter((n) => n.endsWith('.md')).sort() } catch { return [] }
+  try { names = fs.readdirSync(dir).filter((n) => n.endsWith('.md')).sort(compareRevs) } catch { return [] }
   const removed = []
   for (const name of names.slice(0, Math.max(0, names.length - HISTORY_KEEP))) {
     try { fs.unlinkSync(join(dir, name)); removed.push(name) } catch { /* 删不掉就留着，历史多一份比丢一份安全 */ }
@@ -528,7 +818,7 @@ export function readHistory(root, key) {
   const base = baseDir(root)
   const dir = join(base, 'history', key)
   let names
-  try { names = readdirSync(dir).filter((n) => n.endsWith('.md')).sort().reverse() } catch (err) {
+  try { names = readdirSync(dir).filter((n) => n.endsWith('.md')).sort(compareRevs).reverse() } catch (err) {
     if (err?.code === 'ENOENT') return { ok: true, entries: [] }
     return { ok: false, error: String(err?.message || err) }
   }
@@ -549,11 +839,10 @@ export function readHistory(root, key) {
 
 function readSnapshotFile(base, key, rev) {
   const file = join(base, 'history', key, `${rev}.md`)
-  let source
-  try { source = readFileSync(file, 'utf8') } catch (err) {
-    return { ok: false, error: err?.code === 'ENOENT' ? 'snapshot_not_found' : String(err?.message || err) }
-  }
-  const parsed = parseRuleDocument(source)
+  // 快照与规则同一个读取闸：坏 UTF-8 的旧快照不能靠 U+FFFD 混成"看起来正常的旧版"。
+  const read = readRuleSource(file)
+  if (!read.ok) return { ok: false, error: read.error === 'rule_not_found' ? 'snapshot_not_found' : read.error }
+  const parsed = parseRuleDocument(read.text)
   if (!parsed.ok) return { ok: false, error: parsed.error }
   const normalized = normalizeRuleDoc(parsed.front, parsed.text)
   return { ok: true, rule: { ...normalized, bodyStart: parsed.bodyStart, file } }
@@ -598,11 +887,15 @@ export function readRule(root, key) {
   if (!KEY_RE.test(String(key ?? ''))) return { ok: false, error: 'invalid_key' }
   const file = findRuleFile(base, key)
   if (!file) return { ok: false, error: 'rule_not_found' }
-  let source
-  try { source = readFileSync(file, 'utf8') } catch (err) { return { ok: false, error: String(err?.message || err) } }
-  const parsed = parseRuleDocument(source)
+  const read = readRuleSource(file)
+  if (!read.ok) return { ok: false, error: read.error }
+  const parsed = parseRuleDocument(read.text)
   if (!parsed.ok) return { ok: false, error: 'invalid_rule', detail: { parse: parsed.error } }
   const normalized = normalizeRuleDoc(parsed.front, parsed.text)
+  // key 必须等于文件名：手改文件名会造成「列表可见、readRule 找不到、再写一份就丢原条」。
+  if (normalized.front.key !== String(key)) {
+    return { ok: false, error: 'key_mismatch', detail: { key: String(key), frontKey: normalized.front.key, file } }
+  }
   const check = validateRule(normalized.front, normalized.text, { numbers: new Map() })
   if (!check.ok) return { ok: false, error: 'invalid_rule', detail: check.errors }
   return {
@@ -632,24 +925,39 @@ export function listRules(root) {
   for (const { dir, name } of files) {
     const file = join(dir, name)
     if (name.toUpperCase() === 'README.MD') continue
-    let source
-    try { source = readFileSync(file, 'utf8') } catch (err) { errors.push({ file, error: String(err?.message || err) }); continue }
-    const parsed = parseRuleDocument(source)
+    const read = readRuleSource(file)
+    if (!read.ok) { errors.push({ file, error: read.error }); continue }
+    const parsed = parseRuleDocument(read.text)
     if (!parsed.ok) { errors.push({ file, error: parsed.error }); continue }
     const normalized = normalizeRuleDoc(parsed.front, parsed.text)
+    // key=文件名闸：文件名被手改的规则跳过并标 key_mismatch（列表/详情都不再假装它叫新名字）。
+    const fileKey = ruleKeyOfFile(name)
+    if (normalized.front.key !== fileKey) {
+      errors.push({ file, error: 'key_mismatch', detail: { key: fileKey, frontKey: normalized.front.key } })
+      continue
+    }
     const check = validateRule(normalized.front, normalized.text, { numbers })
     if (!check.ok) { errors.push({ file, error: 'invalid_rule', detail: check.errors }); continue }
-    if (Number.isInteger(normalized.front.number) && normalized.front.number > 0 && numbers.has(normalized.front.number)) {
+    // 只有 iron-rule 的正整数编号占号；普通规则/候选 number=null，永不参与撞号。
+    if (normalized.front.type === 'iron-rule'
+      && Number.isInteger(normalized.front.number) && normalized.front.number > 0
+      && numbers.has(normalized.front.number)) {
       errors.push({ file, error: 'duplicate_number', detail: { number: normalized.front.number } })
       continue
     }
     // 无编号规则（number=0）不占号：不进 numbers，也就不会与任何规则撞号。
-    if (Number.isInteger(normalized.front.number) && normalized.front.number > 0) {
+    if (normalized.front.type === 'iron-rule'
+      && Number.isInteger(normalized.front.number) && normalized.front.number > 0) {
       numbers.set(normalized.front.number, normalized.front.key)
     }
     rules.push({ ...normalized, bodyStart: parsed.bodyStart, file })
   }
-  rules.sort((a, b) => a.front.number - b.front.number || a.front.key.localeCompare(b.front.key))
+  // 编号优先（只有铁律有号），无号规则按 key；number=null 不能参与减法（会得 NaN 打乱顺序）。
+  rules.sort((a, b) => {
+    const na = Number.isInteger(a.front.number) ? a.front.number : Number.POSITIVE_INFINITY
+    const nb = Number.isInteger(b.front.number) ? b.front.number : Number.POSITIVE_INFINITY
+    return na - nb || a.front.key.localeCompare(b.front.key)
+  })
   return { ok: true, rules, errors }
 }
 
@@ -675,18 +983,16 @@ export function writeRule(root, input, opts = {}) {
     return { ok: false, error: 'invalid_rule', detail: [{ code: 'invalid_key', field: 'key', message: 'key 非法' }] }
   }
 
-  // 首次写规则时初始化 git 仓库；git 缺失只降级（ensureRuleRepo 不抛），文件仍可写。
-  const ensured = ensureRuleRepo({ root: base, git: opts.git !== false, fs, exec: opts.exec })
-  if (!ensured.ok) return { ok: false, error: 'ensure_failed', detail: { root: base, error: ensured.error } }
+  const run = () => {
+    // 首次写规则时初始化 git 仓库；git 缺失只降级（ensureRuleRepo 不抛），文件仍可写。
+    const ensured = ensureRuleRepo({ root: base, git: opts.git !== false, fs, exec: opts.exec })
+    if (!ensured.ok) return { ok: false, error: 'ensure_failed', detail: { root: base, error: ensured.error } }
 
-  // 编号校验、历史快照、落盘、manifest 必须在同一把同 key 锁内，否则并发写会撞号/丢快照。
-  const lock = acquireRuleLock(base, normalized.front.key, { fs })
-  if (!lock.ok) return { ok: false, error: lock.error }
-  try {
     const existing = listRules(base)
     const numbers = new Map()
     for (const doc of existing.rules) {
       if (doc.front.key === normalized.front.key) continue
+      if (doc.front.type !== 'iron-rule') continue
       if (!(Number.isInteger(doc.front.number) && doc.front.number > 0)) continue
       numbers.set(doc.front.number, doc.front.key)
     }
@@ -700,11 +1006,9 @@ export function writeRule(root, input, opts = {}) {
     const oldFile = findRuleFile(base, normalized.front.key)
     let snapshot = null
     if (oldFile) {
-      let oldText
-      try { oldText = fs.readFileSync(oldFile, 'utf8') } catch (err) {
-        return { ok: false, error: 'snapshot_read_failed', detail: String(err?.message || err) }
-      }
-      snapshot = writeHistorySnapshot(base, normalized.front.key, oldText, { fs })
+      const old = readRuleSource(oldFile, { fs })
+      if (!old.ok) return { ok: false, error: 'snapshot_read_failed', detail: old.error }
+      snapshot = writeHistorySnapshot(base, normalized.front.key, old.text, { fs })
       if (!snapshot.ok) return { ok: false, error: 'snapshot_failed', detail: snapshot.error }
     }
 
@@ -723,7 +1027,17 @@ export function writeRule(root, input, opts = {}) {
 
     let git = null
     if (opts.git !== false) {
-      git = gitCommit(base, `rules: ${normalized.front.key} v${normalized.front.version}`, { exec: opts.exec })
+      // 显式路径：本文件 + manifest（+ 旧文件若被移走）；不用 add -A，避免把候选/快照带进提交。
+      const paths = Array.isArray(opts.commitPaths)
+        ? opts.commitPaths
+        : [relative(base, target), MANIFEST_FILE, ...(oldFile && oldFile !== target ? [relative(base, oldFile)] : [])]
+      const done = commitRuleChanges(base, `rules: ${normalized.front.key} v${normalized.front.version}`, {
+        exec: opts.exec,
+        paths,
+      })
+      git = done.ok
+        ? { ok: true, committed: Boolean(done.committed), message: done.message }
+        : { ok: false, committed: false, message: done.message, error: done.error || 'git_failed' }
     }
     return {
       ok: true,
@@ -738,6 +1052,14 @@ export function writeRule(root, input, opts = {}) {
       manifest: manifest.manifest,
       git,
     }
+  }
+
+  // 锁外默认自己拿仓库级锁；锁内调用方传 lockHeld:true（create/update/apply/seed）。
+  if (opts.lockHeld === true) return run()
+  const lock = acquireRepoLock(base, { fs, timeoutMs: opts.timeoutMs, staleMs: opts.staleMs })
+  if (!lock.ok) return { ok: false, error: lock.error }
+  try {
+    return run()
   } finally {
     lock.release()
   }
@@ -756,14 +1078,25 @@ export function deleteRule(root, key, opts = {}) {
   if (!got.ok) return got
   const doc = got.rule
   if (opts.force === true && doc.front.type === 'rule-candidate') {
-    let oldText
-    try { oldText = fs.readFileSync(doc.file, 'utf8') } catch (err) { return { ok: false, error: String(err?.message || err) } }
-    const snap = writeHistorySnapshot(base, key, oldText, { fs })
-    if (!snap.ok) return { ok: false, error: 'snapshot_failed', detail: snap.error }
-    try { fs.unlinkSync(doc.file) } catch (err) { return { ok: false, error: 'delete_failed', detail: String(err?.message || err) } }
-    regenerateManifest(base, { fs })
-    if (opts.git !== false) gitCommit(base, `rules: delete candidate ${key}`, { exec: opts.exec })
-    return { ok: true, deleted: true }
+    const lock = acquireRepoLock(base, { fs, timeoutMs: opts.timeoutMs, staleMs: opts.staleMs })
+    if (!lock.ok) return { ok: false, error: lock.error }
+    try {
+      const old = readRuleSource(doc.file, { fs })
+      if (!old.ok) return { ok: false, error: old.error }
+      const snap = writeHistorySnapshot(base, key, old.text, { fs })
+      if (!snap.ok) return { ok: false, error: 'snapshot_failed', detail: snap.error }
+      try { fs.unlinkSync(doc.file) } catch (err) { return { ok: false, error: 'delete_failed', detail: String(err?.message || err) } }
+      regenerateManifest(base, { fs })
+      if (opts.git !== false) {
+        commitRuleChanges(base, `rules: delete candidate ${key}`, {
+          exec: opts.exec,
+          paths: [relative(base, doc.file), MANIFEST_FILE],
+        })
+      }
+      return { ok: true, deleted: true }
+    } finally {
+      lock.release()
+    }
   }
   const next = normalizeRuleDoc({
     ...doc.front,
@@ -820,7 +1153,10 @@ function manualModalityOf(text) {
 function occupiedNumbers(rules, retired = []) {
   const numbers = new Set()
   for (const doc of Array.isArray(rules) ? rules : []) {
-    const n = doc?.front ? Number(doc.front.number) : Number(doc?.number)
+    // 只有 iron-rule 占号；普通规则/候选带 number（历史手写文件）也不得压高 nextNumber。
+    const front = doc?.front && typeof doc.front === 'object' ? doc.front : doc
+    if (String(front?.type ?? '') !== 'iron-rule') continue
+    const n = Number(front?.number)
     if (Number.isInteger(n) && n > 0) numbers.add(n)
   }
   for (const item of Array.isArray(retired) ? retired : []) {
@@ -886,66 +1222,106 @@ export function createRule({ root = '', draft = {}, identity = {}, traceId = '',
     }
   }
 
-  const listed = listRules(base)
-  // 墓碑也占号：彻底删除后编号作废、永不复用（删 17 后新建仍 18；删 18 后新建仍 19）。
-  const number = nextRuleNumber(occupiedNumbers(listed.rules, readManifest(base)?.retired))
-  // `rule:<domain>-<hash8>` → `rule-<domain>-<hash8>`（面板/文件里的 key 形状）。
-  const key = type === 'iron-rule' ? `iron-rule-${number}` : ruleKeyOf(text).replace(/^rule:/, 'rule-')
-  if (!isValidRuleKey(key)) return { ok: false, error: 'invalid_draft', detail: { reason: 'invalid_key', key } }
-  if (listed.rules.some((doc) => String(doc.front.key) === key)) {
-    return { ok: false, error: 'duplicate_rule', detail: { key, reason: 'key_exists' } }
-  }
+  // 仓库锁内：重读磁盘 → 分配号 → 落盘 → manifest → 单次提交。锁外算号会被并发抢号/复活墓碑号。
+  const lock = acquireRepoLock(base, { fs, timeoutMs: opts.timeoutMs, staleMs: opts.staleMs })
+  if (!lock.ok) return { ok: false, error: lock.error, detail: { root: base } }
+  try {
+    if (opts.git !== false) {
+      // 仓就绪（含 git init）：单 commit 需要一个已存在的仓库；缺 git 只降级（ensureRuleRepo 不抛）。
+      const ensured = ensureRuleRepo({ root: base, git: true, fs, ...(opts.exec ? { exec: opts.exec } : {}) })
+      if (!ensured.ok) return { ok: false, error: 'ensure_failed', detail: { root: base, error: ensured.error } }
+    }
 
-  const userId = String(identity?.userId ?? '').slice(0, 128)
-  const conditions = Array.isArray(draft.conditions)
-    ? draft.conditions.map((item) => String(item ?? '').trim()).filter(Boolean)
-    : []
-  const exceptions = Array.isArray(draft.exceptions)
-    ? draft.exceptions.map((item) => String(item ?? '').trim()).filter(Boolean)
-    : []
-  const date = dateOf(now)
-  const front = {
-    key,
-    type,
-    number,
-    priority: String(draft.priority ?? (type === 'iron-rule' ? 'P0' : 'P1')).trim().toUpperCase(),
-    scope: String(draft.scope ?? 'global').trim() || 'global',
-    role: String(draft.role ?? '').trim(),
-    modality: manualModalityOf(text),
-    action: String(draft.action ?? '').trim(),
-    object: String(draft.object ?? '').trim(),
-    conditions,
-    exceptions,
-    status: 'active',
-    merged_into: '',
-    superseded_by: '',
-    created: date,
-    updated: date,
-    version: 1,
-    origin: `manual:${userId}`,
-  }
+    const listed = listRules(base)
+    // 编号只属于 iron-rule：普通规则 number=null（不占号、不压 nextNumber）。
+    // 墓碑（retired/*.json）也占号：彻底删除后编号作废、永不复用（删 17 后新建仍 18）。
+    const number = type === 'iron-rule'
+      ? nextRuleNumber(occupiedNumbers(listed.rules, readTombstones(base, { fs })))
+      : null
+    if (type === 'iron-rule' && number > RULE_NUMBER_MAX) {
+      return { ok: false, error: 'number_exhausted', detail: { max: RULE_NUMBER_MAX } }
+    }
+    // `rule:<domain>-<hash8>` → `rule-<domain>-<hash8>`（面板/文件里的 key 形状）。
+    const key = type === 'iron-rule' ? `iron-rule-${number}` : ruleKeyOf(text).replace(/^rule:/, 'rule-')
+    if (!isValidRuleKey(key)) return { ok: false, error: 'invalid_draft', detail: { reason: 'invalid_key', key } }
+    if (listed.rules.some((doc) => String(doc.front.key) === key)) {
+      return { ok: false, error: 'duplicate_rule', detail: { key, reason: 'key_exists' } }
+    }
 
-  // 仓就绪（含 git init）：单 commit 需要一个已存在的仓库；缺 git 只降级（ensureRuleRepo 不抛）。
-  if (opts.git !== false) {
-    const ensured = ensureRuleRepo({ root: base, git: true, fs, ...(opts.exec ? { exec: opts.exec } : {}) })
-    if (!ensured.ok) return { ok: false, error: 'ensure_failed', detail: { root: base, error: ensured.error } }
-  }
+    const userId = String(identity?.userId ?? '').slice(0, 128)
+    const conditions = Array.isArray(draft.conditions)
+      ? draft.conditions.map((item) => String(item ?? '').trim()).filter(Boolean)
+      : []
+    const exceptions = Array.isArray(draft.exceptions)
+      ? draft.exceptions.map((item) => String(item ?? '').trim()).filter(Boolean)
+      : []
+    const date = dateOf(now)
+    const front = {
+      key,
+      type,
+      number,
+      priority: String(draft.priority ?? (type === 'iron-rule' ? 'P0' : 'P1')).trim().toUpperCase(),
+      scope: String(draft.scope ?? 'global').trim() || 'global',
+      role: String(draft.role ?? '').trim(),
+      modality: manualModalityOf(text),
+      action: String(draft.action ?? '').trim(),
+      object: String(draft.object ?? '').trim(),
+      conditions,
+      exceptions,
+      status: 'active',
+      merged_into: '',
+      superseded_by: '',
+      created: date,
+      updated: date,
+      version: 1,
+      origin: `manual:${userId}`,
+    }
 
-  // git:false：文件 + manifest 由 writeRule 一次做完，提交由下面这一条统一出。
-  const written = writeRule(base, { front, text }, { git: false, fs })
-  if (!written.ok) return { ok: false, error: written.error || 'write_failed', detail: written.detail }
+    // git:false：文件 + manifest 由 writeRule 一次做完，提交由下面这一条统一出。
+    const written = writeRule(base, { front, text }, { git: false, fs, lockHeld: true })
+    if (!written.ok) return { ok: false, error: written.error || 'write_failed', detail: written.detail }
 
-  const commit = commitRuleChange(base, `rule: create ${key} (#${number})`, opts)
-  return {
-    ok: true,
-    rule: written.rule,
-    path: written.path,
-    key,
-    number,
-    type,
-    version: 1,
-    origin: front.origin,
-    commit,
+    const message = `rule: create ${key} (#${number})`
+    const commitPaths = [relative(base, written.path), MANIFEST_FILE]
+    let commit = null
+    if (opts.git !== false) {
+      commit = commitRuleChanges(base, message, { exec: opts.exec, paths: commitPaths })
+      if (!commit.ok && isGitDegraded(commit.error)) {
+        // 降级：文件/manifest 已落盘，只是没有版本记录（架构书 §6「git 不可用」语义）。
+        return {
+          ok: true, rule: written.rule, path: written.path, key, number, type, version: 1,
+          origin: front.origin, commit, manifest: written.manifest || null,
+        }
+      }
+      if (!commit.ok) {
+        // commit 失败必须回滚：删新文件 + 重建 manifest + 清 git index，不留"幻影规则/幻影版本"。
+        const rolled = rollbackCreatedFile(base, written.path, commitPaths, { fs, exec: opts.exec })
+        return {
+          ok: false,
+          error: 'commit_failed',
+          detail: { stage: 'commit', error: commit.error },
+          rolledBack: rolled.ok,
+          rollbackFailures: rolled.failures,
+          key,
+          number,
+          type,
+        }
+      }
+    }
+    return {
+      ok: true,
+      rule: written.rule,
+      path: written.path,
+      key,
+      number,
+      type,
+      version: 1,
+      origin: front.origin,
+      commit,
+      manifest: written.manifest || null,
+    }
+  } finally {
+    lock.release()
   }
 }
 
@@ -1024,53 +1400,105 @@ function removeRuleFile(base, file, opts = {}) {
  * purge 让规则从列表、提案与镜像召回里彻底消失，但**编号永不复用**——编号写进
  * `manifest.json#retired` 墓碑，未来自动编号把它算作已占用（删 17 → 新建 18；删 18 → 新建 19）。
  *
- * 顺序刻意是"快照 → 删文件 → 墓碑随 manifest 落盘 → 单 commit"：
+ * 顺序刻意是"快照 → **写墓碑并 fsync** → 删文件 → 重建 manifest → 单 commit"：
  * - 先写快照：最后一版正文必须留在 `history/<key>/`，删除后仍可追溯；
- * - 快照失败立即中止，不出现"文件没了、历史也没了"的不可追溯状态；
+ * - 墓碑先落盘：任何后续失败都不得留下"文件已删、墓碑没写"（否则编号会被回收）；
+ * - 墓碑进 `retired/<key>.json`（append-only 真源），manifest.retired 只是可重建的汇总；
  * - 安全行（number=0）只删文件、不写墓碑：它不占编号，墓碑会把 nextNumber 压回 1。
+ *
+ * 回滚：删文件失败 → 删本次新建的墓碑；manifest 失败/commit 失败 → 恢复文件 + 删墓碑 +
+ * 重建 manifest + `git reset -- <paths>`，逐项失败都记进 rollbackFailures，不静默。
  *
  * @param {{root?:string, key:string, identity?:object, traceId?:string, now?:number}} args
  *   identity/traceId 只为与路由/审计同签名（本模块不写 DB）。
  * @param {{fs?:typeof nodeFs, git?:boolean, exec?:Function}} [opts]
  * @returns {{ok:boolean,key?:string,number?:number,version?:number,historySnapshot?:string,
- *   commit?:object|null,error?:string,detail?:any}}
+ *   tombstone?:string,commit?:object|null,error?:string,detail?:any,rolledBack?:boolean,
+ *   rollbackFailures?:string[]}}
  */
 export function purgeRule({ root = '', key, identity = {}, traceId = '', now = Date.now() } = {}, opts = {}) {
   const fs = opts.fs || nodeFs
   const base = baseDir(root)
-  const got = readRule(base, key)
-  if (!got.ok) return { ok: false, error: got.error, detail: got.detail }
-  const doc = got.rule
-  let oldText
-  try { oldText = fs.readFileSync(doc.file, 'utf8') } catch (err) {
-    return { ok: false, error: String(err?.message || err) }
-  }
-  const snap = writeHistorySnapshot(base, key, oldText, { fs })
-  if (!snap.ok) return { ok: false, error: 'snapshot_failed', detail: snap.error }
+  const lock = acquireRepoLock(base, { fs, timeoutMs: opts.timeoutMs, staleMs: opts.staleMs })
+  if (!lock.ok) return { ok: false, error: lock.error }
+  try {
+    const got = readRule(base, key)
+    if (!got.ok) return { ok: false, error: got.error, detail: got.detail }
+    const doc = got.rule
+    const old = readRuleSource(doc.file, { fs })
+    if (!old.ok) return { ok: false, error: old.error }
+    const oldText = old.text
+    const snap = writeHistorySnapshot(base, key, oldText, { fs })
+    if (!snap.ok) return { ok: false, error: 'snapshot_failed', detail: snap.error }
 
-  const number = Number(doc.front.number)
-  const tombstone = Number.isInteger(number) && number > 0 && !isUnnumberedRule(doc.front)
-  const retired = tombstone
-    ? [{
-      key: String(doc.front.key),
-      number,
-      at: new Date(Number.isFinite(now) ? Number(now) : Date.now()).toISOString(),
-    }]
-    : []
+    const number = Number(doc.front.number)
+    const tombstone = doc.front.type === 'iron-rule' && Number.isInteger(number) && number > 0
+    const at = new Date(Number.isFinite(now) ? Number(now) : Date.now()).toISOString()
+    let tomb = null
+    if (tombstone) {
+      tomb = writeTombstone(base, { key: String(doc.front.key), number, at, reason: 'purge' }, { fs })
+      if (!tomb.ok) return { ok: false, error: 'tombstone_failed', detail: tomb.error }
+    }
 
-  const removed = removeRuleFile(base, doc.file, { ...opts, fs })
-  if (!removed.ok) return removed
+    const restoreFile = () => {
+      const restored = durableWriteFile(doc.file, oldText, { fs })
+      return restored.ok ? null : `restore:${restored.error}`
+    }
+    const dropTombstone = () => {
+      if (!tomb) return null
+      try { fs.unlinkSync(tomb.path); fsyncDir(dirnameOf(tomb.path), fs); return null } catch (err) {
+        return `tombstone:${err?.message || err}`
+      }
+    }
 
-  regenerateManifest(base, { fs, retired })
-  // 单 commit：git rm 已暂存删除，manifest/墓碑由 add -A 一并收进同一提交。
-  const commit = commitRuleChange(base, `rule: purge ${key} (#${number})`, opts)
-  return {
-    ok: true,
-    key: String(doc.front.key),
-    number,
-    version: Number(doc.front.version) || 1,
-    historySnapshot: snap.rev,
-    commit,
+    const removed = removeRuleFile(base, doc.file, { ...opts, fs })
+    if (!removed.ok) {
+      const failures = [dropTombstone()].filter(Boolean)
+      return { ...removed, rolledBack: failures.length === 0, rollbackFailures: failures }
+    }
+
+    const manifest = regenerateManifest(base, { fs })
+    if (!manifest.ok) {
+      const failures = [restoreFile(), dropTombstone()].filter(Boolean)
+      const rebuilt = regenerateManifest(base, { fs, allowShrink: true })
+      if (!rebuilt.ok) failures.push(`manifest:${rebuilt.error}`)
+      return { ok: false, error: 'manifest_failed', detail: manifest.error, rolledBack: failures.length === 0, rollbackFailures: failures }
+    }
+
+    if (opts.git === false) {
+      return {
+        ok: true, key: String(doc.front.key), number, version: Number(doc.front.version) || 1,
+        historySnapshot: snap.rev, tombstone: tomb?.path || '', commit: null,
+      }
+    }
+
+    // 显式路径：被删文件（git rm 已暂存，git add 也能记录删除）+ manifest + 墓碑。
+    const paths = [relative(base, doc.file), MANIFEST_FILE, ...(tomb ? [relative(base, tomb.path)] : [])]
+    const commit = commitRuleChanges(base, `rule: purge ${key} (#${number})`, { exec: opts.exec, paths })
+    if (!commit.ok) {
+      // git 不可用是降级（文件已删、commit 跳过）；只有真的提交失败才回滚。
+      if (isGitDegraded(commit.error)) {
+        return {
+          ok: true, key: String(doc.front.key), number, version: Number(doc.front.version) || 1,
+          historySnapshot: snap.rev, tombstone: tomb?.path || '', commit,
+        }
+      }
+      const failures = [restoreFile(), dropTombstone()].filter(Boolean)
+      const rebuilt = regenerateManifest(base, { fs, allowShrink: true })
+      if (!rebuilt.ok) failures.push(`manifest:${rebuilt.error}`)
+      const reset = resetIndexPaths(base, paths, { exec: opts.exec })
+      if (!reset.ok) failures.push(`index:${reset.error}`)
+      return {
+        ok: false, error: 'commit_failed', detail: { stage: 'commit', error: commit.error },
+        rolledBack: failures.length === 0, rollbackFailures: failures,
+      }
+    }
+    return {
+      ok: true, key: String(doc.front.key), number, version: Number(doc.front.version) || 1,
+      historySnapshot: snap.rev, tombstone: tomb?.path || '', commit,
+    }
+  } finally {
+    lock.release()
   }
 }
 
@@ -1092,10 +1520,12 @@ export function rollbackTo(root, key, rev, opts = {}) {
 // 编辑 / 版本 diff / 按版本回写（R5）
 // ---------------------------------------------------------------------------
 
-/** `now`（毫秒/Date）→ `YYYY-MM-DD`；非法输入退回今天，不因时间戳造假日期。 */
+/** `now`（毫秒/Date）→ 本机时区 `YYYY-MM-DD`；非法输入退回今天，不因时间戳造假日期。 */
 function dateOf(now) {
   const d = now instanceof Date ? now : new Date(Number.isFinite(now) ? Number(now) : Date.now())
-  return (Number.isNaN(d.getTime()) ? new Date() : d).toISOString().slice(0, 10)
+  const at = Number.isNaN(d.getTime()) ? new Date() : d
+  const p = (n) => String(n).padStart(2, '0')
+  return `${at.getFullYear()}-${p(at.getMonth() + 1)}-${p(at.getDate())}`
 }
 
 /**
@@ -1300,6 +1730,25 @@ function patchChanged(front, text, nextFront, nextText) {
  *   rolledBack?:boolean}}
  */
 export function updateRule({ root = '', key, patch, now = Date.now() } = {}, opts = {}) {
+  const base = baseDir(root)
+  const fs = opts.fs || nodeFs
+  // 锁外先拿仓库级锁：重读磁盘 → 校验 → 落盘 → manifest → 提交 全在同一临界区。
+  const lock = acquireRepoLock(base, { fs, timeoutMs: opts.timeoutMs, staleMs: opts.staleMs })
+  if (!lock.ok) return { ok: false, error: lock.error }
+  try {
+    return updateRuleLocked({ root: base, key, patch, now }, { ...opts, fs, lockHeld: true })
+  } finally {
+    lock.release()
+  }
+}
+
+/**
+ * `updateRule` 的锁内实现（调用方必须已持仓库锁）。
+ * @param {{root?:string,key:string,patch:object,now?:number}} args
+ * @param {{fs?:typeof nodeFs,git?:boolean,exec?:Function}} opts
+ * @returns {object}
+ */
+function updateRuleLocked({ root = '', key, patch, now = Date.now() } = {}, opts = {}) {
   const fs = opts.fs || nodeFs
   const base = baseDir(root)
   const got = readRule(base, key)
@@ -1371,13 +1820,39 @@ export function updateRule({ root = '', key, patch, now = Date.now() } = {}, opt
 
   // git:false 由本函数自己控制 commit 文案；若让 writeRule 提交，消息会是 `rules: <key> v<n>`，
   // 面板/审计需要的是 `rule: update ...`，所以这里统一由 updateRule 提交一次。
-  const saved = writeRule(base, nextDoc, { fs, git: false })
+  const saved = writeRule(base, nextDoc, { fs, git: false, lockHeld: true })
   if (!saved.ok) {
     const restored = atomicWriteFile(doc.file, oldSource)
     return { ok: false, error: saved.error, detail: saved.detail, rolledBack: restored.ok }
   }
 
-  const commit = commitRuleChange(base, `rule: update ${key} v${version}`, opts)
+  const paths = [relative(base, saved.path), MANIFEST_FILE, ...(saved.path !== doc.file ? [relative(base, doc.file)] : [])]
+  let commit = null
+  if (opts.git !== false) {
+    commit = commitRuleChanges(base, `rule: update ${key} v${version}`, { exec: opts.exec, paths })
+    if (!commit.ok && isGitDegraded(commit.error)) {
+      // 降级：文件/manifest/history 都已落盘，仅无版本记录（git 不可用 ≠ 提交失败）。
+      return {
+        ok: true, changed: true, rule: saved.rule, path: saved.path, history: saved.history || '',
+        commit, version, previousVersion: Number(current.version),
+      }
+    }
+    if (!commit.ok) {
+      // commit 失败必须回滚：文件/manifest/本事务新增 history 条目/git index 四处一起回。
+      const rolled = rollbackRuleWrite(base, {
+        file: doc.file, oldSource, key, historyRev: saved.history, paths, fs, exec: opts.exec,
+      })
+      return {
+        ok: false,
+        error: 'commit_failed',
+        detail: { stage: 'commit', error: commit.error },
+        rolledBack: rolled.ok,
+        rollbackFailures: rolled.failures,
+        version: Number(current.version),
+        previousVersion: Number(current.version),
+      }
+    }
+  }
   return {
     ok: true,
     changed: true,
@@ -1403,6 +1878,24 @@ export function updateRule({ root = '', key, patch, now = Date.now() } = {}, opt
  *   changed?:boolean,error?:string,detail?:any,rolledBack?:boolean}}
  */
 export function revertRule({ root = '', key, rev, now = Date.now() } = {}, opts = {}) {
+  const base = baseDir(root)
+  const fs = opts.fs || nodeFs
+  const lock = acquireRepoLock(base, { fs, timeoutMs: opts.timeoutMs, staleMs: opts.staleMs })
+  if (!lock.ok) return { ok: false, error: lock.error }
+  try {
+    return revertRuleLocked({ root: base, key, rev, now }, { ...opts, fs, lockHeld: true })
+  } finally {
+    lock.release()
+  }
+}
+
+/**
+ * `revertRule` 的锁内实现（调用方必须已持仓库锁）。
+ * @param {{root?:string,key:string,rev:string,now?:number}} args
+ * @param {{fs?:typeof nodeFs,git?:boolean,exec?:Function}} opts
+ * @returns {object}
+ */
+function revertRuleLocked({ root = '', key, rev, now = Date.now() } = {}, opts = {}) {
   const fs = opts.fs || nodeFs
   const base = baseDir(root)
   const got = readRule(base, key)
@@ -1446,13 +1939,40 @@ export function revertRule({ root = '', key, rev, now = Date.now() } = {}, opts 
   try { oldSource = fs.readFileSync(doc.file, 'utf8') } catch (err) {
     return { ok: false, error: 'snapshot_read_failed', detail: String(err?.message || err) }
   }
-  const saved = writeRule(base, nextDoc, { fs, git: false })
+  const saved = writeRule(base, nextDoc, { fs, git: false, lockHeld: true })
   if (!saved.ok) {
     const restored = atomicWriteFile(doc.file, oldSource)
     return { ok: false, error: saved.error, detail: saved.detail, rolledBack: restored.ok }
   }
 
-  const commit = commitRuleChange(base, `rule: revert ${key} to ${resolved.rev}`, opts)
+  const paths = [relative(base, saved.path), MANIFEST_FILE, ...(saved.path !== doc.file ? [relative(base, doc.file)] : [])]
+  let commit = null
+  if (opts.git !== false) {
+    commit = commitRuleChanges(base, `rule: revert ${key} to ${resolved.rev}`, { exec: opts.exec, paths })
+    if (!commit.ok && isGitDegraded(commit.error)) {
+      return {
+        ok: true, changed: true, rule: saved.rule, path: saved.path, history: saved.history || '',
+        commit, version, previousVersion: Number(doc.front.version),
+        revertedTo: resolved.rev, source: resolved.source,
+      }
+    }
+    if (!commit.ok) {
+      // commit 失败必须回滚：文件/manifest/本事务新增 history 条目/git index 四处一起回。
+      const rolled = rollbackRuleWrite(base, {
+        file: doc.file, oldSource, key, historyRev: saved.history, paths, fs, exec: opts.exec,
+      })
+      return {
+        ok: false,
+        error: 'commit_failed',
+        detail: { stage: 'commit', error: commit.error },
+        rolledBack: rolled.ok,
+        rollbackFailures: rolled.failures,
+        version: Number(doc.front.version),
+        previousVersion: Number(doc.front.version),
+        revertedTo: resolved.rev,
+      }
+    }
+  }
   return {
     ok: true,
     changed: true,
@@ -1467,21 +1987,430 @@ export function revertRule({ root = '', key, rev, now = Date.now() } = {}, opts 
   }
 }
 
-/**
- * 本地 git 提交（不联网；git 不可用/目录不是仓库时**降级**为只写文件）。
- * @param {string} dir @param {string} message
- * @param {{git?:boolean,exec?:Function}} opts
- * @returns {object|null} 未尝试提交时 null
- */
-function commitRuleChange(dir, message, opts = {}) {
-  if (opts.git === false) return null
-  const repo = isGitRepo(dir, { exec: opts.exec })
-  if (!repo.ok) {
-    return { ok: false, committed: false, message, error: repo.error || 'not_a_git_repo' }
+// ---------------------------------------------------------------------------
+// 提交（显式路径） / 回滚
+// ---------------------------------------------------------------------------
+
+/** 提交路径归一：去空、转仓库内相对路径、去重；越界路径直接拒绝（不喂给 git）。 */
+function normalizeCommitPaths(base, paths) {
+  const out = []
+  for (const item of Array.isArray(paths) ? paths : []) {
+    const raw = String(item ?? '').trim()
+    if (!raw) continue
+    const rel = isAbsolute(raw) ? relative(base, raw) : raw
+    const clean = rel.replace(/\\/g, '/').replace(/^\.\//, '')
+    if (!clean || clean.startsWith('..') || isAbsolute(clean)) continue
+    if (!out.includes(clean)) out.push(clean)
   }
-  const done = gitCommit(dir, message, { exec: opts.exec })
-  if (!done.ok) return { ok: false, committed: false, message, error: done.error || 'git_failed' }
-  return { ok: true, committed: Boolean(done.committed), message }
+  return out
+}
+
+/**
+ * 单次提交：**显式路径**（规则文件 + manifest + 墓碑），不用 `git add -A`。
+ *
+ * 为什么必须显式：规则仓里还躺着 `proposals/`、`history/`、`.txn/`；`add -A` 会把候选草稿
+ * 和快照一起固化进历史（双份噪音，回滚也不再干净）。paths 为空 → 不提交，返回 committed:false。
+ *
+ * @param {string} root @param {string} message
+ * @param {{paths?:string[], exec?:Function}} [opts]
+ * @returns {{ok:boolean, committed:boolean, message:string, error?:string}}
+ */
+/**
+ * git 不可用是**降级**而不是提交失败：文件/manifest 已落盘，只是没有版本记录。
+ * 只有真的 `git commit` 失败（index/权限/钩子）才算失败并回滚。
+ * @param {string} [error] @returns {boolean}
+ */
+function isGitDegraded(error) {
+  return error === 'git_unavailable' || error === 'not_a_git_repo'
+}
+
+export function commitRuleChanges(root, message, opts = {}) {
+  const base = baseDir(root)
+  const text = String(message || 'rules: update')
+  const paths = normalizeCommitPaths(base, opts.paths)
+  if (paths.length === 0) return { ok: true, committed: false, message: text }
+  const done = gitCommit(base, text, { exec: opts.exec, paths })
+  if (!done.ok) return { ok: false, committed: false, message: text, error: done.error || 'git_failed' }
+  return { ok: true, committed: Boolean(done.committed), message: text }
+}
+
+/**
+ * 显式清理 git index 的暂存：`git reset -- <paths>`（不 `reset --hard`、不动工作树）。
+ *
+ * 供 apply 的 rollbackPlan 在 commit 失败后清掉本笔已 `git add`/`git rm` 的暂存，
+ * 避免下一笔提交把失败事务的文件带进历史（"幻影版本"）。路径先归一：越界/空路径丢弃；
+ * paths 为空时**不调用 git**，返回 ok（幂等）。
+ *
+ * @param {string} root @param {string[]} paths @param {{exec?:Function}} [opts]
+ * @returns {{ok:boolean, paths:string[], error?:string}}
+ */
+export function resetGitIndex(root, paths, opts = {}) {
+  const base = baseDir(root)
+  const clean = normalizeCommitPaths(base, paths)
+  if (!clean.length) return { ok: true, paths: clean }
+  const reset = runGit(base, ['reset', '-q', '--', ...clean], { exec: opts.exec })
+  return reset.ok ? { ok: true, paths: clean } : { ok: false, paths: clean, error: reset.error }
+}
+
+/** 内部别名（回滚路径沿用旧名，行为即 resetGitIndex）。 */
+function resetIndexPaths(root, paths, opts = {}) {
+  return resetGitIndex(root, paths, opts)
+}
+
+/** 写回旧文件 + 删掉本事务新增的历史快照 + 重建 manifest + 清 index；返回 failures。 */
+function rollbackRuleWrite(base, { file, oldSource, key, historyRev, paths, fs, exec }) {
+  const failures = []
+  const restored = atomicWriteFile(file, oldSource, { fs })
+  if (!restored.ok) failures.push(`file:${restored.error}`)
+  if (historyRev) {
+    try { fs.unlinkSync(join(base, 'history', key, `${historyRev}.md`)) } catch (err) {
+      failures.push(`history:${err?.message || err}`)
+    }
+  }
+  const manifest = regenerateManifest(base, { fs })
+  if (!manifest.ok) failures.push(`manifest:${manifest.error}`)
+  const reset = resetIndexPaths(base, paths, { exec })
+  if (!reset.ok) failures.push(`index:${reset.error}`)
+  return { ok: failures.length === 0, failures }
+}
+
+/** 回滚"新建文件"：删文件 + 重建 manifest + 清 index（create 的 commit 失败路径）。 */
+function rollbackCreatedFile(base, file, paths, { fs, exec }) {
+  const failures = []
+  try { fs.unlinkSync(file) } catch (err) {
+    // 文件可能已被 git rm/失败删除；只有 ENOENT 才算已回滚，其他错误如实记。
+    if (err?.code !== 'ENOENT') failures.push(`file:${err?.message || err}`)
+  }
+  const manifest = regenerateManifest(base, { fs })
+  if (!manifest.ok) failures.push(`manifest:${manifest.error}`)
+  const reset = resetIndexPaths(base, paths, { exec })
+  if (!reset.ok) failures.push(`index:${reset.error}`)
+  return { ok: failures.length === 0, failures }
+}
+
+// ---------------------------------------------------------------------------
+// 墓碑（retired/<key>.json）：编号永不复用的真源
+// ---------------------------------------------------------------------------
+
+/** `retired/<key>.json` 路径（key 必须已过白名单，否则不能拼路径）。 */
+function tombstonePath(base, key) {
+  return join(base, RETIRED_DIR, `${key}.json`)
+}
+
+/**
+ * 写墓碑（append-only）：先 fsync 落盘，再由调用方删规则文件。
+ *
+ * 为什么不只写 manifest：manifest 是生成物，删掉/并发 purge 都会让它回退，已删编号被复用。
+ * 墓碑是独立文件，`regenerateManifest` 取「旧 manifest.retired ∪ retired/ 目录」并集，删
+ * manifest 也重建得回来。同一 key 第二次 purge 时 `numbers` 累积、`number` 留最早的那个，
+ * `at` 留最早时间（append-only = 不删/不覆盖已作废编号）。
+ *
+ * @param {string} root
+ * @param {{key:string, number:number, at?:string, reason?:string}} tool
+ * @param {{fs?:typeof nodeFs}} [opts]
+ * @returns {{ok:boolean, path?:string, error?:string}}
+ */
+export function writeTombstone(root, tool = {}, opts = {}) {
+  const fs = opts.fs || nodeFs
+  const base = baseDir(root)
+  const key = String(tool?.key ?? '').trim()
+  const number = Number(tool?.number)
+  if (!isValidRuleKey(key)) return { ok: false, error: 'invalid_key' }
+  if (!Number.isInteger(number) || number <= 0) return { ok: false, error: 'invalid_number' }
+  const dir = join(base, RETIRED_DIR)
+  try { fs.mkdirSync(dir, { recursive: true }) } catch (err) {
+    return { ok: false, error: `retired_dir_failed:${err?.message || err}` }
+  }
+  const path = tombstonePath(base, key)
+  let prev = null
+  try { prev = JSON.parse(fs.readFileSync(path, 'utf8')) } catch { prev = null }
+  const prevAt = String(prev?.at ?? '').trim()
+  const at = String(tool?.at ?? '').trim() || new Date().toISOString()
+  // 同一 key 二次彻底删除（重建后又 purge）：墓碑不覆盖旧编号，`numbers` 累积、`number` 留最早。
+  // 覆盖会把旧编号放回池子（nextNumber 回落、编号复用），这是编号不变式的直接破口。
+  const prevNumbers = Array.isArray(prev?.numbers)
+    ? prev.numbers.map((item) => Number(item)).filter((item) => Number.isInteger(item) && item > 0)
+    : (Number.isInteger(Number(prev?.number)) && Number(prev?.number) > 0 ? [Number(prev.number)] : [])
+  const numbers = [...new Set([...prevNumbers, number])].sort((a, b) => a - b)
+  // 同一墓碑重写保留更早的 `at`：墓碑记录"何时作废"，后写的一律不掩盖第一次。
+  const payload = {
+    key,
+    number: numbers[0],
+    numbers,
+    at: prevAt && prevAt < at ? prevAt : at,
+    reason: String(tool?.reason ?? prev?.reason ?? 'purge').trim() || 'purge',
+  }
+  const written = durableWriteFile(path, `${JSON.stringify(payload, null, 2)}\n`, { fs })
+  if (!written.ok) return { ok: false, error: written.error }
+  return { ok: true, path }
+}
+
+/**
+ * 读全部墓碑（`retired/*.json`），坏文件跳过（不因一条坏墓碑丢掉整个占用集合）。
+ * 一个文件里的 `numbers` 会展开成多条（同 key 多次 purge），占用/manifest 都按编号逐条算。
+ * @param {string} root @param {{fs?:typeof nodeFs}} [opts]
+ * @returns {Array<{key:string, number:number, at:string, reason:string}>}
+ */
+export function readTombstones(root, opts = {}) {
+  const fs = opts.fs || nodeFs
+  const base = baseDir(root)
+  const dir = join(base, RETIRED_DIR)
+  let names
+  try { names = fs.readdirSync(dir).filter((n) => n.endsWith('.json')).sort() } catch { return [] }
+  const out = []
+  for (const name of names) {
+    let parsed
+    try { parsed = JSON.parse(fs.readFileSync(join(dir, name), 'utf8')) } catch { continue }
+    const key = String(parsed?.key ?? ruleKeyOfFile(name)).trim()
+    if (!isValidRuleKey(key)) continue
+    // 一个墓碑文件可累积多个编号（同 key 二次 purge）：展开成多条，占用集合/manifest 都算全。
+    const numbers = Array.isArray(parsed?.numbers)
+      ? parsed.numbers.map((item) => Number(item)).filter((item) => Number.isInteger(item) && item > 0)
+      : [Number(parsed?.number)]
+    const at = String(parsed?.at ?? '').trim()
+    const reason = String(parsed?.reason ?? 'purge').trim()
+    for (const number of [...new Set(numbers)].sort((a, b) => a - b)) {
+      out.push({ key, number, at, reason })
+    }
+  }
+  // 排序与 manifest 同口径（number → key）：目录里按文件名排序会让 10 排在 9 前面，manifest 抖动。
+  return out.sort((a, b) => a.number - b.number || a.key.localeCompare(b.key))
+}
+
+/** 该编号是否已进墓碑（apply/import 写目标前复核用：命中即拒绝，不得复活）。 */
+export function isRetiredNumber(root, number, opts = {}) {
+  const n = Number(number)
+  if (!Number.isInteger(n) || n <= 0) return false
+  return readTombstones(root, opts).some((item) => Number(item.number) === n)
+}
+
+/**
+ * 可分配的下一个铁律编号 = max(现存铁律编号 ∪ 墓碑)+1，跳过保留空号。
+ * 供 legacy 导入等"没有可靠编号"的入口取号（锁内调用；本函数不自己加锁）。
+ * @param {string} root @param {{fs?:typeof nodeFs}} [opts] @returns {number}
+ */
+export function allocatableRuleNumber(root, opts = {}) {
+  const fs = opts.fs || nodeFs
+  const base = baseDir(root)
+  return nextRuleNumber(occupiedNumbers(listRules(base).rules, readTombstones(base, { fs })))
+}
+
+// ---------------------------------------------------------------------------
+// 事务日志（.txn/<id>.json）：多文件写前的崩溃恢复锚点
+// ---------------------------------------------------------------------------
+
+const TXN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+
+/** `.txn/<id>.json` 路径；id 白名单外返回 null（防止越界写）。 */
+function txnPathOf(base, id) {
+  const text = String(id ?? '').trim()
+  return TXN_ID_RE.test(text) ? join(base, TXN_DIR, `${text}.json`) : null
+}
+
+/**
+ * 落一个事务日志（fsync）：apply 在写第一个文件之前调用。
+ *
+ * `files[].oldText` 是崩溃恢复的判据：无 commit 时按它原样写回；`oldText === null` 表示
+ * 该文件是本事务新建的，恢复即删除。
+ *
+ * @param {string} root
+ * @param {{id:string, planHash?:string, proposalId?:string, createdAt?:string,
+ *   files?:Array<{key:string,path:string,oldText:string|null,newText?:string}>}} txn
+ * @param {{fs?:typeof nodeFs}} [opts]
+ * @returns {{ok:boolean, path?:string, error?:string}}
+ */
+export function writeTxn(root, txn = {}, opts = {}) {
+  const fs = opts.fs || nodeFs
+  const base = baseDir(root)
+  const path = txnPathOf(base, txn?.id)
+  if (!path) return { ok: false, error: 'invalid_txn_id' }
+  const files = []
+  for (const item of Array.isArray(txn?.files) ? txn.files : []) {
+    const filePath = String(item?.path ?? '').trim()
+    if (!filePath) return { ok: false, error: 'invalid_txn_file' }
+    files.push({
+      key: String(item?.key ?? ruleKeyOfFile(filePath)).trim(),
+      path: filePath,
+      oldText: item?.oldText === null || item?.oldText === undefined ? null : String(item.oldText),
+      ...(item?.newText === undefined ? {} : { newText: String(item.newText) }),
+    })
+  }
+  if (!files.length) return { ok: false, error: 'invalid_txn_files' }
+  const payload = {
+    id: String(txn.id).trim(),
+    planHash: String(txn?.planHash ?? ''),
+    proposalId: String(txn?.proposalId ?? ''),
+    createdAt: String(txn?.createdAt ?? new Date().toISOString()),
+    files,
+  }
+  try { fs.mkdirSync(join(base, TXN_DIR), { recursive: true }) } catch (err) {
+    return { ok: false, error: `txn_dir_failed:${err?.message || err}` }
+  }
+  const written = durableWriteFile(path, `${JSON.stringify(payload, null, 2)}\n`, { fs })
+  if (!written.ok) return { ok: false, error: written.error }
+  return { ok: true, path }
+}
+
+/** 读一个事务日志；缺失/坏 JSON 返回 null（恢复流程按"没有待恢复项"处理）。 */
+export function readTxn(root, id, opts = {}) {
+  const fs = opts.fs || nodeFs
+  const base = baseDir(root)
+  const path = txnPathOf(base, id)
+  if (!path) return null
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path, 'utf8'))
+    return parsed && typeof parsed === 'object' ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+/** 清一个事务日志；不存在视为已清（幂等）。 */
+export function clearTxn(root, id, opts = {}) {
+  const fs = opts.fs || nodeFs
+  const base = baseDir(root)
+  const path = txnPathOf(base, id)
+  if (!path) return { ok: false, error: 'invalid_txn_id' }
+  try { fs.unlinkSync(path); return { ok: true } } catch (err) {
+    if (err?.code === 'ENOENT') return { ok: true }
+    return { ok: false, error: String(err?.message || err) }
+  }
+}
+
+/** 列出待恢复事务 id（按文件名排序；目录不存在返回空）。 */
+export function listTxns(root, opts = {}) {
+  const fs = opts.fs || nodeFs
+  const base = baseDir(root)
+  try {
+    return fs.readdirSync(join(base, TXN_DIR))
+      .filter((n) => n.endsWith('.json'))
+      .map((n) => n.replace(/\.json$/, ''))
+      .filter((id) => TXN_ID_RE.test(id))
+      .sort()
+  } catch {
+    return []
+  }
+}
+
+/**
+ * 探"这个事务是否已提交"：`git log --fixed-strings --grep=<proposalId>` 精确到提交说明，
+ * 不扫最近 N 条 subject 猜（猜错会把已发布的新规则回滚掉）。失败一律按"未提交"处理。
+ * @param {string} base @param {object} txn @param {{exec?:Function}} opts
+ * @returns {boolean}
+ */
+function txnHasCommit(base, txn, opts = {}) {
+  const marker = String(txn?.proposalId ?? '').trim() || String(txn?.id ?? '').trim()
+  if (!marker) return false
+  const out = runGit(base, [
+    'log', '-n1', '--fixed-strings', `--grep=${marker}`, '--pretty=format:%h',
+  ], { exec: opts.exec })
+  return out.ok && String(out.out ?? '').trim() !== ''
+}
+
+/**
+ * 启动恢复：把**全部**未完成事务收敛到一致状态（循环处理，不只第一条）。
+ *
+ * 判据分两层：
+ * 1. git 里已有本事务的提交（精确 grep proposalId）→ 事务已发布，只清日志，绝不回滚；
+ * 2. 无提交 → 逐文件按 `newText` 的 sha256 复核：**只有当前内容仍等于本事务写下的 newText**
+ *    才按 `oldText` 恢复（`oldText=null` 则删除）；内容已变 = 之后有合法写入，只清日志不动文件。
+ *
+ * 为什么必须有 hash 闸：apply 失败回滚后若 `.txn` 没清（或崩溃在 clearTxn 前），旧实现会把
+ * 之后所有合法写入一律按 oldText 覆盖回去。hash 不等即视为"不是本事务的中间态"，只清账。
+ *
+ * @param {string} root
+ * @param {{exec?:Function, log?:Function, fs?:typeof nodeFs}} [opts]
+ * @returns {{recovered:boolean, id?:string, ids:string[],
+ *   processed:Array<{id:string, committed:boolean, restored:number, deleted:number,
+ *   skipped:number, failures:string[]}>}}
+ */
+export function recoverPendingTxn(root, opts = {}) {
+  const fs = opts.fs || nodeFs
+  const log = typeof opts.log === 'function' ? opts.log : () => {}
+  const base = baseDir(root)
+  const ids = listTxns(base, { fs })
+  if (!ids.length) return { recovered: false, ids: [], processed: [] }
+  const processed = []
+  let recovered = false
+  for (const id of ids) {
+    const txn = readTxn(base, id, { fs })
+    if (!txn) {
+      clearTxn(base, id, { fs })
+      processed.push({ id, committed: false, restored: 0, deleted: 0, skipped: 0, failures: ['unreadable'] })
+      continue
+    }
+    const committed = txnHasCommit(base, txn, opts)
+    let restored = 0
+    let deleted = 0
+    let skipped = 0
+    const failures = []
+    if (!committed) {
+      for (const item of Array.isArray(txn.files) ? txn.files : []) {
+        const raw = String(item?.path ?? '').trim()
+        if (!raw) continue
+        const file = isAbsolute(raw) ? raw : join(base, raw)
+        const expected = item?.newText === undefined || item?.newText === null ? null : hashText(item.newText)
+        // 无法验证（老 txn 没记 newText）→ 不动文件，只清账：安全优先于"尽量回滚"。
+        if (!expected) { skipped += 1; continue }
+        const current = readRuleSource(file, { fs })
+        if (item?.oldText === null || item?.oldText === undefined) {
+          if (!current.ok) continue
+          if (hashText(current.text) !== expected) { skipped += 1; continue }
+          try { fs.unlinkSync(file); deleted += 1 } catch (err) {
+            if (err?.code !== 'ENOENT') failures.push(`${raw}:${err?.message || err}`)
+          }
+          continue
+        }
+        if (!current.ok) { skipped += 1; continue }
+        if (hashText(current.text) !== expected) { skipped += 1; continue }
+        const wrote = durableWriteFile(file, String(item.oldText), { fs })
+        if (wrote.ok) restored += 1
+        else failures.push(`${raw}:${wrote.error}`)
+      }
+      if (restored || deleted) recovered = true
+      const manifest = regenerateManifest(base, { fs })
+      if (!manifest.ok) failures.push(`manifest:${manifest.error}`)
+    }
+    clearTxn(base, id, { fs })
+    if (restored || deleted) {
+      log(`[whale-memory] txn recovered id=${id} restored=${restored} deleted=${deleted} skipped=${skipped}`)
+    } else if (committed) {
+      log(`[whale-memory] txn already committed, cleared id=${id}`)
+    } else if (skipped) {
+      log(`[whale-memory] txn stale (files changed since), cleared id=${id} skipped=${skipped}`)
+    }
+    if (failures.length) log(`[whale-memory] txn recovery partial id=${id} failures=${failures.join(';')}`)
+    processed.push({
+      id, committed, restored, deleted, skipped,
+      failures: failures.length ? failures : [],
+    })
+  }
+  return { recovered, id: processed[0]?.id, ids: processed.map((item) => item.id), processed }
+}
+
+// ---------------------------------------------------------------------------
+// .gitignore
+// ---------------------------------------------------------------------------
+
+/**
+ * 补规则仓 `.gitignore` 条目（幂等，只追加缺失行）：候选/快照/事务/锁/播种 marker 全是
+ * 本机生成物，不该进 git。返回是否真的改了文件。
+ * @param {string} root @param {{fs?:typeof nodeFs}} [opts]
+ * @returns {boolean}
+ */
+export function ensureRuleGitignore(root, opts = {}) {
+  const fs = opts.fs || nodeFs
+  const base = baseDir(root)
+  const file = join(base, '.gitignore')
+  let content = ''
+  try { content = String(fs.readFileSync(file, 'utf8')) } catch { content = '' }
+  const lines = content.split('\n').map((line) => line.trim())
+  const missing = GITIGNORE_LINES.filter((line) => !lines.includes(line))
+  if (!missing.length) return false
+  const head = content.replace(/\n*$/, '')
+  const next = `${head ? `${head}\n` : ''}${missing.join('\n')}\n`
+  const written = atomicWriteFile(file, next, { fs })
+  return Boolean(written.ok)
 }
 
 // ---------------------------------------------------------------------------
@@ -1540,7 +2469,8 @@ export function computeManifest(rules, retired = []) {
   for (const doc of Array.isArray(rules) ? rules : []) {
     const status = String(doc?.front?.status || 'unknown')
     byStatus[status] = (byStatus[status] || 0) + 1
-    const n = Number(doc?.front?.number)
+    // 只有 iron-rule 的正整数编号进 total/nextNumber；普通规则带 number 也不占号。
+    const n = String(doc?.front?.type ?? '') === 'iron-rule' ? Number(doc?.front?.number) : null
     if (Number.isInteger(n) && n > 0) numbers.push(n)
     else if (isUnnumberedRule(doc?.front)) unnumbered += 1
   }
@@ -1555,21 +2485,38 @@ export function computeManifest(rules, retired = []) {
 }
 
 /**
- * 生成 manifest.json（生成物，勿手改）；内容稳定排序，便于 git diff。
+ * 重建 manifest.json（生成物，勿手改）；内容稳定排序，便于 git diff。
  *
- * 必须**保留已有墓碑**：manifest 是墓碑的唯一真源，任何一次普通写入触发的重生成都不能
- * 把 `retired` 清掉，否则编号会被回收。`opts.retired` 用于本次 purge 追加，与旧墓碑合并去重。
+ * 墓碑真源 = 「旧 manifest.retired ∪ retired/*.json ∪ opts.retired」，**只增不减**：
+ * - 删掉 manifest.json 也能由规则文件 + 墓碑目录重建出同样的 nextNumber（编号不回落）；
+ * - 新的占用集合必须是旧墓碑集合的超集，否则拒绝写并报 `retired_shrink`——
+ *   防止一份旧 manifest 覆盖掉刚写下的新墓碑，把已删编号放回池子。
  *
  * @param {string} root
  * @param {{fs?:typeof nodeFs, retired?:Array<{key:string,number:number,at:string}>}} [opts]
- * @returns {{ok:boolean,manifest?:object,error?:string}}
+ * @returns {{ok:boolean,manifest?:object,error?:string,detail?:any}}
  */
 export function regenerateManifest(root, opts = {}) {
   const fs = opts.fs || nodeFs
   const base = baseDir(root)
   const existing = readManifest(base)
-  const oldRetired = Array.isArray(existing?.retired) ? existing.retired : []
-  const retired = normalizeRetired(oldRetired.concat(Array.isArray(opts.retired) ? opts.retired : []))
+  // 回滚事务允许"撤销刚落下的墓碑"：忽略旧 manifest.retired，只用磁盘墓碑 + 本次追加重建。
+  // 正常写入永远走并集，保证旧墓碑不凭空消失、编号不被回收。
+  const rollbackMode = opts.allowShrink === true
+  const rawOld = rollbackMode ? [] : (Array.isArray(existing?.retired) ? existing.retired : [])
+    .filter((item) => Number.isInteger(Number(item?.number)) && Number(item?.number) > 0)
+  const oldRetired = rollbackMode ? [] : normalizeRetired(existing?.retired)
+  const fromDisk = readTombstones(base, { fs })
+  const retired = normalizeRetired(oldRetired.concat(fromDisk, Array.isArray(opts.retired) ? opts.retired : []))
+  // 只增不减：旧 manifest 里出现过的编号必须仍在新集合里。按编号比对（不按 key），
+  // 因为墓碑的 key 可能被手工改坏；编号一旦消失，就意味着"已删编号被放回池子"。
+  const presentNumbers = new Set(retired.map((item) => item.number))
+  const missing = rawOld.filter((item) => !presentNumbers.has(Number(item.number)))
+  // `allowShrink` 只给本事务的回滚用（purge 的 commit 失败要撤销刚落下的墓碑）：
+  // 正常写入路径永远不带它，保证"旧墓碑不会凭空消失、编号不被回收"。
+  if (missing.length && opts.allowShrink !== true) {
+    return { ok: false, error: 'retired_shrink', detail: { missing } }
+  }
   const list = listRules(base)
   const view = computeManifest(list.rules, retired)
   const manifest = {
@@ -1655,16 +2602,46 @@ export function initRuleRepo(dir, opts = {}) {
 }
 
 /**
- * add -A + commit；无改动视为成功但不提交（规则写失败不该被空 commit 掩盖）。
- * @returns {{ok:boolean,committed?:boolean,error?:string}}
+ * 提交（**只接受显式路径**）：`git add -- <paths>` → 无改动视为成功但不提交。
+ *
+ * R8-13：禁止 `add -A`——候选/快照/事务日志即使被 .gitignore 挡住，`add -A` 也会把
+ * "未预期的新文件"一并固化进历史，回滚不再干净。`opts.paths` 缺省/为空 → 不提交，
+ * 不猜、不兜底（调用方必须自己给出本笔涉及的文件与 manifest）。提交用
+ * `commit -- <已进 index 的 paths>`：预暂存的他笔文件不会被带进提交。
+ *
+ * @param {string} dir @param {string} message
+ * @param {{exec?:Function, paths?:string[]}} [opts]
+ * @returns {{ok:boolean,committed?:boolean,out?:string,error?:string,code?:string}}
  */
 export function gitCommit(dir, message, opts = {}) {
-  const added = runGit(dir, ['add', '-A'], opts)
-  if (!added.ok) return added
-  const staged = runGit(dir, ['diff', '--cached', '--quiet'], opts)
+  const paths = Array.isArray(opts.paths) ? opts.paths : []
+  if (paths.length === 0) return { ok: true, committed: false }
+  // 路径分两类：仍在盘上的 `git add --`；已被删除的用 `git rm --ignore-unmatch` 把删除记进 index。
+  // 直接 `git add -- 已删路径` 会报 "pathspec ... did not match"（purge 的删除路径就是这种）。
+  const existing = paths.filter((rel) => existsSync(join(dir, rel)))
+  const removed = paths.filter((rel) => !existing.includes(rel))
+  if (existing.length) {
+    const added = runGit(dir, ['add', '--', ...existing], opts)
+    if (!added.ok) return added
+  }
+  if (removed.length) {
+    // 失败不致命：文件可能未跟踪/已被 `git rm` 暂存过；由下面 diff 判空。
+    runGit(dir, ['rm', '--ignore-unmatch', '-q', '-f', '--', ...removed], opts)
+  }
+  const staged = runGit(dir, ['diff', '--cached', '--quiet', '--', ...paths], opts)
   // diff --quiet 有差异时退出码 1；runGit 把非 0 当失败，这里按"有差异"解释。
   if (!staged.ok && staged.code === 1) {
-    const committed = runGit(dir, ['commit', '-m', String(message || 'rules: update'), '--no-gpg-sign'], opts)
+    // `commit -- <paths>`：只提交本笔路径。index 里可能已有别的暂存（面板/git add 预暂存、
+    // 上一笔失败残留），无 pathspec 的 commit 会把它们一起带进提交（幻影版本）。
+    // 还要把 pathspec 收窄到"真的进了 index 的路径"：未跟踪且从未 add 过的路径（例如
+    // git:false 写入后又被 purge 的规则）喂给 `git commit -- <path>` 会报
+    // "pathspec ... did not match any file(s) known to git"，整笔提交失败。
+    const names = runGit(dir, ['diff', '--cached', '--name-only', '--', ...paths], opts)
+    const effective = names.ok
+      ? names.out.split('\n').map((line) => line.trim()).filter(Boolean)
+      : []
+    const commitPaths = effective.length ? effective : paths
+    const committed = runGit(dir, ['commit', '-m', String(message || 'rules: update'), '--no-gpg-sign', '--', ...commitPaths], opts)
     if (!committed.ok) return committed
     return { ok: true, committed: true, out: committed.out }
   }
@@ -1747,9 +2724,9 @@ export function ensureRuleRepo(opts = {}) {
         '',
       ].join('\n'), 'utf8')
     }
-    const ignore = join(root, '.gitignore')
-    // `.seeded.json` 是默认播种标记（本机状态）：进 git 会让换机后"已播种"，新机永远不长默认规则。
-    if (!existsSyncSafe(ignore, fs)) fs.writeFileSync(ignore, '*.tmp-*\n.locks/\n.seeded.json\n', 'utf8')
+    // `.gitignore` 逐行补齐（老仓库也要迁移一次）：`.seeded.json` 是本机状态，proposals/history/.txn
+    // 是待裁定草稿/快照/短命事务——进 git 会让规则仓的历史变成双份噪音。
+    ensureRuleGitignore(root, { fs })
     regenerateManifest(root, { fs })
   } catch (err) {
     return { ok: false, error: String(err?.message || err) }
@@ -1783,8 +2760,15 @@ export function ensureRuleRepo(opts = {}) {
   }
   // 只在本次新建仓库时做首次 commit；已有仓库的日常改动由 writeRule 提交，
   // 避免每次 ensure 都插一个空 commit 把规则历史的 diff 打乱。
+  // 显式路径：README/.gitignore/manifest + 已存在的规则文件（新建仓库时可能有默认种子在盘上）。
   const committed = initialized
-    ? gitCommit(root, 'rules: init repository', { exec })
+    ? gitCommit(root, 'rules: init repository', {
+      exec,
+      paths: [
+        'README.md', '.gitignore', MANIFEST_FILE,
+        ...listRules(root).rules.map((doc) => relative(root, doc.file)),
+      ].filter((rel, index, arr) => arr.indexOf(rel) === index),
+    })
     : { ok: true, committed: false }
   return {
     ok: true,

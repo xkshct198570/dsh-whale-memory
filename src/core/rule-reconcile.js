@@ -168,8 +168,9 @@ export const OPPOSITE_FAMILIES = Object.freeze([
 /** 例外条目数硬顶（架构书 §3.2）。 */
 const EXCEPTIONS_MAX = 12
 
-/** 否定/限定/例外词：决定 modality。与 rules.js 的极性表同口径（那份未导出）。 */
-const NEG_RE = /(禁止|不得|不许|不准|不能|不必|无需|不用|毋须|切勿|勿|不要|别再|别用|别把|别删|别改|别(?!人|的|处|致|样)|严禁|避免|never|must not|do not|don't)/i
+/** 否定/限定/例外词：决定 modality。与 rules.js 的极性表同口径（那份未导出）。
+ * 单字「别」同样要挡词内出现（区别/特别/个别/分别/类别/性别/级别）。 */
+const NEG_RE = /(禁止|不得|不许|不准|不能|不必|无需|不用|毋须|切勿|勿|不要|别再|别用|别把|别删|别改|(?<![区特个分类型级性离别])别|严禁|避免|never|must not|do not|don't)/i
 const ONLY_RE = /(只能|只准|只允许|仅能|仅允许|只用|只保留|只读|只做|只接受|只支持|只(?:用|留|存|删|选|取|做|算|跑|走|看|读|写|发|收|要|能|须|需|有|是|可|会|应|得|让|把|给|对|向|从|在|为|于))/
 const EXCEPT_RE = /除(?:了)?[^，,。；;]{1,40}外/
 
@@ -206,7 +207,9 @@ export const SYNONYM_GROUPS = Object.freeze([
 /** 模态词表：守卫据此判断"模态被弱化"（never→尽量、must→建议 一律算弱化）。 */
 export const MODALITY_WORDS = Object.freeze({
   must: /(必须|务必|一律|始终|每次都要|都要|每次|must|always|shall|required)/i,
-  must_not: /(禁止|不得|不许|不准|不要|别|严禁|never|must not|forbidden|do not)/i,
+  // 「别」是单字模态词，必须挡掉「区别/特别/个别/分别/类别/性别/级别」这类词内出现：
+  // 否则一条只说「区别对待」的规则会被判成 must_not，进而与「必须」误判反转（R8-03 口径）。
+  must_not: /(禁止|不得|不许|不准|不要|(?<![区特个分类型级性离别])别|严禁|never|must not|forbidden|do not)/i,
   only: /(只能|只允许|仅能|仅允许|\bonly\b)/i,
   except: /(除了|除[^。；;\n]{1,30}以外|除外|except)/i,
 })
@@ -796,11 +799,14 @@ export function compileStructured(text, signals = {}, opts = {}) {
   const key = explicitRef?.key || `rule-${domain}-${dedupeKey(raw).slice(0, 8)}`
   if (!isValidRuleKey(key)) return { ok: false, error: 'invalid_key', detail: { key } }
 
-  // 编号：显式铁律N > refine 沿用旧号 > 新建取 nextNumber（跳过占号与空号 6）。
+  // 编号：只有 iron-rule 占号（R8-01）；普通规则/候选 number 必须 null。
+  // 显式铁律N > refine 沿用旧号 > 新建取 nextNumber（跳过占号与空号 6）。
   const sameKey = existingKeys.get(key)
   const taken = takenNumbers(existingRules)
-  let number
-  if (explicitRef?.number) {
+  let number = null
+  if (!isIron) {
+    number = null
+  } else if (explicitRef?.number) {
     if (RESERVED_NUMBERS.includes(explicitRef.number)) {
       return { ok: false, error: 'number_reserved', detail: { number: explicitRef.number } }
     }
@@ -911,10 +917,14 @@ function familiesOpposite(a, b) {
   return false
 }
 
-/** 模态是否互斥：must↔must_not、only↔非only。 */
+/**
+ * 模态是否互斥（架构书 §3.3）：严格按反转表 must↔must_not、only↔except。
+ *
+ * Why 不再把 `only` 与任何非 only 都当反转：`only` vs `must` 是**收窄**不是反转，
+ * 应走 merge/refine；v3.7 把它判冲突会让「只用本地模型」永远打不掉「必须用模型」。
+ */
 function modalityReversed(a, b) {
   if (a === b) return false
-  if (a === 'only' || b === 'only') return true
   return REVERSE_MODALITY[a] === b
 }
 
@@ -989,36 +999,84 @@ function slotOverlap(draft, rule) {
 }
 
 /**
- * 关系判定（架构书 §4.3）：先规则、后模型；本函数是**唯一**确定性判据。
+ * 作用域归一（架构书 §3.3）：`global` / `workspace:<绝对路径>` / `role:<id>` **精确**比较。
+ *
+ * 只做纯字符串归一（分隔符统一 + 去尾斜杠），不 realpath：本模块是纯函数，不碰文件系统；
+ * 路径真实化由 host 层在传入前完成。缺省 scope 视为 `global`（与 rule-store 归一化一致）。
+ * @param {any} value 扁平 front、`{front,text}` 文档或草案
+ * @returns {string}
+ */
+export function scopeKeyOf(value) {
+  const front = value && typeof value === 'object'
+    ? (value.front && typeof value.front === 'object' ? value.front : value)
+    : {}
+  const raw = trimmed(front.scope) || 'global'
+  if (raw.startsWith('workspace:')) {
+    const path = raw.slice('workspace:'.length).trim().replace(/\\/g, '/').replace(/\/+$/, '')
+    return `workspace:${path}`
+  }
+  if (raw.startsWith('role:')) return `role:${raw.slice('role:'.length).trim()}`
+  return raw
+}
+
+/**
+ * 角色闸：两侧 role 都非空且不同 → 不同作用域（role A↔B 不得 merge/conflict）。
+ *
+ * 允许一侧为空：历史规则 role 为空表示"不绑定角色"（默认铁律/导入件都是空 role），
+ * 否则聊天候选（带会话 role）会永远配不上任何既有规则，跨角色提示会淹没真关系。
+ * @param {{role?:string}} a @param {{role?:string}} b @returns {boolean}
+ */
+function rolesCompatible(a, b) {
+  const left = trimmed(a?.role)
+  const right = trimmed(b?.role)
+  if (!left || !right) return true
+  return left === right
+}
+
+/**
+ * 关系判定（架构书 §3.3）：先规则、后模型；本函数是**唯一**确定性判据。
  *
  * 判定顺序（先到先得）：
- * 1. 同 key → refine（沿用旧编号）；
- * 2. dedupeKey 相同或正文相似度 ≥0.9 → duplicate；
- * 3. 同域 + 槽位重叠（对象词 Jaccard≥0.3 / 共享动作 / 共享条件事件）
- *    + 模态反向或动词族互斥 → conflict；
- * 4. 同域 + 槽位重叠 + 模态兼容 + 条件/例外互补 + 动词族不互斥 → merge；
- * 5. 其余：有既有规则 → 'unrelated'；没有既有规则 → 'new'（两者下游动作相同）。
+ * 1. 同 scope + 同 key → refine（沿用旧编号）；
+ * 2. 同 scope + dedupeKey 相同或正文相似度 ≥0.9 → duplicate；
+ * 3. 同 scope + 槽位重叠（对象词 Jaccard≥0.3 / 共享动作 / 共享条件事件）
+ *    + 模态反转（must↔must_not / only↔except）或动词族互斥 → conflict；
+ * 4. 同 scope + 槽位重叠 + 模态兼容 + 条件/例外互补 + 动词族不互斥 → merge；
+ * 5. 其余：有同 scope 既有规则 → 'unrelated'；没有 → 'new'（两者下游动作相同）。
+ *
+ * 作用域闸（R8-04）：跨 scope（global↔workspace、workspace A↔B、role A↔B）一律 unrelated，
+ * 不得 supersede/merge 他区规则；跨区命中放进 `crossScope` 供面板提示（只提示不改状态）。
  *
  * @param {object} draft compileStructured 的草案
  * @param {Array<any>} [existingRules] 真实规则（`{front,text}` 或扁平 front）
  * @returns {{relation:'new'|'duplicate'|'refine'|'merge'|'conflict'|'unrelated',
- *   targets:Array<{key:string,number:number|null,text:string,reason:string}>}}
+ *   targets:Array<{key:string,number:number|null,text:string,reason:string}>,
+ *   crossScope?:Array<{key:string,scope:string,reason:string}>}}
  */
 export function classifyRelation(draft, existingRules = []) {
   const rules = (Array.isArray(existingRules) ? existingRules : []).map(relationTarget)
-  const empty = { relation: rules.length ? 'unrelated' : 'new', targets: [] }
+  const draftScope = scopeKeyOf(draft)
+  const scoped = rules.filter((rule) => scopeKeyOf(rule.front) === draftScope && rolesCompatible(draft, rule.front))
+  const crossScope = rules
+    .filter((rule) => scopeKeyOf(rule.front) !== draftScope)
+    .map((rule) => ({ key: rule.key, scope: scopeKeyOf(rule.front), reason: 'cross_scope' }))
+  const empty = {
+    relation: scoped.length ? 'unrelated' : 'new',
+    targets: [],
+    ...(crossScope.length ? { crossScope } : {}),
+  }
   if (!draft || !textOf(draft.text).trim()) return empty
   const draftKey = trimmed(draft.key)
   const draftText = textOf(draft.text)
   const view = draftViewOf(draft)
 
-  const refine = rules.find((rule) => rule.key && rule.key === draftKey)
+  const refine = scoped.find((rule) => rule.key && rule.key === draftKey)
   if (refine) {
     return { relation: 'refine', targets: [{ key: refine.key, number: refine.number, text: refine.text, reason: 'same_key' }] }
   }
 
   const draftHash = dedupeKey(draftText)
-  const duplicates = rules.filter((rule) => rule.key !== draftKey && rule.text && (
+  const duplicates = scoped.filter((rule) => rule.key !== draftKey && rule.text && (
     dedupeKey(rule.text) === draftHash || similarity(draftText, rule.text) >= DUPLICATE_SIMILARITY
   ))
   if (duplicates.length) {
@@ -1036,7 +1094,7 @@ export function classifyRelation(draft, existingRules = []) {
   // 不再用"推断域相等"做前置过滤：域是从关键词猜的（「以后都先提炼再删」会被猜成 general，
   // 而「禁止删源文件」是 file-hygiene，真正的槽位冲突就被域过滤吃掉了）。
   // 槽位判定（对象词 Jaccard / 共享动作 / 共享条件事件）足够具体，域只做展示。
-  const candidates = rules.filter((rule) => rule.key !== draftKey && rule.text)
+  const candidates = scoped.filter((rule) => rule.key !== draftKey && rule.text)
 
   const conflicts = []
   const merges = []
@@ -1130,16 +1188,20 @@ export function retainsClause(mergedNorm, clause) {
 // ---------------------------------------------------------------------------
 
 /**
- * 改写守卫（架构书 §4.5）：逐条核对受影响旧规则，全过才允许落盘。
+ * 改写守卫（架构书 §3.6）：逐条核对受影响旧规则，全过才允许落盘。
+ *
+ * 逐文件调用：`newText` 对**它替换的旧规则**校验；调用方把一批旧规则 + 该文件新正文传进来。
  *
  * @param {{affected?:Array<any>, mergedText?:string, draft?:object|null,
- *   strict?:boolean, acknowledgeDropped?:string[]}} args
+ *   strict?:boolean, acknowledgeDropped?:string[], relation?:string}} args
  *   affected: 旧规则（`{front,text}` 或扁平 front）；acknowledgeDropped: 非 strict 时 owner
- *   显式确认丢弃的规则 key 列表——这是**唯一**能放行"丢例外"的通道。
+ *   显式确认丢弃的规则 key 列表——这是**唯一**能放行"丢例外/丢条件"的通道；
+ *   relation: `conflict` 时按冲突口径判模态（新正文表达**新模态**，旧模态允许被取代），
+ *   其余关系（refine/merge/编辑）仍要求旧模态保留。
  * @returns {{ok:boolean, failures:Array<{code:string,key:string,detail:string}>}}
  */
 export function guardRewrite({
-  affected = [], mergedText = '', draft = null, strict = true, acknowledgeDropped = [],
+  affected = [], mergedText = '', draft = null, strict = true, acknowledgeDropped = [], relation = '',
 } = {}) {
   const failures = []
   const merged = textOf(mergedText)
@@ -1147,6 +1209,8 @@ export function guardRewrite({
   const acknowledged = new Set((Array.isArray(acknowledgeDropped) ? acknowledgeDropped : []).map((k) => trimmed(k)))
   const draftScope = trimmed(draft?.scope)
   const draftIsIron = trimmed(draft?.type) === 'iron-rule'
+  const conflict = trimmed(relation) === 'conflict'
+  const draftModality = trimmed(draft?.modality) || 'must'
 
   if (!mergedNorm) failures.push({ code: 'body_empty', key: '', detail: '改写后正文为空' })
   const length = chars(merged)
@@ -1167,20 +1231,35 @@ export function guardRewrite({
       failures.push({ code: 'vague_word', key, detail: '铁律不得含模糊词（尽量/最好/尽可能…）' })
     }
 
-    const exceptions = Array.isArray(front.exceptions) ? front.exceptions : []
-    for (const exception of exceptions) {
-      if (retainsClause(mergedNorm, exception)) continue
-      if (droppedOk) continue
-      failures.push({ code: 'dropped_exception', key, detail: `旧例外未保留：${trimmed(exception)}` })
+    // 例外与条件同权（架构书 §3.6）：旧 conditions 丢了与丢例外一样必须拒绝，
+    // 只留结构化字段而正文不写＝正文与 front 漂移，注入读到的就是没有条件的规则。
+    for (const [code, field] of [['dropped_exception', 'exceptions'], ['dropped_condition', 'conditions']]) {
+      const clauses = Array.isArray(front[field]) ? front[field] : []
+      for (const clause of clauses) {
+        if (retainsClause(mergedNorm, clause)) continue
+        if (droppedOk) continue
+        failures.push({ code, key, detail: `旧${field === 'exceptions' ? '例外' : '条件'}未保留：${trimmed(clause)}` })
+      }
     }
 
     const modality = trimmed(front.modality) || 'must'
-    const words = MODALITY_WORDS[modality]
-    if (words && !words.test(merged)) {
-      failures.push({ code: 'modality_weakened', key, detail: `模态 ${modality} 在改写后消失` })
-    } else if (HEDGE_RE.test(merged) && ['must', 'must_not', 'only'].includes(modality)) {
-      // 「禁止→尽量别」「必须→最好」是典型弱化：模态词还在，但强度被对冲词拉低了。
-      failures.push({ code: 'modality_weakened', key, detail: `模态 ${modality} 被模糊词弱化` })
+    if (conflict) {
+      // v3.7 让冲突永远过不了守卫（旧模态必须保留），冲突态等于死路：冲突的定义就是新口
+      // 径取代旧口径，所以这里只要求**新正文**把新模态表达清楚。
+      const need = MODALITY_WORDS[draftModality]
+      if (need && !need.test(merged)) {
+        failures.push({ code: 'modality_missing', key, detail: `冲突新正文未表达模态 ${draftModality}` })
+      } else if (HEDGE_RE.test(merged) && ['must', 'must_not', 'only'].includes(draftModality)) {
+        failures.push({ code: 'modality_weakened', key, detail: `模态 ${draftModality} 被模糊词弱化` })
+      }
+    } else {
+      const words = MODALITY_WORDS[modality]
+      if (words && !words.test(merged)) {
+        failures.push({ code: 'modality_weakened', key, detail: `模态 ${modality} 在改写后消失` })
+      } else if (HEDGE_RE.test(merged) && ['must', 'must_not', 'only'].includes(modality)) {
+        // 「禁止→尽量别」「必须→最好」是典型弱化：模态词还在，但强度被对冲词拉低了。
+        failures.push({ code: 'modality_weakened', key, detail: `模态 ${modality} 被模糊词弱化` })
+      }
     }
 
     const oldScope = trimmed(front.scope)
@@ -1190,6 +1269,97 @@ export function guardRewrite({
   }
 
   return { ok: failures.length === 0, failures }
+}
+
+// ---------------------------------------------------------------------------
+// 链解析（merged_into / superseded_by）
+// ---------------------------------------------------------------------------
+
+/**
+ * 取一条规则的链指针（`merged_into` 优先于 `superseded_by`；两者互斥落盘）。
+ * @param {any} doc `{front,text}` 或扁平 front
+ * @returns {string} 目标 key，空串=链终点
+ */
+export function chainPointerOf(doc) {
+  const { front } = normalizeDoc(doc)
+  return trimmed(front.merged_into) || trimmed(front.superseded_by)
+}
+
+/**
+ * 传递解析链：沿 `merged_into`/`superseded_by` 追到终点（架构书 §3.3）。
+ *
+ * 三种结局：`terminal`（无链指针的当前规则）、`broken`（指向的 key 不存在）、
+ * `cycle`（A→B→A 这类环）。注入/摘要只该用 `terminal` 且 status=active 的规则；
+ * 环/断链由 `/rules/health` 报红（`chainIssues`）。
+ *
+ * @param {Array<any>} rules 全量规则（含 superseded）
+ * @param {string} key 起点 key
+ * @returns {{ok:boolean, chain:string[], rule:object|null, status:string,
+ *   broken:boolean, cycle:boolean, missingKey:string}}
+ */
+export function resolveChain(rules, key) {
+  const byKey = new Map()
+  for (const doc of Array.isArray(rules) ? rules : []) {
+    const { front } = normalizeDoc(doc)
+    const k = trimmed(front.key)
+    if (k && !byKey.has(k)) byKey.set(k, { front, text: normalizeDoc(doc).text })
+  }
+  const start = trimmed(key)
+  const chain = [start]
+  const seen = new Set([start])
+  let current = start
+  // 上限 = 规则数 + 1：`seen` 已经保证有界，这里只是防御性硬顶（坏数据里 key 可能超长）。
+  for (let step = 0; step <= byKey.size; step += 1) {
+    const doc = byKey.get(current)
+    if (!doc) {
+      return { ok: false, chain, rule: null, status: '', broken: true, cycle: false, missingKey: current }
+    }
+    const pointer = chainPointerOf(doc)
+    if (!pointer) {
+      return {
+        ok: true,
+        chain,
+        rule: doc,
+        status: trimmed(doc.front.status),
+        broken: false,
+        cycle: false,
+        missingKey: '',
+      }
+    }
+    if (seen.has(pointer)) {
+      return { ok: false, chain: [...chain, pointer], rule: null, status: '', broken: false, cycle: true, missingKey: '' }
+    }
+    seen.add(pointer)
+    chain.push(pointer)
+    current = pointer
+  }
+  return { ok: false, chain, rule: null, status: '', broken: false, cycle: true, missingKey: '' }
+}
+
+/**
+ * 全仓链体检（`/rules/health` 用）：列出所有环与断链。
+ * @param {Array<any>} rules @returns {{cycles:Array<object>, broken:Array<object>, ok:boolean}}
+ */
+export function chainIssues(rules) {
+  const cycles = []
+  const broken = []
+  const seenCycle = new Set()
+  for (const doc of Array.isArray(rules) ? rules : []) {
+    const { front } = normalizeDoc(doc)
+    const key = trimmed(front.key)
+    if (!key || !chainPointerOf(doc)) continue
+    const got = resolveChain(rules, key)
+    if (got.cycle) {
+      // 同一环从不同起点会被各报一次：用环内 key 集合去重（A→B→A 与 B→A→B 是同一个环）。
+      const signature = [...new Set(got.chain)].sort().join('|')
+      if (seenCycle.has(signature)) continue
+      seenCycle.add(signature)
+      cycles.push({ key, chain: got.chain })
+    } else if (got.broken) {
+      broken.push({ key, missingKey: got.missingKey, chain: got.chain })
+    }
+  }
+  return { cycles, broken, ok: cycles.length === 0 && broken.length === 0 }
 }
 
 // ---------------------------------------------------------------------------
