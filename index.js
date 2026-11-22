@@ -15,6 +15,9 @@ import { installConfigMigration } from './src/host/config-migration.js'
 import { installReflectScheduler } from './src/core/reflect.js'
 import { installKeeper } from './src/core/keeper.js'
 import { installOutboxWatchdog } from './src/core/hybrid.js'
+import { defaultRuleRoot, listRules } from './src/core/rule-store.js'
+import { mirrorRules } from './src/core/rule-mirror.js'
+import { agentsPathOf, renderAgentsDigest } from './src/core/rule-render.js'
 import { bool, num } from './src/host/config-values.js'
 
 export { Config }
@@ -216,6 +219,29 @@ export function apply(ctx, config) {
     hook = installHook(ctx, { backend: backendProxy, config, getIdentityCfg, getIdentityHint, getHostUserId, identityState, log })
     return () => hook?.dispose()
   }, 'whale-memory: recall hook')
+
+  // 规则文件启动自愈（R7）：规则真源在文件仓，DB 镜像/AGENTS 摘要是投影。
+  // 插件重启或换机后，文件还在但镜像可能为空/过期，这里异步补一次（fail-open，不阻塞启动）。
+  ctx.effect(() => {
+    if (bool(config?.rules?.enabled, true) === false) return () => {}
+    if (bool(config?.rules?.mirrorAuto, true) === false) return () => {}
+    const dir = String(config?.rules?.dir || '').trim() || defaultRuleRoot()
+    const timer = setTimeout(() => {
+      try {
+        const listed = listRules(dir)
+        if (!listed?.ok || !Array.isArray(listed.rules) || listed.rules.length === 0) return
+        const mirror = mirrorRules({ backend: backendProxy, rules: listed.rules, log })
+        if (mirror && mirror.ok === false) log(`[whale-memory] rules mirror self-heal skipped: ${mirror.error || mirror.code || 'error'}`)
+        // 文件真源有变而 AGENTS 管理块存在 → 顺手校准摘要（无标记时 render 会返回 no_markers，静默跳过）。
+        const agents = renderAgentsDigest({ rules: listed.rules, agentsPath: agentsPathOf(dir), rulesDir: dir, log })
+        if (agents && agents.ok === false && agents.code !== 'no_markers') log(`[whale-memory] rules agents self-heal skipped: ${agents.code || agents.error || 'error'}`)
+      } catch (err) {
+        log(`[whale-memory] rules self-heal fail-open: ${err?.message || err}`)
+      }
+    }, 1200)
+    if (typeof timer.unref === 'function') timer.unref()
+    return () => clearTimeout(timer)
+  }, 'whale-memory: rules self-heal')
 
   log(`[whale-memory] armed mode=${config?.backend?.mode || 'local'} backendReady=${Boolean(backend.ready)} hook=on`)
 }
