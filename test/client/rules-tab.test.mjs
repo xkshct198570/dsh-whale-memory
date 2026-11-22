@@ -22,7 +22,8 @@ const NEW_KEYS = [
   'rules.rebuildMirror', 'rules.rebuildConfirm', 'rules.rebuildDone', 'rules.importLegacy',
   'rules.importConfirm', 'rules.importDone', 'rules.proposalsTitle', 'rules.proposalsEmpty',
   'rules.emptyTitle', 'rules.emptyWhy', 'rules.emptyStepImport', 'rules.emptyStepEdit', 'rules.emptyStepRefresh',
-  'rules.rollbackPending', 'rules.editPending', 'rules.diffOld', 'rules.diffNew',
+  'rules.editTitle', 'rules.editPreview', 'rules.editSubmit', 'rules.revertConfirm',
+  'rules.diffOld', 'rules.diffNew', 'rules.currentRev',
   'rules.typeCandidate', 'rules.importSkipped', 'err.rules_disabled', 'err.git_required',
 ]
 
@@ -205,7 +206,7 @@ test('待确认区：404 软降级空态，其它失败给卡片内错误态与�
   assert.ok(card.includes('onRetry'), '提案错误态缺少重试入口')
 })
 
-test('所有写操作二次确认，回滚/编辑 R3b 前 disabled + 说明', () => {
+test('所有写操作二次确认；回滚/编辑已接线（R5 不再 disabled）', () => {
   const view = sliceFrom('function RulesView(props) {', 'function RulesGitBar(props) {')
   for (const key of ['rules.rebuildConfirm', 'rules.importConfirm']) {
     assert.ok(view.includes(`askConfirm(t('${key}'))`), `缺少二次确认 ${key}`)
@@ -213,10 +214,12 @@ test('所有写操作二次确认，回滚/编辑 R3b 前 disabled + 说明', ()
   assert.ok(view.includes("t('rules.rebuildDone')"), '重建缺少成功提示')
   assert.ok(view.includes("t('rules.importDone')"), '导入缺少成功提示')
   const drawer = sliceFrom('function RuleDrawer(props) {', '// ----------------------------------------------------------------- recall')
-  assert.match(drawer, /disabled: true, title: t\('rules\.rollbackPending'\)/, '回滚按钮未 disabled + 说明')
-  assert.match(drawer, /disabled: true, title: t\('rules\.editPending'\)/, '编辑按钮未 disabled + 说明')
+  assert.ok(drawer.includes("askConfirm(t('rules.revertConfirm'))"), '回滚缺少二次确认')
+  assert.ok(drawer.includes("callJson('/rules/revert'"), '回滚未走 POST /rules/revert')
+  assert.ok(drawer.includes("t('rules.edit')"), '详情缺少编辑入口')
+  assert.ok(!drawer.includes('rules.rollbackPending') && !drawer.includes('rules.editPending'), 'R5 不应再留占位 disabled 文案')
   assert.ok(drawer.includes("t('rules.diffOld')") && drawer.includes("t('rules.diffNew')"), '缺少旧/新对比标记')
-  assert.ok(drawer.includes('lineDiff('), '缺少逐行 diff 调用')
+  assert.ok(drawer.includes('lineDiff('), '缺少逐行 diff 兜底')
 })
 
 test('空态引导：为什么需要规则 / 导入铁律 / 文件在 ~/.dsh/rules 可手改', () => {

@@ -308,11 +308,12 @@ test('空态手动提案：文本域 → POST /rules/propose → 跳到待确认
   assert.ok(view.includes('ref: proposalsRef'), '待确认区缺少滚动锚点')
 })
 
-test('详情：历史版本查看可用，编辑/回滚维持 disabled（R5）', () => {
+test('详情：历史版本查看可用，编辑/回滚走 R5 接线（详情内不再有占位 disabled）', () => {
   const drawer = drawerSource()
   assert.ok(drawer.includes('lineDiff(') && drawer.includes("t('rules.diffOld')"), '历史版本查看/diff 丢失')
-  assert.match(drawer, /disabled: true, title: t\('rules\.rollbackPending'\)/, '回滚未维持 disabled')
-  assert.match(drawer, /disabled: true, title: t\('rules\.editPending'\)/, '编辑未维持 disabled')
+  assert.ok(drawer.includes("askConfirm(t('rules.revertConfirm'))"), '回滚缺少二次确认')
+  assert.ok(drawer.includes('h(RulesEditDialog') || drawer.includes('RulesEditDialog'), '详情缺少编辑弹层')
+  assert.ok(!drawer.includes('rules.rollbackPending') && !drawer.includes('rules.editPending'), 'R5 不应再留占位 disabled 文案')
   assert.ok(!drawer.includes("disabled: true, title: t('rules.history')"), '历史版本不应被禁用')
 })
 
