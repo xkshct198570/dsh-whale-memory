@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "ホエールメモリ",
-    "description": "ローカル長期記憶：ノード、想起、書き込み監査；既定はローカル SQLite、任意で外部サービス。",
+    "description": "ローカル長期記憶：重要な事実・ルールをローカル SQLite に保存し、会話前に身元別に想起・注入します。パネルで検索・編集・書き込み審査が可能。既定では外部リクエストを送りません（backend=http/hybrid のときだけ設定 URL に /stats /recent /search /recall /write /version）。無効化すると想起・書き込みが止まり、DB は ~/.dsh/whale-memory に残ります。",
     "detail": "docs/DETAIL.md"
   },
   "tab.overview": "Overview",
