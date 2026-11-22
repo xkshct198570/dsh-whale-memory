@@ -16,6 +16,7 @@ import {
   IMMUTABLE_RULE_FIELDS,
   MANIFEST_FILE,
   atomicWriteFile,
+  createRule,
   defaultRuleRoot,
   deleteRule,
   diffLines,
@@ -24,7 +25,9 @@ import {
   nextRuleNumber,
   normalizeRuleDoc,
   parseRuleDocument,
+  purgeRule,
   readHistory,
+  readManifest,
   readRule,
   readSnapshot,
   regenerateManifest,
@@ -316,6 +319,103 @@ test('delete：普通规则 force 也只 retired 留文件；候选 force 才物
   assert.equal(deleted.ok, true)
   assert.equal(deleted.deleted, true)
   assert.equal(readRule(root, 'cand-2').error, 'rule_not_found')
+})
+
+test('purgeRule：删文件 + 最后一版 history 快照 + 墓碑，nextNumber 不回收（删17→18，删18→19）', (t) => {
+  const root = freshRoot(t)
+  const text = '必须先验证再覆盖正式库。'
+  assert.equal(writeDoc(root, frontOf({ key: 'iron-rule-17', type: 'iron-rule', number: 17 }), text).ok, true)
+  assert.equal(readManifest(root).nextNumber, 18)
+
+  const purged = purgeRule({ root, key: 'iron-rule-17', now: Date.UTC(2026, 10, 22, 15, 30, 0) }, { git: false })
+  assert.equal(purged.ok, true, purged.error)
+  assert.equal(purged.key, 'iron-rule-17')
+  assert.equal(purged.number, 17)
+  assert.equal(purged.version, 1)
+  assert.match(purged.historySnapshot, /^\d{17}/, '必须返回 history 快照 rev')
+
+  // 文件物理删除；详情接口回到 rule_not_found。
+  assert.equal(nodeFs.existsSync(join(root, 'iron-rule-17.md')), false)
+  assert.equal(readRule(root, 'iron-rule-17').error, 'rule_not_found')
+
+  // 删除前最后一版仍在 history，可追溯。
+  const history = readHistory(root, 'iron-rule-17')
+  assert.equal(history.ok, true)
+  assert.equal(history.entries.length, 1)
+  assert.equal(history.entries[0].rev, purged.historySnapshot)
+  assert.ok(history.entries[0].text.includes(text))
+
+  // 墓碑进 manifest；编号继续占位，删最高号也不回落。
+  const manifest = readManifest(root)
+  assert.deepEqual(manifest.retired.map((item) => [item.key, item.number]), [['iron-rule-17', 17]])
+  assert.equal(manifest.nextNumber, 18)
+  assert.equal(manifest.total, 0, '墓碑不是规则，不能虚增 total')
+
+  // 删 17 后新建仍分配 18（不回收到 1 或 17）。
+  const created = createRule({ root, draft: { text: '必须保留审计日志。', type: 'iron-rule' } }, { git: false })
+  assert.equal(created.ok, true, created.error)
+  assert.equal(created.number, 18)
+  assert.equal(created.key, 'iron-rule-18')
+
+  // 再删新建的 18：下一个编号仍是 19（墓碑 17/18 都占位）。
+  const purgedAgain = purgeRule({ root, key: 'iron-rule-18' }, { git: false })
+  assert.equal(purgedAgain.ok, true, purgedAgain.error)
+  assert.equal(readManifest(root).nextNumber, 19)
+  assert.deepEqual(readManifest(root).retired.map((item) => item.number), [17, 18])
+  const next = createRule({ root, draft: { text: '必须保留审计行。', type: 'iron-rule' } }, { git: false })
+  assert.equal(next.ok, true, next.error)
+  assert.equal(next.number, 19, '连续 purge 后编号仍单调递增')
+})
+
+test('purgeRule：安全行 number=0 只删文件、不写墓碑、不压回 nextNumber', (t) => {
+  const root = freshRoot(t)
+  const safety = frontOf({
+    key: 'iron-rule-safety',
+    type: 'iron-rule',
+    number: 0,
+    modality: 'only',
+    action: '存放',
+    object: '认证凭据（token）',
+    conditions: ['认证凭据存用'],
+  })
+  const text = '认证凭据（token）只准走环境变量或 DPAPI；禁止落在台账／脚本／日志明文里。'
+  assert.equal(writeDoc(root, safety, text).ok, true)
+  assert.equal(readManifest(root).nextNumber, 1)
+
+  const purged = purgeRule({ root, key: 'iron-rule-safety' }, { git: false })
+  assert.equal(purged.ok, true, purged.error)
+  assert.equal(purged.number, 0)
+  assert.equal(nodeFs.existsSync(join(root, 'iron-rule-safety.md')), false)
+  const manifest = readManifest(root)
+  assert.deepEqual(manifest.retired, [], 'number=0 无编号，不进墓碑')
+  assert.equal(manifest.nextNumber, 1, '安全行不占号，nextNumber 不得因删除被压成 2')
+  assert.equal(manifest.unnumbered, 0)
+})
+
+test('purgeRule：git 不可用降级 fs.unlinkSync；文件照样删除、commit 记录降级原因', (t) => {
+  const root = freshRoot(t)
+  assert.equal(writeDoc(root, frontOf({ key: 'rule-4', number: 4 }), '必须保留审计行。').ok, true)
+  const noGit = () => {
+    const err = new Error('spawn git ENOENT')
+    err.code = 'ENOENT'
+    throw err
+  }
+  const purged = purgeRule({ root, key: 'rule-4' }, { exec: noGit })
+  assert.equal(purged.ok, true, purged.error)
+  assert.equal(nodeFs.existsSync(join(root, 'rule-4.md')), false)
+  assert.equal(purged.commit.ok, false)
+  assert.equal(purged.commit.error, 'git_unavailable')
+  assert.equal(readManifest(root).retired[0].number, 4)
+})
+
+test('purgeRule：重复 purge → rule_not_found，墓碑不重复堆积', (t) => {
+  const root = freshRoot(t)
+  assert.equal(writeDoc(root, frontOf({ key: 'rule-2', number: 2 }), '必须保留审计行。').ok, true)
+  assert.equal(purgeRule({ root, key: 'rule-2' }, { git: false }).ok, true)
+  const again = purgeRule({ root, key: 'rule-2' }, { git: false })
+  assert.equal(again.ok, false)
+  assert.equal(again.error, 'rule_not_found')
+  assert.equal(readManifest(root).retired.length, 1)
 })
 
 test('ensureRuleRepo：建目录/README/manifest；git 缺失只降级不抛', (t) => {

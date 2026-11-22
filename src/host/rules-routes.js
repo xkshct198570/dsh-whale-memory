@@ -35,8 +35,8 @@ import { value } from './config-values.js'
 import { detectGit, gitRequired, refreshGit } from './git-detector.js'
 import {
   DIFF_LINE_LIMIT, computeManifest, createRule, defaultRuleRoot, diffLines, ensureRuleRepo, gitLog,
-  isValidRuleKey, listRules, reactivateRule, readHistory, readRule, resolveRevision, retireRule,
-  revertRule, updateRule,
+  isValidRuleKey, listRules, purgeRule, reactivateRule, readHistory, readManifest, readRule,
+  resolveRevision, retireRule, revertRule, updateRule,
 } from '../core/rule-store.js'
 import { importLegacyRule, mirrorRules, mirrorStatus } from '../core/rule-mirror.js'
 import {
@@ -82,7 +82,8 @@ function titleOf(front, body) {
 export function rulesListPayload({ root = '', config = {}, detect = detectGit, forceGit = false } = {}) {
   const dir = root || resolveRulesRoot(config)
   const list = listRules(dir)
-  const manifest = computeManifest(list.rules)
+  // 墓碑必须参与列表的 nextNumber：purge 过的编号不复用，列表页的"下一个编号"不能回落。
+  const manifest = computeManifest(list.rules, readManifest(dir)?.retired)
   const rules = list.rules.map((doc) => ({
     key: textOf(doc.front.key),
     type: textOf(doc.front.type),
@@ -402,15 +403,20 @@ function applyPostSteps({ dir, config, backend, mirror, renderAgents, log }) {
 }
 
 /**
- * 审计一次规则编辑/回滚：writes(reason=rule_edit|rule_revert) + evolution(text old→new)。
+ * 审计一次规则编辑/回滚/删除：writes(reason=rule_edit|rule_revert|rule_purge) + evolution 变更。
  *
  * before/after 在 writes 里是**摘要**（截 200 字，面板列表够用），全文进 evolution——
  * 两个表各有用途，别把 500 字正文塞两遍。
+ *
+ * purge 例外：`afterText === null` 表示规则已被物理删除——writes.after_text 就存 null
+ * （不是空串，空串会与"删空正文"混淆）；evolution 记 `status: <旧状态> → deleted`，
+ * 让审计可答"这条规则什么时候消失、编号作废"。
+ *
  * @returns {{ok:boolean,error?:string}}
  */
 function auditRuleChange({
   backend, reason, key, beforeText, afterText, commit, mirrorResult, agentsResult,
-  traceId, identity, log, extra = {},
+  traceId, identity, log, extra = {}, evolutionField = 'text', evolutionOld = '', evolutionNew = '',
 }) {
   if (!backend || typeof backend.withDb !== 'function') return { ok: false, error: 'backend_unavailable' }
   const ident = identity && typeof identity === 'object' ? identity : {}
@@ -422,7 +428,8 @@ function auditRuleChange({
       db.prepare(`INSERT INTO writes (ts, trace_id, action, node_id, reason, before_text, after_text,
         mode, payload, user_id, role_id, workspace) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(
         at, textOf(traceId), 'MERGE', nodeId, reason,
-        beforeText ? textOf(beforeText).slice(0, 200) : null, textOf(afterText).slice(0, 200), 'auto',
+        beforeText ? textOf(beforeText).slice(0, 200) : null,
+        afterText === null ? null : textOf(afterText).slice(0, 200), 'auto',
         JSON.stringify({
           key,
           commit: textOf(commit?.message || ''),
@@ -432,9 +439,11 @@ function auditRuleChange({
         }),
         textOf(ident.userId), textOf(ident.roleId), textOf(ident.workspace),
       )
-      if (textOf(beforeText) !== textOf(afterText)) {
+      const oldValue = evolutionField === 'text' ? textOf(beforeText) : textOf(evolutionOld)
+      const newValue = evolutionField === 'text' ? textOf(afterText) : textOf(evolutionNew)
+      if (oldValue !== newValue) {
         db.prepare(`INSERT INTO evolution (ts, from_id, to_id, field, old_value, new_value, trace_id)
-          VALUES (?,?,?,?,?,?,?)`).run(at, nodeId, nodeId, 'text', textOf(beforeText), textOf(afterText), textOf(traceId))
+          VALUES (?,?,?,?,?,?,?)`).run(at, nodeId, nodeId, evolutionField, oldValue, newValue, textOf(traceId))
       }
       return true
     })
@@ -813,11 +822,13 @@ export function createPayload({
 }
 
 /**
- * 停用/恢复规则（`mode:'retire'|'reactivate'`，默认 retire）。
+ * 停用/恢复/彻底删除规则（`mode:'retire'|'reactivate'|'purge'`，默认 retire）。
  *
  * 停用只改 status（文件/编号/正文/历史全保留）：编号永不复用，所以 manifest 的 nextNumber 不因
  * 停用回退；镜像侧 pinned 归 0 由 rule-mirror 按 status 投影，本层只负责触发。
  * 已 retired 再停用 → `already_retired`；未 retired 恢复 → `not_retired`（幂等动作要显式报"没动"）。
+ *
+ * purge 是**删除**而不是停用：文件物理删除、编号进 manifest 墓碑后作废永不复用，见 `purgePayload`。
  *
  * @param {{root?:string,config?:any,backend?:any,body?:object,detect?:Function,
  *   mirror?:Function,renderAgents?:Function,git?:boolean,exec?:Function,
@@ -833,15 +844,21 @@ export function deletePayload({
   const dir = root || resolveRulesRoot(config)
   const key = textOf(body?.key).trim()
   if (!isValidRuleKey(key)) return { ok: false, error: 'invalid_key' }
+  const allowedModes = ['retire', 'reactivate', 'purge']
   const mode = textOf(body?.mode).trim() || 'retire'
-  if (mode !== 'retire' && mode !== 'reactivate') {
-    return { ok: false, error: 'invalid_mode', detail: { mode, allowed: ['retire', 'reactivate'] } }
+  if (!allowedModes.includes(mode)) {
+    return { ok: false, error: 'invalid_mode', detail: { mode, allowed: allowedModes } }
   }
   const before = readRule(dir, key)
   if (!before.ok) return { ok: false, error: before.error, detail: before.detail }
   // 与 update 同口径：首次写前建好规则仓/首个 commit（新目录否则提交不上）。
   const ensured = ensureRuleRepo({ root: dir, git: git !== false, ...(exec ? { exec } : {}) })
   if (!ensured.ok) return { ok: false, error: 'ensure_failed', detail: ensured.error }
+  if (mode === 'purge') {
+    return purgePayload({
+      dir, key, config, backend, before, body, mirror, renderAgents, git, exec, log, now,
+    })
+  }
   const changed = mode === 'retire'
     ? retireRule({ root: dir, key, identity: identityOf(body), traceId: textOf(body?.traceId), now }, { git, exec })
     : reactivateRule({ root: dir, key, identity: identityOf(body), traceId: textOf(body?.traceId), now }, { git, exec })
@@ -880,6 +897,75 @@ export function deletePayload({
     commitInfo: changed.commit,
     version: changed.version,
     previousVersion: changed.previousVersion,
+    ...postView(post),
+    audit: { ok: audit.ok, ...(audit.ok ? {} : { error: audit.error }) },
+  }
+}
+
+/**
+ * purge 分支（deletePayload 内部）：彻底删除 + 镜像/AGENTS/审计。
+ *
+ * Why 后处理照旧走 `applyPostSteps`：文件没了，`mirrorRules` 会把孤儿镜像行归档为
+ * archived/pinned=0（不物理删，保留审计），AGENTS 摘要也随之不再列出该规则。
+ * 审计特殊在 `afterText=null`：规则不存在了，写 null 比空串诚实；evolution 记
+ * `status: 旧状态 → deleted`，别拿空正文冒充"改成了空规则"。
+ *
+ * @returns {object}
+ */
+function purgePayload({
+  dir, key, config, backend, before, body, mirror, renderAgents, git, exec, log, now,
+}) {
+  const purged = purgeRule({
+    root: dir, key, identity: identityOf(body), traceId: textOf(body?.traceId), now,
+  }, { git, exec })
+  if (!purged.ok) return { ok: false, error: purged.error, detail: purged.detail }
+  const post = applyPostSteps({ dir, config, backend, mirror, renderAgents, log })
+  const manifest = readManifest(dir) || {}
+  const retiredNumbers = (Array.isArray(manifest.retired) ? manifest.retired : [])
+    .map((item) => Number(item?.number))
+    .filter((n) => Number.isInteger(n) && n > 0)
+    .sort((a, b) => a - b)
+  const nextNumber = Number(manifest.nextNumber) || 1
+  const audit = auditRuleChange({
+    backend,
+    reason: 'rule_purge',
+    key,
+    beforeText: textOf(before.rule.text),
+    afterText: null,
+    commit: purged.commit,
+    mirrorResult: post.mirror,
+    agentsResult: post.agents,
+    traceId: textOf(body?.traceId),
+    identity: identityOf(body),
+    log,
+    evolutionField: 'status',
+    evolutionOld: textOf(before.rule.front.status),
+    evolutionNew: 'deleted',
+    extra: {
+      mode: 'purge',
+      number: purged.number,
+      version: purged.version,
+      retiredNumbers,
+      nextNumber,
+      purged: true,
+      deleted: true,
+    },
+  })
+  return {
+    ok: true,
+    dir,
+    key,
+    mode: 'purge',
+    status: 'deleted',
+    purged: true,
+    deleted: true,
+    number: purged.number,
+    version: purged.version,
+    historySnapshot: purged.historySnapshot,
+    commit: textOf(purged.commit?.message),
+    commitInfo: purged.commit,
+    retiredNumbers,
+    nextNumber,
     ...postView(post),
     audit: { ok: audit.ok, ...(audit.ok ? {} : { error: audit.error }) },
   }

@@ -34,6 +34,7 @@ import {
   atomicWriteFile,
   computeManifest,
   defaultRuleRoot,
+  readManifest,
   ensureRuleRepo,
   gitCommit,
   listRules,
@@ -283,7 +284,8 @@ export function createProposal({
   // 只与 active 正式规则比对：superseded/retired 已经失效，候选里的 `rule-candidate` 不是同层级。
   const activeRules = listed.rules.filter((doc) => textOf(doc.front.status) === 'active'
     && textOf(doc.front.type) !== 'rule-candidate')
-  const manifest = computeManifest(activeRules)
+  // 墓碑编号必须并入：purge 掉最高号后，候选不能再拿回作废号。
+  const manifest = computeManifest(activeRules, readManifest(base)?.retired)
 
   const compiled = compileStructured(raw, signals, {
     existingRules: activeRules,
@@ -852,7 +854,7 @@ export async function applyProposal({
   // 4) 编号/文件名：refine 沿用旧号，其余用草案号（空号 6 由 writeRule 挡住）。
   const targetKey = textOf(draft.key)
   const existingTarget = byKey.get(targetKey)
-  const manifest = computeManifest(currentRules)
+  const manifest = computeManifest(currentRules, readManifest(base)?.retired)
   const targetNumber = existingTarget
     ? Number(existingTarget.front.number)
     : (Number.isInteger(Number(draft.number)) && Number(draft.number) > 0 ? Number(draft.number) : manifest.nextNumber)

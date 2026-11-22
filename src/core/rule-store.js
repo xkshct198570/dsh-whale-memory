@@ -24,7 +24,7 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import * as nodeFs from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { homedir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { join, relative, resolve } from 'node:path'
 import { detectSignals, normalizeRuleText, ruleKeyOf } from './rules.js'
 
 /** 已知 front matter 字段（顺序即序列化顺序）。未知字段一律报错，不静默丢弃。 */
@@ -811,11 +811,20 @@ function manualModalityOf(text) {
   return 'must'
 }
 
-/** 旧编号永不回收：所有规则（含 retired/archived）的编号都算占用。 */
-function occupiedNumbers(rules) {
+/**
+ * 旧编号永不回收：所有规则（含 retired/archived）的编号都算占用；已彻底删除的编号
+ * 只剩 manifest 墓碑，也必须继续占位——否则删掉最高号后新规则会回收该号，违反"编号稳定。
+ * @param {Array<object>} rules @param {Array<{number:number}>} [retired] manifest.retired 墓碑
+ * @returns {Set<number>}
+ */
+function occupiedNumbers(rules, retired = []) {
   const numbers = new Set()
   for (const doc of Array.isArray(rules) ? rules : []) {
     const n = doc?.front ? Number(doc.front.number) : Number(doc?.number)
+    if (Number.isInteger(n) && n > 0) numbers.add(n)
+  }
+  for (const item of Array.isArray(retired) ? retired : []) {
+    const n = Number(item?.number)
     if (Number.isInteger(n) && n > 0) numbers.add(n)
   }
   return numbers
@@ -878,7 +887,8 @@ export function createRule({ root = '', draft = {}, identity = {}, traceId = '',
   }
 
   const listed = listRules(base)
-  const number = nextRuleNumber(occupiedNumbers(listed.rules))
+  // 墓碑也占号：彻底删除后编号作废、永不复用（删 17 后新建仍 18；删 18 后新建仍 19）。
+  const number = nextRuleNumber(occupiedNumbers(listed.rules, readManifest(base)?.retired))
   // `rule:<domain>-<hash8>` → `rule-<domain>-<hash8>`（面板/文件里的 key 形状）。
   const key = type === 'iron-rule' ? `iron-rule-${number}` : ruleKeyOf(text).replace(/^rule:/, 'rule-')
   if (!isValidRuleKey(key)) return { ok: false, error: 'invalid_draft', detail: { reason: 'invalid_key', key } }
@@ -977,6 +987,91 @@ export function reactivateRule({ root = '', key, identity = {}, traceId = '', no
   const updated = updateRule({ root, key, patch: { status: 'active' }, identity, traceId, now }, opts)
   if (!updated.ok) return updated
   return { ...updated, status: 'active', reactivated: true }
+}
+
+/**
+ * 物理删除规则文件：优先 `git rm`（删除与暂存一体，随后一次 commit 就是一次删除记录），
+ * git 不可用/不是仓库/文件未跟踪时降级 `fs.unlinkSync`——删除动作本身不能因 git 缺失失败。
+ * @param {string} base @param {string} file
+ * @param {{fs?:typeof nodeFs, git?:boolean, exec?:Function}} [opts]
+ * @returns {{ok:boolean,viaGit?:boolean,error?:string,detail?:any}}
+ */
+function removeRuleFile(base, file, opts = {}) {
+  const fs = opts.fs || nodeFs
+  if (opts.git !== false) {
+    const repo = isGitRepo(base, { exec: opts.exec })
+    if (repo.ok) {
+      const rel = relative(base, file)
+      // 只允许仓库内相对路径；越界路径说明文件不该在这里，直接走 unlink，不喂给 git。
+      if (rel && !rel.startsWith('..')) {
+        const rm = runGit(base, ['rm', '-q', '-f', '--', rel], { exec: opts.exec })
+        if (rm.ok) return { ok: true, viaGit: true }
+      }
+    }
+  }
+  try {
+    fs.unlinkSync(file)
+    return { ok: true, viaGit: false }
+  } catch (err) {
+    return { ok: false, error: 'delete_failed', detail: String(err?.message || err) }
+  }
+}
+
+/**
+ * 彻底删除一条规则（purge）：文件物理删除 + manifest 墓碑 + history 快照 + 单 commit。
+ *
+ * 与 `retireRule` 的区别：停用只切 status，文件/编号/正文/历史全保留，可随时重新启用；
+ * purge 让规则从列表、提案与镜像召回里彻底消失，但**编号永不复用**——编号写进
+ * `manifest.json#retired` 墓碑，未来自动编号把它算作已占用（删 17 → 新建 18；删 18 → 新建 19）。
+ *
+ * 顺序刻意是"快照 → 删文件 → 墓碑随 manifest 落盘 → 单 commit"：
+ * - 先写快照：最后一版正文必须留在 `history/<key>/`，删除后仍可追溯；
+ * - 快照失败立即中止，不出现"文件没了、历史也没了"的不可追溯状态；
+ * - 安全行（number=0）只删文件、不写墓碑：它不占编号，墓碑会把 nextNumber 压回 1。
+ *
+ * @param {{root?:string, key:string, identity?:object, traceId?:string, now?:number}} args
+ *   identity/traceId 只为与路由/审计同签名（本模块不写 DB）。
+ * @param {{fs?:typeof nodeFs, git?:boolean, exec?:Function}} [opts]
+ * @returns {{ok:boolean,key?:string,number?:number,version?:number,historySnapshot?:string,
+ *   commit?:object|null,error?:string,detail?:any}}
+ */
+export function purgeRule({ root = '', key, identity = {}, traceId = '', now = Date.now() } = {}, opts = {}) {
+  const fs = opts.fs || nodeFs
+  const base = baseDir(root)
+  const got = readRule(base, key)
+  if (!got.ok) return { ok: false, error: got.error, detail: got.detail }
+  const doc = got.rule
+  let oldText
+  try { oldText = fs.readFileSync(doc.file, 'utf8') } catch (err) {
+    return { ok: false, error: String(err?.message || err) }
+  }
+  const snap = writeHistorySnapshot(base, key, oldText, { fs })
+  if (!snap.ok) return { ok: false, error: 'snapshot_failed', detail: snap.error }
+
+  const number = Number(doc.front.number)
+  const tombstone = Number.isInteger(number) && number > 0 && !isUnnumberedRule(doc.front)
+  const retired = tombstone
+    ? [{
+      key: String(doc.front.key),
+      number,
+      at: new Date(Number.isFinite(now) ? Number(now) : Date.now()).toISOString(),
+    }]
+    : []
+
+  const removed = removeRuleFile(base, doc.file, { ...opts, fs })
+  if (!removed.ok) return removed
+
+  regenerateManifest(base, { fs, retired })
+  // 单 commit：git rm 已暂存删除，manifest/墓碑由 add -A 一并收进同一提交。
+  const commit = commitRuleChange(base, `rule: purge ${key} (#${number})`, opts)
+  return {
+    ok: true,
+    key: String(doc.front.key),
+    number,
+    version: Number(doc.front.version) || 1,
+    historySnapshot: snap.rev,
+    commit,
+  }
 }
 
 /**
@@ -1402,15 +1497,43 @@ export function nextRuleNumber(numbers) {
 }
 
 /**
+ * 墓碑归一：`manifest.retired` 是"已彻底删除、编号作废"的编号台账（rule-store 的唯一删除记录）。
+ *
+ * 只保留合法正整数的编号；同一 `{key,number}` 只留最新 `at`（重复记录不堆垃圾）。
+ * 排序固定（number → key），保证 manifest 在 git diff 里稳定、不因对象顺序抖动。
+ *
+ * @param {Array<{key:string,number:number,at:string}>} retired
+ * @returns {Array<{key:string,number:number,at:string}>}
+ */
+function normalizeRetired(retired) {
+  const seen = new Map()
+  for (const item of Array.isArray(retired) ? retired : []) {
+    const key = String(item?.key ?? '').trim()
+    const number = Number(item?.number)
+    if (!key || !Number.isInteger(number) || number <= 0) continue
+    const at = String(item?.at ?? '').trim()
+    const id = `${key}#${number}`
+    const prev = seen.get(id)
+    if (!prev || String(prev.at) < at) seen.set(id, { key, number, at })
+  }
+  return [...seen.values()].sort((a, b) => a.number - b.number || a.key.localeCompare(b.key))
+}
+
+/**
  * 由规则列表计算 manifest 视图（纯函数，GET 列表用；不写盘）。
  *
  * 编号口径：只有正整数编号参与 `nextNumber`/`total`；无编号铁律（安全行，number=0）单列
  * `unnumbered` 计数——它存在、要被列表/镜像渲染，但**不占号**，否则 nextNumber 会被压回 1。
+ * 已 purge 的编号只剩墓碑：`nextNumber` 把它算作占用（删最高号也不回落），但 `total`
+ * 只数现存编号规则——墓碑不是规则，不能虚增列表条数。
  *
  * @param {Array<object>} rules listRules 的 rules
- * @returns {{nextNumber:number,total:number,unnumbered:number,byStatus:Record<string,number>}}
+ * @param {Array<{key:string,number:number,at:string}>} [retired] manifest.retired 墓碑
+ * @returns {{nextNumber:number,total:number,unnumbered:number,byStatus:Record<string,number>,
+ *   retired:Array<{key:string,number:number,at:string}>}}
  */
-export function computeManifest(rules) {
+export function computeManifest(rules, retired = []) {
+  const tombstones = normalizeRetired(retired)
   const byStatus = {}
   const numbers = []
   let unnumbered = 0
@@ -1421,19 +1544,34 @@ export function computeManifest(rules) {
     if (Number.isInteger(n) && n > 0) numbers.push(n)
     else if (isUnnumberedRule(doc?.front)) unnumbered += 1
   }
-  return { nextNumber: nextRuleNumber(numbers), total: numbers.length, unnumbered, byStatus }
+  const occupied = numbers.concat(tombstones.map((item) => item.number))
+  return {
+    nextNumber: nextRuleNumber(occupied),
+    total: numbers.length,
+    unnumbered,
+    byStatus,
+    retired: tombstones,
+  }
 }
 
 /**
  * 生成 manifest.json（生成物，勿手改）；内容稳定排序，便于 git diff。
- * @param {string} root @param {{fs?:typeof nodeFs}} [opts]
+ *
+ * 必须**保留已有墓碑**：manifest 是墓碑的唯一真源，任何一次普通写入触发的重生成都不能
+ * 把 `retired` 清掉，否则编号会被回收。`opts.retired` 用于本次 purge 追加，与旧墓碑合并去重。
+ *
+ * @param {string} root
+ * @param {{fs?:typeof nodeFs, retired?:Array<{key:string,number:number,at:string}>}} [opts]
  * @returns {{ok:boolean,manifest?:object,error?:string}}
  */
 export function regenerateManifest(root, opts = {}) {
   const fs = opts.fs || nodeFs
   const base = baseDir(root)
+  const existing = readManifest(base)
+  const oldRetired = Array.isArray(existing?.retired) ? existing.retired : []
+  const retired = normalizeRetired(oldRetired.concat(Array.isArray(opts.retired) ? opts.retired : []))
   const list = listRules(base)
-  const view = computeManifest(list.rules)
+  const view = computeManifest(list.rules, retired)
   const manifest = {
     ...view,
     keys: list.rules.map((doc) => doc.front.key),

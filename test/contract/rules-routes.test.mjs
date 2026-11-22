@@ -483,6 +483,7 @@ function fakeGit() {
   }
   return {
     exec,
+    calls,
     commitMessages: () => calls
       .filter((call) => call.argv.includes('commit'))
       .map((call) => call.argv[call.argv.indexOf('-m') + 1]),
@@ -1066,6 +1067,185 @@ test('POST /rules/delete reactivate：恢复 active、镜像 pinned 1、审计 r
   assert.equal(again.body.status, 'active')
 })
 
+test('POST /rules/delete purge：删文件、墓碑编号不复用、镜像归档、审计 rule_purge、返回 retiredNumbers/nextNumber', async (t) => {
+  const fx = freshFixture(t)
+  const text = '必须先验证再覆盖正式库。'
+  const front = frontOf(17, { key: 'iron-rule-17', type: 'iron-rule' })
+  assert.equal(writeRule(fx.dir, { front, text }, { git: false }).ok, true)
+  assert.equal(readManifestSync(fx.dir).nextNumber, 18)
+
+  // 先镜像出 active 行，purge 才有"孤儿"可归档（不先建行就测不到归档路径）。
+  const mirrored = await callWith(fx.handler, 'POST', '/whale-memory/api/rules/rebuild-mirror')
+  assert.equal(mirrored.status, 200, JSON.stringify(mirrored.body))
+  const beforeRow = fx.db.prepare("SELECT status, pinned FROM nodes WHERE origin = 'rule:iron-rule-17'").get()
+  assert.equal(beforeRow.status, 'active')
+  assert.equal(beforeRow.pinned, 1)
+
+  const res = await callWith(fx.handler, 'POST', '/whale-memory/api/rules/delete', {
+    key: 'iron-rule-17',
+    mode: 'purge',
+    identity: { userId: 'u9' },
+  })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  const body = res.body
+  assert.equal(body.ok, true)
+  assert.equal(body.key, 'iron-rule-17')
+  assert.equal(body.mode, 'purge')
+  assert.equal(body.status, 'deleted')
+  assert.equal(body.purged, true)
+  assert.equal(body.deleted, true)
+  assert.equal(body.number, 17)
+  assert.equal(body.version, 1)
+  assert.match(String(body.historySnapshot), /^\d{17}/)
+  assert.deepEqual(body.retiredNumbers, [17])
+  assert.equal(body.nextNumber, 18)
+  assert.equal(body.audit.ok, true)
+
+  // 文件物理删除 + 最后一版 history 仍可追溯。
+  assert.equal(nodeFs.existsSync(join(fx.dir, 'iron-rule-17.md')), false)
+  assert.equal(readRule(fx.dir, 'iron-rule-17').error, 'rule_not_found')
+  const history = readHistory(fx.dir, 'iron-rule-17')
+  assert.equal(history.entries.length, 1)
+  assert.equal(history.entries[0].rev, body.historySnapshot)
+  assert.ok(history.entries[0].text.includes(text))
+
+  // manifest 墓碑；列表彻底消失（不再出现，也不进"已退役"筛选的数据源）。
+  const manifest = readManifestSync(fx.dir)
+  assert.deepEqual(manifest.retired.map((item) => [item.key, item.number]), [['iron-rule-17', 17]])
+  assert.equal(manifest.nextNumber, 18)
+  const list = await callWith(fx.handler, 'GET', '/whale-memory/api/rules')
+  assert.equal(list.body.rules.some((rule) => rule.key === 'iron-rule-17'), false)
+
+  // 镜像：文件没了 → 孤儿归档 archived + pinned 0（不物理删）。
+  const row = fx.db.prepare("SELECT text, status, pinned FROM nodes WHERE origin = 'rule:iron-rule-17'").get()
+  assert.ok(row, '镜像行必须保留（不物理删）')
+  assert.equal(row.status, 'archived')
+  assert.equal(row.pinned, 0)
+  assert.ok(String(row.text).includes('必须先验证'))
+
+  // 审计：reason=rule_purge，after_text=null，payload 带编号/墓碑；evolution 记 status→deleted。
+  const audit = fx.db.prepare("SELECT * FROM writes WHERE reason = 'rule_purge' ORDER BY id DESC LIMIT 1").get()
+  assert.ok(audit, 'writes 必须留 reason=rule_purge')
+  assert.equal(audit.user_id, 'u9')
+  assert.equal(audit.before_text, text)
+  assert.equal(audit.after_text, null)
+  const payload = JSON.parse(audit.payload)
+  assert.equal(payload.mode, 'purge')
+  assert.equal(payload.number, 17)
+  assert.equal(payload.purged, true)
+  assert.deepEqual(payload.retiredNumbers, [17])
+  assert.equal(payload.nextNumber, 18)
+  const evolution = fx.db.prepare("SELECT * FROM evolution WHERE field = 'status' ORDER BY id DESC LIMIT 1").get()
+  assert.ok(evolution, 'evolution 必须记 status 变化')
+  assert.equal(evolution.old_value, 'active')
+  assert.equal(evolution.new_value, 'deleted')
+
+  // 删除不回收编号：新建铁律仍是 18；再删 18 后仍是 19。
+  const created = await callWith(fx.handler, 'POST', '/whale-memory/api/rules/create', {
+    draft: { text: '必须保留审计日志。', type: 'iron-rule' },
+  })
+  assert.equal(created.status, 200, JSON.stringify(created.body))
+  assert.equal(created.body.number, 18)
+  const purgedAgain = await callWith(fx.handler, 'POST', '/whale-memory/api/rules/delete', {
+    key: 'iron-rule-18',
+    mode: 'purge',
+  })
+  assert.equal(purgedAgain.status, 200, JSON.stringify(purgedAgain.body))
+  assert.deepEqual(purgedAgain.body.retiredNumbers, [17, 18])
+  assert.equal(purgedAgain.body.nextNumber, 19)
+
+  // 重复删除同一 key → 404 rule_not_found（文件已不存在，不是"再停用"语义）。
+  const again = await callWith(fx.handler, 'POST', '/whale-memory/api/rules/delete', {
+    key: 'iron-rule-18',
+    mode: 'purge',
+  })
+  assert.equal(again.status, 404)
+  assert.equal(again.body.error, 'rule_not_found')
+
+  // 已停用规则也可彻底删除（停用不是删除，删除路径不依赖 status）。
+  assert.equal(writeRule(fx.dir, {
+    front: frontOf(3, { key: 'rule-3', status: 'retired' }),
+    text: '必须保留审计行。',
+  }, { git: false }).ok, true)
+  const retiredPurged = await callWith(fx.handler, 'POST', '/whale-memory/api/rules/delete', {
+    key: 'rule-3',
+    mode: 'purge',
+  })
+  assert.equal(retiredPurged.status, 200, JSON.stringify(retiredPurged.body))
+  assert.equal(nodeFs.existsSync(join(fx.dir, 'rule-3.md')), false)
+  const afterPurgeList = await callWith(fx.handler, 'GET', '/whale-memory/api/rules')
+  assert.equal(afterPurgeList.body.rules.some((rule) => rule.key === 'rule-3'), false)
+})
+
+test('POST /rules/delete purge 错误码：git_required/rules_disabled；retire/reactivate 行为不变', async (t) => {
+  const fx = freshFixture(t)
+  assert.equal(writeRule(fx.dir, { front: frontOf(5), text: '必须保留审计日志。' }, { git: false }).ok, true)
+
+  const missing = () => ({ available: false, version: '', error: 'git_not_installed', checkedAt: 1 })
+  const blocked = deletePayload({
+    root: fx.dir,
+    config: { ...fx.config, rules: { ...fx.config.rules, requireGit: true } },
+    backend: fx.backend,
+    body: { key: 'rule-5', mode: 'purge' },
+    detect: missing,
+  })
+  assert.equal(blocked.ok, false)
+  assert.equal(blocked.error, 'git_required')
+  assert.equal(nodeFs.existsSync(join(fx.dir, 'rule-5.md')), true, '闸门拒绝后文件必须原样保留')
+
+  const disabled = freshFixture(t, { enabled: false })
+  const off = await callWith(disabled.handler, 'POST', '/whale-memory/api/rules/delete', {
+    key: 'rule-5',
+    mode: 'purge',
+  })
+  assert.equal(off.status, 403)
+  assert.equal(off.body.error, 'rules_disabled')
+
+  // retire/reactivate 不受 purge 影响：停用仍保留文件，恢复仍回 active。
+  const retired = await callWith(fx.handler, 'POST', '/whale-memory/api/rules/delete', {
+    key: 'rule-5',
+    mode: 'retire',
+  })
+  assert.equal(retired.status, 200, JSON.stringify(retired.body))
+  assert.equal(retired.body.status, 'retired')
+  assert.equal(nodeFs.existsSync(join(fx.dir, 'rule-5.md')), true, '停用仍必须保留文件')
+  const reactivated = await callWith(fx.handler, 'POST', '/whale-memory/api/rules/delete', {
+    key: 'rule-5',
+    mode: 'reactivate',
+  })
+  assert.equal(reactivated.status, 200, JSON.stringify(reactivated.body))
+  assert.equal(reactivated.body.status, 'active')
+  assert.equal(readManifestSync(fx.dir).retired.some((item) => item.number === 5), false, '停用/恢复不写墓碑')
+})
+
+test('deletePayload purge：单 commit 文案 rule: purge <key> (#n)（注入 exec，不依赖真实 git）', async (t) => {
+  const fx = freshFixture(t)
+  const fake = fakeGit()
+  const created = createPayload({
+    root: fx.dir,
+    config: fx.config,
+    backend: fx.backend,
+    body: { draft: { text: '必须在改动前先备份。', type: 'iron-rule' } },
+    exec: fake.exec,
+  })
+  assert.equal(created.ok, true, JSON.stringify(created.detail))
+  const purged = deletePayload({
+    root: fx.dir,
+    config: fx.config,
+    backend: fx.backend,
+    body: { key: created.key, mode: 'purge' },
+    exec: fake.exec,
+  })
+  assert.equal(purged.ok, true, purged.error)
+  assert.equal(purged.commit, `rule: purge ${created.key} (#${created.number})`, 'purge 是一次性单 commit')
+  assert.deepEqual(fake.commitMessages(), [
+    `rule: create ${created.key} (#${created.number})`,
+    `rule: purge ${created.key} (#${created.number})`,
+  ])
+  // 假 git 不会真删文件；这里锁"删文件动作走 git rm"（真实删除由上面的端点用例断言）。
+  assert.equal(fake.calls.some((call) => call.argv.includes('rm')), true, 'git 可用时必须走 git rm')
+})
+
 test('POST /rules/delete 错误码：rule_not_found/invalid_key/invalid_mode/rules_disabled', async (t) => {
   const fx = freshFixture(t)
   const missing = await callWith(fx.handler, 'POST', '/whale-memory/api/rules/delete', { key: 'rule-nope' })
@@ -1082,7 +1262,7 @@ test('POST /rules/delete 错误码：rule_not_found/invalid_key/invalid_mode/rul
   })
   assert.equal(badMode.status, 400)
   assert.equal(badMode.body.error, 'invalid_mode')
-  assert.deepEqual(badMode.body.detail.allowed, ['retire', 'reactivate'])
+  assert.deepEqual(badMode.body.detail.allowed, ['retire', 'reactivate', 'purge'])
 
   const disabled = freshFixture(t, { enabled: false })
   const off = await callWith(disabled.handler, 'POST', '/whale-memory/api/rules/delete', { key: 'rule-1' })
