@@ -29,7 +29,9 @@ export const LEDGER_BEGIN = '<!-- whale-memory:ledger:begin -->'
 export const LEDGER_END = '<!-- whale-memory:ledger:end -->'
 
 /** 摘要里正文摘录长度（一行一条，太长会把 AGENTS 读成本体）。 */
-const EXCERPT_CHARS = 60
+// 摘要要能独立读懂：60 字只剩半句，真机 AGENTS 实测看不到例外/判据。200 字≈全条正文本体，
+// 超长铁律才截断并给省略号 + 文件指针；17 条全量约 3.4K 字符，可接受。
+const EXCERPT_CHARS = 200
 
 /** @param {any} value @returns {string} */
 function textOf(value) {

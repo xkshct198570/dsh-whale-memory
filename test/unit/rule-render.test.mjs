@@ -72,8 +72,8 @@ function agentsFile(dir, body = '- 旧行') {
 // 内容口径
 // ---------------------------------------------------------------------------
 
-test('rulesDigestContent：只收 global+active 铁律，按编号排序，正文截 60 字', () => {
-  const long = '必须'.repeat(40)
+test('rulesDigestContent：只收 global+active 铁律，按编号排序，正文截 200 字', () => {
+  const long = '必须'.repeat(120)
   const got = rulesDigestContent([
     doc({ key: 'iron-rule-17', number: 17, text: '删文档前先核对绝对路径。' }),
     doc({ key: 'iron-rule-13', number: 13, text: '只在本工作区生效。' }),
@@ -89,8 +89,8 @@ test('rulesDigestContent：只收 global+active 铁律，按编号排序，正�
   const longLine = got.content.split('\n').find((line) => line.startsWith('- 铁律20'))
   // 摘要 60 字后追加「（文件：…）」指针，取两者之间的正文再数长度。
   const excerpt = longLine.slice(longLine.indexOf('：') + 1, longLine.indexOf('（文件：'))
-  // 60 字 + 截断省略号（长文本才有）
-  assert.equal(Array.from(excerpt).length, 61)
+  // 200 字 + 截断省略号（长文本才有）
+  assert.equal(Array.from(excerpt).length, 201)
   assert.match(excerpt, /…$/)
   assert.match(longLine, /（文件：iron-rule-20\.md）$/)
 })
