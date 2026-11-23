@@ -4,7 +4,7 @@
 
 Local-first long-term memory for DeepSeek Harness sessions: recall relevant memories before each turn, review and edit them in a six-tab panel, and keep rules in a local git Markdown repository where the database is only a search mirror.
 
-> Current version **0.6.0** (unreleased): local SQLite memory store, automatic recall, six-tab panel, write auditing and adoption signals, optional two-way sync/outbox, metrics and daily reports, and legacy migration auditing. Rule source of truth: `~/.dsh/rules` (proposals, plan/apply, tombstone numbering, health check).
+> Current version **0.6.0** (released; R9 fixes queued for 0.6.1): local SQLite memory store, automatic recall, six-tab panel, write auditing and adoption signals, optional two-way sync/outbox, metrics and daily reports, and legacy migration auditing. Rule source of truth: `~/.dsh/rules` (proposals, plan/apply, tombstone numbering, health check).
 > Requirements: DSH `>=0.2.2-rc.5 <0.3.0`, Node `>=22.5` (built-in SQLite).
 
 ## Install
@@ -80,7 +80,7 @@ The backend defaults to `local` (`$DSH_HOME/whale-memory/memory.db`). `http`/`hy
 
 ```bash
 cd dsh-whale-memory
-npm test                    # 799 tests (798 pass / 1 skip)
+npm test                    # 808 tests (807 pass / 1 skip)
 node scripts/check.mjs      # contract gate
 node scripts/i18n-check.mjs # zh/en/ja locale keys
 ```
