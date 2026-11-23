@@ -22,7 +22,7 @@ import { join } from 'node:path'
 import { contentHash, bigrams } from './tokenize.js'
 import {
   acquireRepoLock, allocatableRuleNumber, defaultRuleRoot, isRetiredNumber, isValidRuleKey, listRules,
-  readTombstones, writeRule,
+  readTombstones, requireGitGate, writeRule,
 } from './rule-store.js'
 
 /** 旧铁律节点（迁移前已知 id）；没有该节点时按 tags/origin 兜底查找。 */
@@ -365,8 +365,12 @@ function parseNumberHint(...values) {
  */
 export function importLegacyRule({
   backend, key = '', number = null, root = '', rules = '', git = true, legacyId = LEGACY_IRON_RULE_ID,
+  gitRequired = false,
 } = {}) {
   const base = root || rules || defaultRuleRoot()
+  // requireGit 闸门（R9-05）：迁移也是写入口；缺 git 时不许先写墓碑/占号。
+  const gate = requireGitGate(base, { gitRequired, git })
+  if (!gate.ok) return gate
   const requestedKey = textOf(key).trim()
   if (requestedKey && !isValidRuleKey(requestedKey)) return { ok: false, error: 'invalid_key' }
   const node = findNode(backend, { key: requestedKey, id: requestedKey ? '' : legacyId })

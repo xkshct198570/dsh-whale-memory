@@ -171,7 +171,10 @@ export function runRulesSelfHeal({ config, backend, log = () => {}, store = rule
 
   // 1) 默认铁律播种（后台；播种本身不阻塞 init）。
   try {
-    result.seeded = seedDefaultRules({ root: dir, log })
+    result.seeded = seedDefaultRules({ root: dir, log }, {
+      // 播种与面板/提案同口径（R9-05）：requireGit=true 且缺 git 时不播、不写 marker。
+      gitRequired: Boolean(config?.rules?.requireGit),
+    })
     if (result.seeded && result.seeded.ok === false) {
       log(`[whale-memory] rules seed skipped: ${result.seeded.error || 'error'}${result.seeded.skippedInvalid ? ` (invalid=${result.seeded.skippedInvalid})` : ''}`)
     } else if (result.seeded && result.seeded.seeded) {

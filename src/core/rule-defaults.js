@@ -36,6 +36,7 @@ import {
   readRuleSource,
   readTombstones,
   regenerateManifest,
+  requireGitGate,
   validateRule,
   writeRule,
   MANIFEST_FILE,
@@ -191,6 +192,15 @@ export function seedDefaultRules({
   const base = String(root ?? '').trim() ? resolve(root) : defaultRuleRoot()
   const markerFile = join(base, marker)
   const defaults = String(defaultsDir ?? '').trim()
+  // requireGit 闸门（R9-05）：播种也是写入口，必须与面板/提案同口径；先于锁与 marker，
+  // 缺 git 时既不能播规则也不能写「已播种」假状态。
+  const gate = requireGitGate(base, opts)
+  if (!gate.ok) {
+    return {
+      ok: false, error: 'git_required', detail: gate.detail,
+      root: base, defaultsDir: defaults, marker: markerFile, count: 0,
+    }
+  }
   const lock = acquireRepoLock(base, { fs, timeoutMs: opts.timeoutMs, staleMs: opts.staleMs })
   if (!lock.ok) {
     return {

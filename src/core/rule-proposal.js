@@ -38,6 +38,8 @@ import {
   occupancy,
   readTombstones,
   regenerateManifest,
+  requireGitGate,
+  ruleCommitState,
   writeRule,
 } from './rule-store.js'
 // R8-03 的存储层契约（锁/事务日志/显式路径提交）由 store owner 落地；未落地时按下面的
@@ -886,7 +888,7 @@ export async function applyProposal({
   id, decisions = {}, identity = {}, traceId = '', rulesDir, config = {},
   getLlm = () => null, getSelection = () => null, backend = null,
   mirror = null, renderAgents = null, git = true, exec = null, log = () => {}, now = Date.now(),
-  planHash = '',
+  planHash = '', gitRequired = null,
 } = {}) {
   const base = resolveRuleRoot(rulesDir, config)
   const got = readProposal({ rulesDir: base, config, id })
@@ -904,13 +906,17 @@ export async function applyProposal({
   const relation = textOf(proposal.relation?.relation) || 'new'
   const needsRewrite = REWRITE_RELATIONS.includes(relation)
 
-  // 规则仓就绪 + git 闸门：ensureRuleRepo 顺带给出 git 可用性（本模块不 import host 探测）。
+  // requireGit 闸门（R9-05）：显式参数优先（路由把 config 折算成布尔传进来），回落到 config
+  // 只为兼容直接调用——两者同源，不制造第二个真源。闸门先于建仓，缺 git 时不落任何目录。
+  const requireGit = gitRequired === null ? cfgBool(config?.rules?.requireGit, false) : Boolean(gitRequired)
+  const gate = requireGitGate(base, { gitRequired: requireGit, git, ...(exec ? { exec } : {}) })
+  if (!gate.ok) {
+    return { ok: false, error: 'git_required', code: 'git_required', proposal, detail: gate.detail }
+  }
+  // 规则仓就绪：ensureRuleRepo 顺带给出 git 可用性，供 commit/降级判定（本模块不 import host 探测）。
   const ensured = ensureRuleRepo({ root: base, git: git !== false, ...(exec ? { exec } : {}) })
   if (!ensured.ok) return { ok: false, error: 'ensure_failed', code: 'ensure_failed', detail: ensured.error }
   const gitAvailable = git !== false && ensured.git?.available === true
-  if (cfgBool(config?.rules?.requireGit, false) && !gitAvailable) {
-    return { ok: false, error: 'git_required', code: 'git_required', proposal }
-  }
 
   // 1) 措辞改写：面板 decisions.text/affected 优先；需要改写又没给 → rules.llm 问模型，否则转面板。
   //    模型输出只当**候选措辞**：它和面板输入一样只能进 decisions，随后由 plan 逐文件守卫。
@@ -1068,6 +1074,8 @@ export async function applyProposal({
         file: '',
         number: plan.target.number,
         commit: null,
+        // 重复=不写文件，没有版本状态可报；与 update 的 changed:false 同口径。
+        commitState: null,
         duplicate: true,
         mirror: null,
         agents: null,
@@ -1133,6 +1141,7 @@ export async function applyProposal({
           detail: committed.error,
           rolledBack: true,
           rollbackFailures: rolledBack,
+          commitState: 'failed',
         }
       }
       commit = { message: plan.commitMessage, committed: Boolean(committed.committed) }
@@ -1161,7 +1170,10 @@ export async function applyProposal({
     if (!acceptedWritten.ok) {
       log(`[whale-memory] rules accepted write failed id=${proposal.id} code=${acceptedWritten.error}`)
     }
-    return { ok: true, applied, proposal: next, commit, affectedChanges }
+    return {
+      ok: true, applied, proposal: next, commit, affectedChanges,
+      commitState: ruleCommitState(commit, { git: gitAvailable ? true : false }),
+    }
   }
 
   const locked = withStoreLock(base, runApply, exec)
@@ -1253,6 +1265,7 @@ export async function applyProposal({
     ok: true,
     applied,
     proposal: finalProposal,
+    commitState: outcome.commitState ?? null,
     ...(outcome.duplicate ? { duplicate: true } : {}),
   }
 }

@@ -862,6 +862,9 @@ export function writeRule(root, input, opts = {}) {
   if (!isValidRuleKey(normalized.front.key)) {
     return { ok: false, error: 'invalid_rule', detail: [{ code: 'invalid_key', field: 'key', message: 'key 非法' }] }
   }
+  // requireGit 闸门（R9-05）必须在**拿锁之前**：`.locks/` 本身也是落盘动作，缺 git 时不许动。
+  const gate = gitGate(base, opts)
+  if (!gate.ok) return gate
 
   const run = () => {
     // 首次写规则时初始化 git 仓库；git 缺失只降级（ensureRuleRepo 不抛），文件仍可写。
@@ -951,7 +954,7 @@ export function writeRule(root, input, opts = {}) {
         const rolled = rollback()
         return {
           ok: false, error: 'commit_failed', detail: { stage: 'commit', error: done.error || 'git_failed' },
-          rolledBack: rolled.ok, rollbackFailures: rolled.failures,
+          rolledBack: rolled.ok, rollbackFailures: rolled.failures, commitState: 'failed',
         }
       }
       git = done.ok
@@ -970,6 +973,7 @@ export function writeRule(root, input, opts = {}) {
       history: snapshot?.rev || '',
       manifest: manifest.manifest,
       git,
+      commitState: commitStateOf(git, { git: opts.git }),
     }
   }
 
@@ -1169,6 +1173,9 @@ export function occupancy(root, opts = {}) {
 export function createRule({ root = '', draft = {}, identity = {}, traceId = '', now = Date.now() } = {}, opts = {}) {
   const fs = opts.fs || nodeFs
   const base = baseDir(root)
+  // requireGit 闸门（R9-05）：先于校验/锁/建仓，路由之外的调用方（脚本/迁移）同样被拦。
+  const gate = gitGate(base, opts)
+  if (!gate.ok) return gate
   if (!draft || typeof draft !== 'object' || Array.isArray(draft)) {
     return { ok: false, error: 'invalid_draft', detail: { reason: 'draft_must_be_object' } }
   }
@@ -1274,7 +1281,7 @@ export function createRule({ root = '', draft = {}, identity = {}, traceId = '',
         // 降级：文件/manifest 已落盘，只是没有版本记录（架构书 §6「git 不可用」语义）。
         return {
           ok: true, rule: written.rule, path: written.path, key, number, type, version: 1,
-          origin: front.origin, commit, manifest: written.manifest || null,
+          origin: front.origin, commit, manifest: written.manifest || null, commitState: 'degraded',
         }
       }
       if (!commit.ok) {
@@ -1289,6 +1296,7 @@ export function createRule({ root = '', draft = {}, identity = {}, traceId = '',
           key,
           number,
           type,
+          commitState: 'failed',
         }
       }
     }
@@ -1303,6 +1311,7 @@ export function createRule({ root = '', draft = {}, identity = {}, traceId = '',
       origin: front.origin,
       commit,
       manifest: written.manifest || null,
+      commitState: commitStateOf(commit, { git: opts.git }),
     }
   } finally {
     lock.release()
@@ -1411,9 +1420,16 @@ function dropTombstoneSafe(tomb, fs) {
 export function purgeRule({ root = '', key, identity = {}, traceId = '', now = Date.now() } = {}, opts = {}) {
   const fs = opts.fs || nodeFs
   const base = baseDir(root)
+  // requireGit 闸门（R9-05）：先于锁/墓碑/删文件，缺 git 时一条规则都不许被删。
+  const gate = gitGate(base, opts)
+  if (!gate.ok) return gate
   const lock = acquireRepoLock(base, { fs, timeoutMs: opts.timeoutMs, staleMs: opts.staleMs })
   if (!lock.ok) return { ok: false, error: lock.error }
   try {
+    // 仓就绪由 store 自己负责（与 writeRule 同口径）：路由不再在锁外预先 ensure，
+    // 否则每次写都要 init/重建 manifest 两遍（R9-05 收口）。
+    const ensured = ensureRuleRepo({ root: base, git: opts.git !== false, fs, exec: opts.exec })
+    if (!ensured.ok) return { ok: false, error: 'ensure_failed', detail: ensured.error }
     const got = opts.skipValidation === true ? readRuleLax(base, key) : readRule(base, key)
     if (!got.ok) return { ok: false, error: got.error, detail: got.detail }
     const doc = got.rule
@@ -1488,7 +1504,7 @@ export function purgeRule({ root = '', key, identity = {}, traceId = '', now = D
       clearTxnIfAny()
       return {
         ok: true, key: String(doc.front.key), number, version: Number(doc.front.version) || 1,
-        historySnapshot: snap.rev, tombstone: tomb?.path || '', commit: null,
+        historySnapshot: snap.rev, tombstone: tomb?.path || '', commit: null, commitState: 'degraded',
       }
     }
 
@@ -1499,7 +1515,7 @@ export function purgeRule({ root = '', key, identity = {}, traceId = '', now = D
         clearTxnIfAny()
         return {
           ok: true, key: String(doc.front.key), number, version: Number(doc.front.version) || 1,
-          historySnapshot: snap.rev, tombstone: tomb?.path || '', commit,
+          historySnapshot: snap.rev, tombstone: tomb?.path || '', commit, commitState: 'degraded',
         }
       }
       const failures = [restoreFile(), dropTombstone()].filter(Boolean)
@@ -1510,13 +1526,14 @@ export function purgeRule({ root = '', key, identity = {}, traceId = '', now = D
       clearTxnIfAny()
       return {
         ok: false, error: 'commit_failed', detail: { stage: 'commit', error: commit.error },
-        rolledBack: failures.length === 0, rollbackFailures: failures,
+        rolledBack: failures.length === 0, rollbackFailures: failures, commitState: 'failed',
       }
     }
     clearTxnIfAny()
     return {
       ok: true, key: String(doc.front.key), number, version: Number(doc.front.version) || 1,
       historySnapshot: snap.rev, tombstone: tomb?.path || '', commit,
+      commitState: commitStateOf(commit, { git: opts.git }),
     }
   } finally {
     lock.release()
@@ -1753,6 +1770,9 @@ function patchChanged(front, text, nextFront, nextText) {
 export function updateRule({ root = '', key, patch, now = Date.now() } = {}, opts = {}) {
   const base = baseDir(root)
   const fs = opts.fs || nodeFs
+  // requireGit 闸门（R9-05）：先于锁/读盘，缺 git 时不产生任何状态变化。
+  const gate = gitGate(base, opts)
+  if (!gate.ok) return gate
   // 锁外先拿仓库级锁：重读磁盘 → 校验 → 落盘 → manifest → 提交 全在同一临界区。
   const lock = acquireRepoLock(base, { fs, timeoutMs: opts.timeoutMs, staleMs: opts.staleMs })
   if (!lock.ok) return { ok: false, error: lock.error }
@@ -1772,6 +1792,12 @@ export function updateRule({ root = '', key, patch, now = Date.now() } = {}, opt
 function updateRuleLocked({ root = '', key, patch, now = Date.now() } = {}, opts = {}) {
   const fs = opts.fs || nodeFs
   const base = baseDir(root)
+  // 本函数用 `writeRule(git:false)` 自己控制提交文案，writeRule 因此不会 init 仓库；
+  // 建仓必须由 updateRule 自己负责，否则首次编辑永远 commit_failed（not a git repository）。
+  if (opts.git !== false) {
+    const ensured = ensureRuleRepo({ root: base, git: true, fs, ...(opts.exec ? { exec: opts.exec } : {}) })
+    if (!ensured.ok) return { ok: false, error: 'ensure_failed', detail: ensured.error }
+  }
   const got = readRule(base, key)
   if (!got.ok) return got
   const doc = got.rule
@@ -1829,6 +1855,8 @@ function updateRuleLocked({ root = '', key, patch, now = Date.now() } = {}, opts
       path: doc.file,
       history: '',
       commit: null,
+      // 无写入就没有版本状态：留 null 比谎报 committed/degraded 诚实。
+      commitState: null,
       version: Number(current.version),
       previousVersion: Number(current.version),
     }
@@ -1854,7 +1882,7 @@ function updateRuleLocked({ root = '', key, patch, now = Date.now() } = {}, opts
       // 降级：文件/manifest/history 都已落盘，仅无版本记录（git 不可用 ≠ 提交失败）。
       return {
         ok: true, changed: true, rule: saved.rule, path: saved.path, history: saved.history || '',
-        commit, version, previousVersion: Number(current.version),
+        commit, version, previousVersion: Number(current.version), commitState: 'degraded',
       }
     }
     if (!commit.ok) {
@@ -1870,6 +1898,7 @@ function updateRuleLocked({ root = '', key, patch, now = Date.now() } = {}, opts
         rollbackFailures: rolled.failures,
         version: Number(current.version),
         previousVersion: Number(current.version),
+        commitState: 'failed',
       }
     }
   }
@@ -1882,6 +1911,7 @@ function updateRuleLocked({ root = '', key, patch, now = Date.now() } = {}, opts
     commit,
     version,
     previousVersion: Number(current.version),
+    commitState: commitStateOf(commit, { git: opts.git }),
   }
 }
 
@@ -1900,6 +1930,9 @@ function updateRuleLocked({ root = '', key, patch, now = Date.now() } = {}, opts
 export function revertRule({ root = '', key, rev, now = Date.now() } = {}, opts = {}) {
   const base = baseDir(root)
   const fs = opts.fs || nodeFs
+  // requireGit 闸门（R9-05）：先于锁/读盘。
+  const gate = gitGate(base, opts)
+  if (!gate.ok) return gate
   const lock = acquireRepoLock(base, { fs, timeoutMs: opts.timeoutMs, staleMs: opts.staleMs })
   if (!lock.ok) return { ok: false, error: lock.error }
   try {
@@ -1918,6 +1951,11 @@ export function revertRule({ root = '', key, rev, now = Date.now() } = {}, opts 
 function revertRuleLocked({ root = '', key, rev, now = Date.now() } = {}, opts = {}) {
   const fs = opts.fs || nodeFs
   const base = baseDir(root)
+  // 同 updateRule：内部 writeRule(git:false) 不建仓，revert 自己 ensure，否则首笔回滚提交不上。
+  if (opts.git !== false) {
+    const ensured = ensureRuleRepo({ root: base, git: true, fs, ...(opts.exec ? { exec: opts.exec } : {}) })
+    if (!ensured.ok) return { ok: false, error: 'ensure_failed', detail: ensured.error }
+  }
   const got = readRule(base, key)
   if (!got.ok) return got
   const doc = got.rule
@@ -1972,7 +2010,7 @@ function revertRuleLocked({ root = '', key, rev, now = Date.now() } = {}, opts =
       return {
         ok: true, changed: true, rule: saved.rule, path: saved.path, history: saved.history || '',
         commit, version, previousVersion: Number(doc.front.version),
-        revertedTo: resolved.rev, source: resolved.source,
+        revertedTo: resolved.rev, source: resolved.source, commitState: 'degraded',
       }
     }
     if (!commit.ok) {
@@ -1989,6 +2027,7 @@ function revertRuleLocked({ root = '', key, rev, now = Date.now() } = {}, opts =
         version: Number(doc.front.version),
         previousVersion: Number(doc.front.version),
         revertedTo: resolved.rev,
+        commitState: 'failed',
       }
     }
   }
@@ -2003,6 +2042,7 @@ function revertRuleLocked({ root = '', key, rev, now = Date.now() } = {}, opts =
     previousVersion: Number(doc.front.version),
     revertedTo: resolved.rev,
     source: resolved.source,
+    commitState: commitStateOf(commit, { git: opts.git }),
   }
 }
 
@@ -2025,6 +2065,74 @@ function normalizeCommitPaths(base, paths) {
 }
 
 /**
+ * git 不可用是**降级**而不是提交失败：文件/manifest 已落盘，只是没有版本记录。
+ * 只有真的 `git commit` 失败（index/权限/钩子）才算失败并回滚。
+ * @param {string} [error] @returns {boolean}
+ */
+function isGitDegraded(error) {
+  return error === 'git_unavailable' || error === 'not_a_git_repo'
+}
+
+/**
+ * requireGit 闸门（R9-05）：配置折算成布尔由调用方传入，store 自己复核 git 可执行性。
+ *
+ * 为什么下沉到 store：路由闸只能拦住 HTTP 入口；播种、迁移、apply 内部、别的插件直接调
+ * store 时都绕过它。闸门必须贴着写入口，且**在任何落盘动作之前**（锁目录/建仓/marker 都不许先动）。
+ *
+ * 只探 `git --version` 而不要求仓库已存在：requireGit 的语义是「这台机器有 git 才能写」，
+ * 仓库由写入口自己 ensure；拿「仓库不存在」当缺 git 会误伤首次写入。
+ *
+ * @param {string} root 规则仓根（仅用于错误明细，不写盘）
+ * @param {{gitRequired?:boolean, git?:boolean, exec?:Function}} [opts]
+ * @returns {{ok:true}|{ok:false, error:'git_required', detail:{reason:string,root:string}}}
+ */
+export function requireGitGate(root, opts = {}) {
+  if (opts.gitRequired !== true) return { ok: true }
+  const base = baseDir(root)
+  if (opts.git === false) {
+    // 调用方显式要求 git 又显式关掉 git：配置自相矛盾，宁可拒绝也不写一笔没有版本记录的规则。
+    return { ok: false, error: 'git_required', detail: { reason: 'git_disabled', root: base } }
+  }
+  const exec = opts.exec || execFileSync
+  try {
+    exec('git', ['--version'], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: GIT_TIMEOUT_MS, env: gitEnv(),
+    })
+    return { ok: true }
+  } catch (err) {
+    return {
+      ok: false,
+      error: 'git_required',
+      detail: { reason: err?.code === 'ENOENT' ? 'git_unavailable' : String(err?.message || err).trim(), root: base },
+    }
+  }
+}
+
+/** 内部别名：写入口统一用短名调用，导出名给播种/迁移/提案复用（同一道闸，禁止各自实现）。 */
+const gitGate = requireGitGate
+
+/**
+ * 三态提交状态（架构书 §6）：`committed`=版本已记录；`degraded`=文件已写但无版本记录
+ * （git 关闭/不可用）；`failed`=git 可用但提交失败（写入口必须已把四处回滚干净）。
+ *
+ * `commit.ok && !committed` 是「工作树与 index 已一致、无需提交」：按 committed 记，
+ * 明细里保留 `committed:false`，不谎报「产生了提交」。
+ *
+ * @param {{ok?:boolean, committed?:boolean, error?:string}|null} commit
+ * @param {{git?:boolean}} [opts]
+ * @returns {'committed'|'degraded'|'failed'}
+ */
+function commitStateOf(commit, opts = {}) {
+  if (opts.git === false) return 'degraded'
+  if (!commit) return 'degraded'
+  if (commit.ok) return 'committed'
+  return isGitDegraded(commit.error) ? 'degraded' : 'failed'
+}
+
+/** 公开别名：提案 apply 与路由复用同一三态判定（禁止在别处再实现一份）。 */
+export const ruleCommitState = commitStateOf
+
+/**
  * 单次提交：**显式路径**（规则文件 + manifest + 墓碑），不用 `git add -A`。
  *
  * 为什么必须显式：规则仓里还躺着 `proposals/`、`history/`、`.txn/`；`add -A` 会把候选草稿
@@ -2034,15 +2142,6 @@ function normalizeCommitPaths(base, paths) {
  * @param {{paths?:string[], exec?:Function}} [opts]
  * @returns {{ok:boolean, committed:boolean, message:string, error?:string}}
  */
-/**
- * git 不可用是**降级**而不是提交失败：文件/manifest 已落盘，只是没有版本记录。
- * 只有真的 `git commit` 失败（index/权限/钩子）才算失败并回滚。
- * @param {string} [error] @returns {boolean}
- */
-function isGitDegraded(error) {
-  return error === 'git_unavailable' || error === 'not_a_git_repo'
-}
-
 export function commitRuleChanges(root, message, opts = {}) {
   const base = baseDir(root)
   const text = String(message || 'rules: update')

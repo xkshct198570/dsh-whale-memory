@@ -38,7 +38,7 @@ import { value } from './config-values.js'
 import { detectGit, gitRequired, refreshGit } from './git-detector.js'
 import {
   DIFF_LINE_LIMIT, MANIFEST_FILE, TXN_DIR, computeManifest, createRule,
-  defaultRuleRoot, diffLines, durableWriteFile, ensureRuleRepo, fileRuleNumbers, gitLog,
+  defaultRuleRoot, diffLines, durableWriteFile, fileRuleNumbers, gitLog,
   isValidRuleKey, listRules, normalizeRuleDoc, parseRuleDocument, purgeRule, reactivateRule,
   readHistory, readManifest, readRule, readRuleSource, readTombstones, regenerateManifest,
   resetGitIndex, resolveRevision, retireRule, revertRule, updateRule, writeHistorySnapshot, writeTombstone,
@@ -495,8 +495,18 @@ export async function applyPayload({
     exec,
     log,
     now,
+    // requireGit 闸门下沉（R9-05）：路由快速失败之外，store 拿到显式布尔再复核一次。
+    gitRequired: guard.required,
   })
-  if (result.ok) return { ok: true, dir, applied: result.applied, proposal: proposalView(result.proposal) }
+  if (result.ok) {
+    return {
+      ok: true,
+      dir,
+      applied: result.applied,
+      proposal: proposalView(result.proposal),
+      ...(result.commitState ? { commitState: result.commitState } : {}),
+    }
+  }
   return {
     ok: false,
     error: textOf(result.code || result.error) || 'apply_failed',
@@ -504,6 +514,7 @@ export async function applyPayload({
     status: result.status,
     detail: result.detail,
     rolledBack: result.rolledBack,
+    ...(result.commitState ? { commitState: result.commitState } : {}),
     proposal: result.proposal ? proposalView(result.proposal) : undefined,
   }
 }
@@ -829,10 +840,6 @@ export function updatePayload({
   if (!isValidRuleKey(key)) return { ok: false, error: 'invalid_key' }
   const before = readRule(dir, key)
   if (!before.ok) return { ok: false, error: before.error, detail: before.detail }
-  // 与 apply 同口径：首次写前把规则仓/首个 commit 建好，否则新目录的编辑永远提交不上。
-  // 放在读规则之后：打错 key 不该顺手建出一个空规则仓。
-  const ensured = ensureRuleRepo({ root: dir, git: git !== false, ...(exec ? { exec } : {}) })
-  if (!ensured.ok) return { ok: false, error: 'ensure_failed', detail: ensured.error }
   const patch = body?.patch
   const updated = updateRule({
     root: dir,
@@ -841,7 +848,7 @@ export function updatePayload({
     identity: body?.identity,
     traceId: textOf(body?.traceId),
     now,
-  }, { git, exec })
+  }, { git, exec, gitRequired: guard.required })
   if (!updated.ok) {
     return { ok: false, error: updated.error, detail: updated.detail, rolledBack: updated.rolledBack }
   }
@@ -875,6 +882,7 @@ export function updatePayload({
     // 结构化细节（ok/committed/error）放 commitInfo，避免客户端把对象 String 成 [object Object]。
     commit: textOf(updated.commit?.message),
     commitInfo: updated.commit,
+    commitState: updated.commitState ?? null,
     version: updated.version,
     previousVersion: updated.previousVersion,
     mirror: post.mirror ? { ok: Boolean(post.mirror.ok), mirrored: post.mirror.mirrored ?? null } : null,
@@ -910,8 +918,6 @@ export function revertPayload({
   if (!rev) return { ok: false, error: 'invalid_rev' }
   const before = readRule(dir, key)
   if (!before.ok) return { ok: false, error: before.error, detail: before.detail }
-  const ensured = ensureRuleRepo({ root: dir, git: git !== false, ...(exec ? { exec } : {}) })
-  if (!ensured.ok) return { ok: false, error: 'ensure_failed', detail: ensured.error }
   const reverted = revertRule({
     root: dir,
     key,
@@ -919,7 +925,7 @@ export function revertPayload({
     identity: body?.identity,
     traceId: textOf(body?.traceId),
     now,
-  }, { git, exec })
+  }, { git, exec, gitRequired: guard.required })
   if (!reverted.ok) {
     return {
       ok: false,
@@ -958,6 +964,7 @@ export function revertPayload({
     rule: ruleView(reverted.rule),
     commit: textOf(reverted.commit?.message),
     commitInfo: reverted.commit,
+    commitState: reverted.commitState ?? null,
     version: reverted.version,
     previousVersion: reverted.previousVersion,
     mirror: post.mirror ? { ok: Boolean(post.mirror.ok), mirrored: post.mirror.mirrored ?? null } : null,
@@ -1030,7 +1037,7 @@ export function createPayload({
     identity,
     traceId: textOf(body?.traceId),
     now,
-  }, { git, exec })
+  }, { git, exec, gitRequired: guard.required })
   if (!created.ok) {
     return { ok: false, error: textOf(created.error) || 'invalid_rule', detail: created.detail }
   }
@@ -1065,6 +1072,7 @@ export function createPayload({
     // 与 update/revert 契约一致：`commit` 是提交消息字符串，结构化细节在 commitInfo。
     commit: textOf(created.commit?.message),
     commitInfo: created.commit,
+    commitState: created.commitState ?? null,
     version: Number(created.version) || 1,
     ...postView(post),
     audit: { ok: audit.ok, ...(audit.ok ? {} : { error: audit.error }) },
@@ -1108,17 +1116,16 @@ export function deletePayload({
   // 超长、带 HTML 注释标记）仍必须能删，否则脏文件永远删不掉。停用/恢复仍走全量校验。
   const before = mode === 'purge' ? readRuleForPurge(dir, key) : readRule(dir, key)
   if (!before.ok) return { ok: false, error: before.error, detail: before.detail }
-  // 与 update 同口径：首次写前建好规则仓/首个 commit（新目录否则提交不上）。
-  const ensured = ensureRuleRepo({ root: dir, git: git !== false, ...(exec ? { exec } : {}) })
-  if (!ensured.ok) return { ok: false, error: 'ensure_failed', detail: ensured.error }
+  // 建仓由 store 写入口自己负责（purgeRule/updateRule 均 ensure），路由只做闸门与后处理。
   if (mode === 'purge') {
     return purgePayload({
       dir, key, config, backend, before, body, mirror, renderAgents, git, exec, log, now,
+      gitRequired: guard.required,
     })
   }
   const changed = mode === 'retire'
-    ? retireRule({ root: dir, key, identity: identityOf(body), traceId: textOf(body?.traceId), now }, { git, exec })
-    : reactivateRule({ root: dir, key, identity: identityOf(body), traceId: textOf(body?.traceId), now }, { git, exec })
+    ? retireRule({ root: dir, key, identity: identityOf(body), traceId: textOf(body?.traceId), now }, { git, exec, gitRequired: guard.required })
+    : reactivateRule({ root: dir, key, identity: identityOf(body), traceId: textOf(body?.traceId), now }, { git, exec, gitRequired: guard.required })
   if (!changed.ok) {
     return { ok: false, error: changed.error, detail: changed.detail, status: textOf(changed.status) }
   }
@@ -1152,6 +1159,7 @@ export function deletePayload({
     rule: ruleView(changed.rule),
     commit: textOf(changed.commit?.message),
     commitInfo: changed.commit,
+    commitState: changed.commitState ?? null,
     version: changed.version,
     previousVersion: changed.previousVersion,
     ...postView(post),
@@ -1208,12 +1216,12 @@ function readRuleForPurge(dir, key) {
  * @returns {object}
  */
 function purgePayload({
-  dir, key, config, backend, before, body, mirror, renderAgents, git, exec, log, now,
+  dir, key, config, backend, before, body, mirror, renderAgents, git, exec, log, now, gitRequired = false,
 }) {
   // purge 是删除不是写入：不跑正文守卫（手改写坏的规则也必须删得掉），只做宽松解析。
   let purged = purgeRule({
     root: dir, key, identity: identityOf(body), traceId: textOf(body?.traceId), now,
-  }, { git, exec, skipValidation: true })
+  }, { git, exec, skipValidation: true, gitRequired })
   if (!purged.ok) return { ok: false, error: purged.error, detail: purged.detail }
   const post = applyPostSteps({ dir, config, backend, mirror, renderAgents, log })
   const manifest = readManifest(dir) || {}
@@ -1330,7 +1338,7 @@ export function importLegacyPayload({
   const guard = writeGuard(config, detect)
   if (!guard.ok) return { ok: false, error: guard.error, git: guard.git }
   const dir = root || resolveRulesRoot(config)
-  const imported = importLegacyRule({ backend, key, number, root: dir })
+  const imported = importLegacyRule({ backend, key, number, root: dir, gitRequired: guard.required })
   if (!imported.ok) return imported
   let mirror = null
   if (config?.rules?.mirrorAuto !== false && imported.skipped === false) {

@@ -13,11 +13,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as nodeFs from 'node:fs'
 import { execFileSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import {
   createRule, fileRuleNumbers, listRules, occupancy, purgeRule, readManifest, readRule, regenerateManifest,
-  readTombstones, recoverPendingTxn, writeRule, writeTombstone, writeTxn, validateRule, TXN_DIR,
+  readTombstones, recoverPendingTxn, updateRule, writeRule, writeTombstone, writeTxn, validateRule, TXN_DIR,
 } from '../../src/core/rule-store.js'
 import { createProposal } from '../../src/core/rule-proposal.js'
+import { seedDefaultRules } from '../../src/core/rule-defaults.js'
 
 function freshRoot(t) {
   const root = mkdtempSync(join(tmpdir(), 'whale-r9-store-'))
@@ -317,4 +319,121 @@ test('R9-21：坏事务日志不得静默清除，failed=true 且文件保留', 
   const out = recoverPendingTxn(root, { log: () => {} })
   assert.equal(out.failed, true)
   assert.equal(existsSync(join(txnDir, 'broken.json')), true, '无法证明安全时必须保留锚点')
+})
+
+
+// ---------------------------------------------------------------------------
+// R9-05：commitState 三态 + requireGit 闸门下沉到 store 写入口
+// ---------------------------------------------------------------------------
+
+/** 缺 git 的 exec：任何命令都按 ENOENT 抛（模拟空机/无 git 的机器）。 */
+function missingGitExec() {
+  const err = new Error('spawn git ENOENT')
+  err.code = 'ENOENT'
+  throw err
+}
+
+test('R9-05：requireGit 缺 git 时 create/writeRule 拒写且零落盘（闸门先于建仓/锁）', (t) => {
+  const root = freshRoot(t)
+  const created = createRule(
+    { root, draft: { type: 'iron-rule', text: '必须先验证再覆盖正式库。' } },
+    { gitRequired: true, exec: missingGitExec },
+  )
+  assert.equal(created.ok, false)
+  assert.equal(created.error, 'git_required')
+  assert.equal(created.detail.reason, 'git_unavailable')
+  assert.equal(readdirSync(root).length, 0, '闸门拒写时不得建目录/锁/manifest 等任何产物')
+
+  const written = writeRule(
+    root,
+    { front: ironFront(1), text: '必须保留审计日志。' },
+    { gitRequired: true, exec: missingGitExec },
+  )
+  assert.equal(written.ok, false)
+  assert.equal(written.error, 'git_required')
+  assert.equal(existsSync(join(root, 'iron-rule-1.md')), false)
+  assert.equal(existsSync(join(root, '.locks')), false, '闸门必须早于拿锁：.locks 也不许建')
+})
+
+test('R9-05：requireGit 缺 git 时 update/purge 也拒写——正文与墓碑都不动', (t) => {
+  const root = freshRoot(t)
+  const made = writeRule(root, { front: ironFront(1), text: '必须保留审计日志。' }, { git: false })
+  assert.equal(made.ok, true, made.error)
+
+  const updated = updateRule(
+    { root, key: 'iron-rule-1', patch: { text: '必须改成新正文。' }, now: Date.parse('2026-11-23T00:00:00Z') },
+    { git: false, gitRequired: true, exec: missingGitExec },
+  )
+  assert.equal(updated.ok, false)
+  assert.equal(updated.error, 'git_required')
+  assert.equal(readRule(root, 'iron-rule-1').rule.text, '必须保留审计日志。')
+
+  const purged = purgeRule(
+    { root, key: 'iron-rule-1', now: Date.parse('2026-11-23T00:00:00Z') },
+    { git: false, gitRequired: true, exec: missingGitExec },
+  )
+  assert.equal(purged.ok, false)
+  assert.equal(purged.error, 'git_required')
+  assert.equal(existsSync(join(root, 'iron-rule-1.md')), true, '缺 git 时一条规则都不许被删')
+  assert.deepEqual(readTombstones(root), [], '缺 git 时不许写墓碑')
+})
+
+test('R9-05：requireGit=true 且 git 可用 → 照常写，commitState=committed', (t) => {
+  const root = freshRoot(t)
+  const created = createRule(
+    { root, draft: { type: 'iron-rule', text: '必须先验证再覆盖正式库。' } },
+    { gitRequired: true },
+  )
+  assert.equal(created.ok, true, created.error)
+  assert.equal(created.commitState, 'committed')
+  assert.equal(created.commit.committed, true)
+})
+
+test('R9-05：git:false → degrade 三态=degraded；非降级提交失败 → failed', (t) => {
+  const root = freshRoot(t)
+  const created = createRule({ root, draft: { type: 'iron-rule', text: '必须先验证再覆盖正式库。' } }, { git: false })
+  assert.equal(created.ok, true, created.error)
+  assert.equal(created.commitState, 'degraded', 'git 关闭=文件已写但无版本记录')
+
+  const badExec = (cmd, args, opts) => {
+    if (/(^| )commit( |$)/.test(args.join(' '))) {
+      const err = new Error('fatal: commit denied')
+      err.stderr = 'fatal: commit denied'
+      throw err
+    }
+    return execFileSync(cmd, args, opts)
+  }
+  const failed = writeRule(
+    root,
+    { front: ironFront(2), text: '必须替换成第二版正文。' },
+    { exec: badExec },
+  )
+  assert.equal(failed.ok, false)
+  assert.equal(failed.error, 'commit_failed')
+  assert.equal(failed.commitState, 'failed')
+})
+
+test('R9-05：无写入（patch 未改变内容）commitState=null，不谎报 committed/degraded', (t) => {
+  const root = freshRoot(t)
+  assert.equal(writeRule(root, { front: ironFront(1), text: '必须保留审计日志。' }, { git: false }).ok, true)
+  const same = updateRule(
+    { root, key: 'iron-rule-1', patch: { text: '必须保留审计日志。' }, now: Date.parse('2026-11-23T00:00:00Z') },
+    { git: false },
+  )
+  assert.equal(same.ok, true)
+  assert.equal(same.changed, false)
+  assert.equal(same.commitState, null)
+})
+
+test('R9-05：播种是写入口——requireGit 缺 git 时不播规则、不写 marker', (t) => {
+  const root = freshRoot(t)
+  const defaultsDir = fileURLToPath(new URL('../../defaults/rules', import.meta.url))
+  const seeded = seedDefaultRules(
+    { root, defaultsDir },
+    { gitRequired: true, git: true, exec: missingGitExec },
+  )
+  assert.equal(seeded.ok, false)
+  assert.equal(seeded.error, 'git_required')
+  assert.equal(existsSync(join(root, '.seeded.json')), false, '缺 git 时不许写「已播种」假状态')
+  assert.deepEqual(readdirSync(root), [], '缺 git 时不播任何文件')
 })
