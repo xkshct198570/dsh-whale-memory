@@ -22,6 +22,8 @@ import {
   proposalNonce,
   rejectProposal,
   resetSessionPending,
+  SESSION_PENDING_TTL_MS,
+  getSessionPending,
   setSessionPending,
 } from '../../src/core/rule-proposal.js'
 import { buildApplyPlan } from '../../src/core/rule-plan.js'
@@ -194,7 +196,7 @@ test('createProposal：同 hash 在冷却期内 → cooling:true（仍可面板�
   assert.match(log, /"hash"/)
 })
 
-test('createProposal：超过 maxProposals 时最旧 pending 标 expired（不删文件）', (t) => {
+test('createProposal：超过 maxProposals 时最旧 pending 标 expired 并归档（不删证据）', (t) => {
   const root = freshRoot(t)
   const cfg = { rules: { maxProposals: 2 } }
   const a = createProposal({ text: '以后都别删源文件', identity: IDENTITY, rulesDir: root, config: cfg, now: 1000 })
@@ -206,7 +208,10 @@ test('createProposal：超过 maxProposals 时最旧 pending 标 expired（不�
   assert.equal(c.expired.includes(a.proposal.id), true, JSON.stringify(c.expired))
   const list = listProposals({ rulesDir: root, status: 'pending' })
   assert.equal(list.proposals.length, 2)
-  assert.equal(existsSync(join(root, 'proposals', `${a.proposal.id}.json`)), true, '只改状态，不删证据')
+  // R9-14 改语义：过期候选从主目录移到 archive/（状态 expired 仍落盘，证据不删）。
+  // 原因：主目录无限堆积会让每次候选扫描越来越慢，也挤占面板「待确认」视野。
+  assert.equal(existsSync(join(root, 'proposals', `${a.proposal.id}.json`)), false, '过期候选应退出主扫描目录')
+  assert.equal(existsSync(join(root, 'proposals', 'archive', `${a.proposal.id}.json`)), true, '证据必须留在 archive/')
 })
 
 test('listProposals/readProposal：status 过滤与非法 id 不越界', (t) => {
@@ -839,4 +844,60 @@ test('applyProposal：预览后目标编号被 purge 作废 → 锁内复核拒�
   assert.equal(got.status, 'needs_manual')
   assert.equal(ruleFiles(root).length, 0, '墓碑号不得落盘')
   assert.equal(jsonFile(root, `${made.proposal.id}.json`).status, 'needs_manual')
+})
+
+test('R9-14：会话 pending 用绝对 expAt——时钟回拨不冻结 TTL，到点即过期', () => {
+  resetSessionPending()
+  const id = 'p1795408837317_7dd185e7'
+  assert.equal(setSessionPending('s-clock', id, 100_000), true)
+  assert.equal(getSessionPending('s-clock', 100_001)?.proposalId, id)
+  // 回拨：now 远小于 at。旧实现 now-at 变负 → 永远不过期；绝对 expAt 只到原到期点。
+  assert.equal(getSessionPending('s-clock', 50_000)?.proposalId, id, '时钟回拨不得让 pending 提前消失')
+  assert.equal(getSessionPending('s-clock', 100_000 + SESSION_PENDING_TTL_MS), null, 'now>=expAt 即过期')
+  resetSessionPending()
+})
+
+test('R9-14：rejected.jsonl 裁剪——180 天外且非最近 200 条被裁，冷却记录保留', (t) => {
+  const root = freshRoot(t)
+  const made = createProposal({ text: '以后都别删源文件', identity: IDENTITY, rulesDir: root, config: { rules: {} } })
+  assert.equal(made.ok, true)
+  const file = join(root, 'proposals', '.rejected.jsonl')
+  const day = 24 * 3600 * 1000
+  const stale = Array.from({ length: 250 }, (_, i) => ({ hash: `stale${i}`, ts: 1000, expiresAt: 1000 + day }))
+  writeFileSync(file, `${stale.map((item) => JSON.stringify(item)).join('\n')}\n`, 'utf8')
+
+  const rejected = rejectProposal({ id: made.proposal.id, reason: '测试裁剪', rulesDir: root, config: { rules: {} } })
+  assert.equal(rejected.ok, true)
+  const lines = readFileSync(file, 'utf8').split('\n').filter(Boolean)
+  assert.ok(lines.length <= 201, `裁剪后仍留 ${lines.length} 行（应 ≈ 最近 200 + 本次）`)
+  const hashes = lines.map((line) => JSON.parse(line).hash)
+  assert.equal(hashes.includes('stale0'), false, '最旧记录必须被裁掉')
+  assert.equal(hashes.includes(made.proposal.hash), true, '本次拒绝记录不得被裁')
+})
+
+test('R9-14：审计 beforeText 取锁内旧正文（refine 不记成新建）', async (t) => {
+  const root = freshRoot(t)
+  seed(root, { type: 'iron-rule', number: 5, exceptions: ['用户原件'] }, '源文件必须保留。')
+  const oldText = readRule(root, 'rule-src-keep').rule.text
+  const made = createProposal({
+    text: '按 rule:rule-src-keep 记成铁律：源文件必须保留，例外：用户原件',
+    identity: IDENTITY,
+    rulesDir: root,
+    config: { rules: {} },
+  })
+  assert.equal(made.proposal.relation.relation, 'refine')
+  const backend = fakeBackend()
+  const result = await applyProposal({
+    id: made.proposal.id,
+    rulesDir: root,
+    config: { rules: {} },
+    git: false,
+    backend,
+    decisions: { text: '源文件必须保留，例外：用户原件。' },
+  })
+  assert.equal(result.ok, true, JSON.stringify({ err: result.error, failures: result.failures }))
+  const writesRun = backend.calls.find((call) => call.kind === 'run' && /INSERT INTO writes/.test(call.sql))
+  assert.ok(writesRun, '必须写 writes 审计')
+  // 列序：ts,trace_id,action,node_id,reason,before_text,after_text,… → before_text = args[5]
+  assert.equal(writesRun.args[5], oldText, 'beforeText 必须是磁盘旧正文，不是空串')
 })

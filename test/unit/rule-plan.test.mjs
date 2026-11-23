@@ -328,3 +328,18 @@ test('buildApplyPlan：机器起草 iron-rule 的 target key/path 由最终编�
   assert.equal(target.key, plan.target.key)
   assert.match(target.path, new RegExp(`/iron-rule-${plan.target.number}\\.md$`))
 })
+
+test('R9-14：planHash 不含日期派生字段——隔夜重算同指纹', (t) => {
+  const root = freshRoot(t)
+  const made = createProposal({ text: '以后都别删源文件', identity: IDENTITY, rulesDir: root, config: { rules: {} } })
+  assert.equal(made.ok, true, made.code)
+  const day1 = Date.UTC(2026, 10, 23, 2, 0, 0)
+  const day3 = Date.UTC(2026, 10, 25, 2, 0, 0)
+  const a = buildApplyPlan({ proposal: made.proposal, rulesDir: root, config: { rules: {} }, decisions: {}, now: day1 })
+  const b = buildApplyPlan({ proposal: made.proposal, rulesDir: root, config: { rules: {} }, decisions: {}, now: day3 })
+  assert.equal(a.ok, true, JSON.stringify(a))
+  assert.equal(b.ok, true, JSON.stringify(b))
+  // 前提：日期派生字段确实变了（否则这个用例证明不了散列排除了它们）。
+  assert.notEqual(a.plan.target.front.updated, b.plan.target.front.updated)
+  assert.equal(b.plan.planHash, a.plan.planHash, '隔夜重算必须是同一指纹（否则面板 planHash 永远对不上）')
+})

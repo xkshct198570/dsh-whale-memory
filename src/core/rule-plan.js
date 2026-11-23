@@ -170,7 +170,11 @@ function hashPlanOf(plan) {
     key: file.key,
     path: file.path,
     oldHash: file.oldHash,
-    newHash: sha256(file.newText),
+    // 新内容指纹必须**排除日期派生字段**（created/updated 由 now 派生）：否则隔夜重算同一份计划
+    // 会得到不同 hash，面板预览与 apply 永远对不上。语义=front（去日期）+ 正文。
+    newHash: file.front && typeof file.front === 'object'
+      ? sha256(`${JSON.stringify({ ...file.front, created: '', updated: '' })}\n${textOf(file.text)}`)
+      : sha256(file.newText),
     guards: (Array.isArray(file.guards) ? file.guards : []).map((guard) => [guard.code, guard.ok]),
   }))
   const affected = (Array.isArray(plan.affected) ? plan.affected : []).map((item) => ({
@@ -179,10 +183,13 @@ function hashPlanOf(plan) {
     newHash: sha256(item.newText),
     status: item.status,
   }))
+  // 只散列「执行真正依赖」的字段（R9-14）：target 里带 created/updated/dayOf(now) 这类日期派生值，
+  // 把整个 target 塞进来会让同一份计划隔夜变成不同指纹（面板 hash 对不上、apply 误报 plan_hash_mismatch）。
+  const target = plan.target && typeof plan.target === 'object' ? plan.target : {}
   return sha256(JSON.stringify({
     proposalId: plan.proposalId,
     relation: plan.relation,
-    target: plan.target,
+    target: { key: target.key, type: target.type, number: target.number, version: target.version },
     files,
     affected,
     commitMessage: plan.commitMessage,
@@ -207,6 +214,7 @@ function guardEntry(code, ok, detail = '') {
  */
 export function buildApplyPlan({
   proposal, rulesDir, config = {}, decisions = {}, now = Date.now(), log = () => {}, exec = null,
+  listed = null,
 } = {}) {
   void exec // 契约占位：本函数不跑 git
   const base = rootOf(rulesDir, config)
@@ -220,7 +228,9 @@ export function buildApplyPlan({
   // 磁盘真源：只与 active 正式规则比对（superseded/candidate 不是落盘目标）。
   // 全量规则（含 retired/superseded）：它们仍占号——只按 active 算 nextNumber 会在停用/取代
   // 最高号后把该号重新发出去，写盘时撞 duplicate_number（R8-01 不变式）。
-  const allRules = listRules(base).rules
+  // 快照可复用（R9-14）：apply 锁内已经读过一次 listRules，再内部扫一遍就是重复 I/O；
+  // 调用方不给时仍然自己读（面板 plan 预览/单测路径不变）。
+  const allRules = Array.isArray(listed) ? listed : listRules(base).rules
   const currentRules = allRules.filter((doc) => trimmed(doc.front.status) === 'active'
     && trimmed(doc.front.type) !== 'rule-candidate')
   const byKey = new Map(currentRules.map((doc) => [trimmed(doc.front.key), doc]))
@@ -472,6 +482,9 @@ export function buildApplyPlan({
     path: existingTarget?.file || join(base, `${targetKey}.md`),
     role: 'target',
     oldText: targetOldText,
+    // oldBody = 磁盘上的旧**正文**（不含 front）；oldText 是整文件、给回滚还原用。
+    // 审计/差异展示要的是正文，两者不能混用（R9-14）。
+    oldBody: existingTarget ? textOf(existingTarget.text) : '',
     oldHash: targetOldText === null ? null : sha256(targetOldText),
     newText: targetSerialized.text,
     front: targetNormalized.front,

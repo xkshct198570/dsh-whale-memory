@@ -19,7 +19,7 @@
  * 守卫、编号、commit、镜像、审计五件事一次全做或全不做。
  */
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { dedupeKey, detectSignals } from './rules.js'
 import {
@@ -53,6 +53,11 @@ import { mirrorRules } from './rule-mirror.js'
 const PROPOSAL_ID_RE = /^p[0-9]{3,19}_[a-z0-9]{4,16}$/
 /** 冷却日志文件名（生成物；`proposals/` 下唯一以点开头的文件）。 */
 export const REJECTED_FILE = '.rejected.jsonl'
+/** 冷却日志保留口径（R9-14）：180 天内或最近 200 条，取并集；日志不得无限增长。 */
+export const REJECTED_KEEP_DAYS = 180
+export const REJECTED_KEEP_LAST = 200
+/** 过期候选归档目录（proposals/archive/）：移出主扫描范围，但保留裁定证据。 */
+export const PROPOSALS_ARCHIVE_DIR = 'archive'
 /** 会话候选映射 TTL：用户隔了半小时才回「确认」就不要再猜是哪条。 */
 export const SESSION_PENDING_TTL_MS = 30 * 60 * 1000
 /** 需要措辞改写（不能直接落盘）的关系。 */
@@ -222,9 +227,33 @@ function readRejected(dir) {
   return entries
 }
 
-/** 追加一行冷却记录（原子重写：jsonl 被并发截断会让冷却整体失效）。 */
-function appendRejected(dir, entry) {
-  const entries = [...readRejected(dir), entry]
+/**
+ * 冷却日志裁剪（R9-14）：保留「180 天内」与「最近 200 条」的并集，避免 jsonl 无限增长。
+ *
+ * 为什么取并集而不是只按时间：冷却窗口内必须留着（否则同一句可被反复提案），
+ * 而历史裁定证据也要留最近一批供面板/审计回看；两条判据各自独立。
+ *
+ * @param {Array<object>} entries @param {number} now
+ * @returns {Array<object>}
+ */
+function pruneRejected(entries, now) {
+  const list = Array.isArray(entries) ? entries : []
+  if (!list.length) return []
+  const nowMs = Number.isFinite(Number(now)) ? Number(now) : Date.now()
+  const cutoff = nowMs - REJECTED_KEEP_DAYS * 24 * 3600 * 1000
+  const recentStart = Math.max(0, list.length - REJECTED_KEEP_LAST)
+  return list.filter((item, index) => {
+    if (index >= recentStart) return true
+    const expiresAt = Number.isFinite(Number(item?.expiresAt))
+      ? Number(item.expiresAt)
+      : (Number.isFinite(Number(item?.ts)) ? Number(item.ts) + REJECTED_KEEP_DAYS * 24 * 3600 * 1000 : NaN)
+    return Number.isFinite(expiresAt) && expiresAt >= cutoff
+  })
+}
+
+/** 追加一行冷却记录（原子重写 + 裁剪：jsonl 被并发截断会让冷却整体失效）。 */
+function appendRejected(dir, entry, now = Date.now()) {
+  const entries = pruneRejected([...readRejected(dir), entry], now)
   const lines = entries.map((item) => JSON.stringify(item)).join('\n')
   return atomicWriteFile(join(dir, REJECTED_FILE), `${lines}\n`)
 }
@@ -439,18 +468,50 @@ function mkdirIfNeeded(dir) {
  */
 export function enforceProposalCap({ rulesDir, config = {}, now = Date.now(), log = () => {} } = {}) {
   const max = Math.max(1, cfgNum(config?.rules?.maxProposals, 20))
-  const { proposals } = listProposals({ rulesDir, config, status: 'pending,needs_manual' })
+  const { proposals, dir } = listProposals({ rulesDir, config, status: 'pending,needs_manual' })
   if (proposals.length <= max) return []
   const keep = new Set(proposals.slice(0, max).map((item) => item.id))
   const expired = []
   for (const item of proposals) {
     if (keep.has(item.id)) continue
+    const file = item.file || join(dir, `${item.id}.json`)
     const next = { ...item, status: 'expired', updated: isoNow(now) }
-    const written = writeProposalFile(item.file || join(proposalsDirOf(rulesDir, config), `${item.id}.json`), next)
+    const written = writeProposalFile(file, next)
     if (written.ok) expired.push(item.id)
   }
-  if (expired.length) log(`[whale-memory] proposals cap=${max} expired=${expired.length}`)
+  if (!expired.length) return []
+  // 归档（R9-14）：expired 候选移出主目录，只改状态不够——listProposals 每次全扫主目录，
+  // 过期项无限堆积会让候选扫描越跑越慢，也会挤占面板「待确认」视野。
+  archiveExpiredProposals(dir, expired, log)
+  log(`[whale-memory] proposals cap=${max} expired=${expired.length}`)
   return expired
+}
+
+/**
+ * 把过期候选从 `proposals/*.json` 移到 `proposals/archive/`：保留裁定证据但退出主扫描范围。
+ *
+ * 失败只记日志不回滚（过期是状态事实，归档是卫生动作）：rename 失败时留主目录，
+ * 下次会再试；不删文件、不改状态。
+ *
+ * @param {string} dir proposals 目录 @param {string[]} ids 已标 expired 的候选 id
+ * @param {Function} log
+ */
+function archiveExpiredProposals(dir, ids, log) {
+  const archiveDir = join(dir, PROPOSALS_ARCHIVE_DIR)
+  try { mkdirSync(archiveDir, { recursive: true }) } catch (err) {
+    log(`[whale-memory] proposals archive mkdir failed: ${err?.message || err}`)
+    return
+  }
+  for (const id of ids) {
+    const from = join(dir, `${id}.json`)
+    const to = join(archiveDir, `${id}.json`)
+    if (!existsSync(from)) continue
+    try {
+      renameSync(from, to)
+    } catch (err) {
+      log(`[whale-memory] proposals archive rename failed id=${id} code=${err?.code || err?.message || err}`)
+    }
+  }
 }
 
 /**
@@ -481,7 +542,7 @@ export function rejectProposal({ id, reason = '', identity = {}, rulesDir, confi
   try {
     mkdirIfNeeded(dir)
   } catch { /* 冷却写失败不阻止状态更新；面板仍能看到 rejected */ }
-  const logged = appendRejected(dir, entry)
+  const logged = appendRejected(dir, entry, now)
   const next = {
     ...proposal,
     status: 'rejected',
@@ -502,21 +563,27 @@ export function rejectProposal({ id, reason = '', identity = {}, rulesDir, confi
 export function setSessionPending(sessionId, proposalId, now = Date.now()) {
   const sid = trimmed(sessionId)
   if (!sid || !PROPOSAL_ID_RE.test(trimmed(proposalId))) return false
-  sessionPending.set(sid, { proposalId: trimmed(proposalId), at: now })
+  const at = Number.isFinite(Number(now)) ? Number(now) : Date.now()
+  // 绝对到期时间（R9-14）：时钟回拨时 `now - at` 会变负、TTL 被永久冻结；落 expAt 只延长到原点。
+  sessionPending.set(sid, { proposalId: trimmed(proposalId), at, expAt: at + SESSION_PENDING_TTL_MS })
   return true
 }
 
-/** @returns {{proposalId:string, at:number}|null} */
+/** @returns {{proposalId:string, at:number, expAt:number}|null} */
 export function getSessionPending(sessionId, now = Date.now()) {
   const sid = trimmed(sessionId)
   if (!sid) return null
   const entry = sessionPending.get(sid)
   if (!entry) return null
-  if (now - Number(entry.at) > SESSION_PENDING_TTL_MS) {
+  const nowMs = Number.isFinite(Number(now)) ? Number(now) : Date.now()
+  const at = Number(entry.at) || 0
+  // 兼容旧内存形状（只有 at）：缺失 expAt 时按 at+TTL 推导，不因升级丢 pending。
+  const expAt = Number.isFinite(Number(entry.expAt)) ? Number(entry.expAt) : at + SESSION_PENDING_TTL_MS
+  if (nowMs >= expAt) {
     sessionPending.delete(sid)
     return null
   }
-  return entry
+  return { proposalId: entry.proposalId, at, expAt }
 }
 
 export function clearSessionPending(sessionId) {
@@ -913,10 +980,6 @@ export async function applyProposal({
   if (!gate.ok) {
     return { ok: false, error: 'git_required', code: 'git_required', proposal, detail: gate.detail }
   }
-  // 规则仓就绪：ensureRuleRepo 顺带给出 git 可用性，供 commit/降级判定（本模块不 import host 探测）。
-  const ensured = ensureRuleRepo({ root: base, git: git !== false, ...(exec ? { exec } : {}) })
-  if (!ensured.ok) return { ok: false, error: 'ensure_failed', code: 'ensure_failed', detail: ensured.error }
-  const gitAvailable = git !== false && ensured.git?.available === true
 
   // 1) 措辞改写：面板 decisions.text/affected 优先；需要改写又没给 → rules.llm 问模型，否则转面板。
   //    模型输出只当**候选措辞**：它和面板输入一样只能进 decisions，随后由 plan 逐文件守卫。
@@ -1028,8 +1091,16 @@ export async function applyProposal({
     }
     // 编号/墓碑/oldHash 必须在**锁内**重算：锁外的 plan 可能已被另一笔 apply/purge 改掉
     // （两提案同抢一个号 → 第二笔会撞号 write_failed；plan 后 purge 目标号 → 会复用墓碑号）。
+    // 仓就绪/ git 可用性必须**锁内**判定（R9-14）：锁外 ensure 会在两道闸之间留下 TOCTOU 窗口，
+    // 且 ensure 自身会重建 manifest——两个写者在锁外各 ensure 一次就是两次半写风险。
+    const ensured = ensureRuleRepo({ root: base, git: git !== false, ...(exec ? { exec } : {}) })
+    if (!ensured.ok) return { ok: false, code: 'ensure_failed', error: 'ensure_failed', detail: ensured.error }
+    const gitAvailable = git !== false && ensured.git?.available === true
+    // 同一快照既用于 plan、也用于后面 postRules 之外的判定：一次 listRules，不重复扫盘。
+    const listedSnapshot = listRules(base).rules
     const rebuilt = buildApplyPlan({
       proposal: fresh.proposal, rulesDir: base, config, decisions: decided, now, log, exec,
+      listed: listedSnapshot,
     })
     if (!rebuilt.ok) {
       if (rebuilt.code === 'proposal_corrupt') return { ok: false, code: 'proposal_corrupt' }
@@ -1083,7 +1154,11 @@ export async function applyProposal({
       }
       const next = { ...fresh.proposal, status: 'accepted', updated: isoNow(now), applied }
       writeProposalFile(next.file || join(proposalsDirOf(base, config), `${next.id}.json`), next)
-      return { ok: true, duplicate: true, applied, proposal: next, commit: null, affectedChanges: [] }
+      return {
+        ok: true, duplicate: true, applied, proposal: next, commit: null, affectedChanges: [],
+        commitState: null,
+        beforeText: textOf(plan.affected[0]?.oldText), afterText: textOf(plan.affected[0]?.newText),
+      }
     }
 
     // 事务日志是崩溃恢复锚点：写不进去就不许落盘（否则崩溃后没法按 oldText 回滚）。
@@ -1149,6 +1224,9 @@ export async function applyProposal({
     clearTxnSafe(base, txnId)
 
     const targetFile = written.find((item) => item.key === plan.target.key) || written[0] || { path: '' }
+    // 审计的 beforeText 必须取**锁内 plan 的真实旧正文**（R9-14）：新建目标 oldText=空串，
+    // refine/merge 目标是磁盘上的旧正文；用空串冒充「原规则不存在」会把改写记成新建。
+    const targetPlanFile = plan.files.find((item) => item.key === plan.target.key) || null
     const affectedChanges = plan.affected
       .filter((item) => item.key !== plan.target.key)
       .map((item) => ({ key: item.key, before: item.oldText, after: item.newText, status: item.status }))
@@ -1173,6 +1251,8 @@ export async function applyProposal({
     return {
       ok: true, applied, proposal: next, commit, affectedChanges,
       commitState: ruleCommitState(commit, { git: gitAvailable ? true : false }),
+      beforeText: targetPlanFile ? textOf(targetPlanFile.oldBody) : '',
+      afterText: textOf(plan.target.text),
     }
   }
 
@@ -1241,8 +1321,8 @@ export async function applyProposal({
     proposal,
     relation,
     target: { key: outcome.applied.key, number: outcome.applied.number },
-    beforeText: outcome.duplicate ? textOf(plan.affected[0]?.oldText) : '',
-    afterText: outcome.duplicate ? textOf(plan.affected[0]?.newText) : textOf(plan.target.text),
+    beforeText: textOf(outcome.beforeText),
+    afterText: textOf(outcome.afterText),
     affectedChanges: outcome.affectedChanges || [],
     commit: outcome.commit,
     mirrorResult,
