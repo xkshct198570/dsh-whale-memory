@@ -127,7 +127,9 @@ test('页根键盘：PageUp/PageDown/Home/End，输入控件不接管', () => {
 test('切页签恢复 scrollTop（±8px），筛选变化归零', () => {
   const panel = panelSource()
   assert.match(panel, /scrollPos\.current\[tab\] = node\.scrollTop/, '切页签前未保存位置')
-  assert.match(panel, /node\.scrollTop = typeof saved === 'number' \? saved : 0/, '切回页签未恢复位置')
+  // R9-07 真机修正：恢复改为「pendingRestore + 每次渲染尝试」，因为异步面板首帧高度不足会夹到 0。
+  assert.match(panel, /pendingRestore\.current = next === tab \? 0 : \(scrollPos\.current\[next\] \|\| 0\)/, '切页签未置待恢复目标')
+  assert.match(panel, /node\.scrollTop = typeof target === 'number' \? target : 0/, '切回页签未恢复位置')
   assert.match(panel, /onScrollReset: resetScroll/, '未把滚动归零回调下发到页签视图')
   assert.ok(panel.includes('onClick: () => switchTab(key)'), '页签按钮未走保存位置的 switchTab')
   for (const [name, view] of [['RulesView', rulesView()], ['RecallTab', recallView()], ['MemoryTab', memoryView()]]) {
@@ -155,4 +157,20 @@ test('虚拟化只留阈值与判据，不提前引组件', () => {
   assert.match(table, /判据/, '缺虚拟化判据')
   assert.ok(table.includes('不做窗口化'), '未写明当前不做虚拟化')
   assert.doesNotMatch(table, /virtual|Virtual/i, '提前引入了虚拟化实现')
+})
+
+test('R9-07 真机修正：切回页签时异步面板高度未就绪 → 每次渲染补写 scrollTop，不丢位置', () => {
+  const panel = CLIENT.slice(CLIENT.indexOf('function Panel('), CLIENT.indexOf('function Overview('))
+  assert.match(panel, /const pendingRestore = useRef\(0\)/, '缺少待恢复目标 ref')
+  assert.match(panel, /pendingRestore\.current = next === tab \? 0 :/, '切页签未置恢复目标')
+  assert.match(panel, /requestAnimationFrame\(tick\)/, '缺少按帧重试（子组件数据加载不触发父级重渲染）')
+  assert.match(panel, /Date\.now\(\) - startedAt > 1500/, '缺少 1.5s 放弃保护，防止无限挂起')
+  assert.match(panel, /if \(node\.scrollTop > 0\) \{ pendingRestore\.current = 0; return \}/, '恢复成功后未清目标')
+})
+
+test('R9-07 真机修正：页签 sticky 贴页根顶部（滚下去也能直接切，不被迫滚回顶部）', () => {
+  const css = CLIENT.slice(CLIENT.indexOf('      tabs: {'), CLIENT.indexOf('      tab: {'))
+  assert.match(css, /position: 'sticky'/, '页签未 sticky：滚动后不可达，切页签会丢位置')
+  assert.match(css, /top: 0/, '页签 sticky 未贴顶')
+  assert.match(css, /background: 'var\(--dsw-alias-bg-layer-1\)'/, '页签无背景，会透出滚过的内容')
 })
