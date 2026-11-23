@@ -165,7 +165,7 @@ test('R9-07 真机修正：切回页签时异步面板高度未就绪 → 每次
   assert.match(panel, /pendingRestore\.current = next === tab \? 0 :/, '切页签未置恢复目标')
   assert.match(panel, /requestAnimationFrame\(tick\)/, '缺少按帧重试（子组件数据加载不触发父级重渲染）')
   assert.match(panel, /Date\.now\(\) - startedAt > 1500/, '缺少 1.5s 放弃保护，防止无限挂起')
-  assert.match(panel, /if \(node\.scrollTop > 0\) \{ pendingRestore\.current = 0; return \}/, '恢复成功后未清目标')
+  assert.match(panel, /Math\.abs\(node\.scrollTop - target\) <= 2/, '恢复到位判据必须比目标值（不能拿 >0 当到位，窄屏会被夹到最大可滚值）')
 })
 
 test('R9-07 真机修正：页签 sticky 贴页根顶部（滚下去也能直接切，不被迫滚回顶部）', () => {
