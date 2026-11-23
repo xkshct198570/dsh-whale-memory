@@ -1311,7 +1311,10 @@ export async function applyProposal({
   const agentsFn = typeof renderAgents === 'function' ? renderAgents : renderAgentsDigest
   if (!outcome.duplicate && cfgBool(config?.rules?.renderAgents, true)) {
     try {
-      agentsResult = agentsFn({ rules: postRules, agentsPath: agentsPathOf(base), rulesDir: base, log })
+      agentsResult = agentsFn({
+        rules: postRules, agentsPath: agentsPathOf(base), rulesDir: base, log,
+        budgetChars: cfgNum(config?.rules?.summaryBudgetChars, 4000),
+      })
     } catch (err) {
       agentsResult = { ok: false, code: 'render_failed', error: String(err?.message || err) }
     }

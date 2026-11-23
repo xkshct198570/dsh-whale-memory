@@ -518,3 +518,15 @@ test('scopeMatches：win32 大小写/分隔符归一；posix 大小写敏感；�
   }
   assert.equal(scopeMatches(`workspace:${link}`, '', real), true, '软链与真实目录必须视为同一工作区')
 })
+
+test('R9-14：AGENTS 块陈旧 → 按无块处理，降级注入 global（避免全局规则零次出现）', (t) => {
+  const { rulesDir, agentsPath } = freshHome(t)
+  writeFileSync(agentsPath, `# A\n${RULES_BEGIN}\n${RULES_END}\n`, 'utf8')
+  seed(rulesDir, { key: 'rule-global', number: 1, scope: 'global', type: 'iron-rule', priority: 'P0' }, '必须让全局规则可见。')
+  const fresh = buildRulesPrefix({ identity: {}, rulesDir, config: cfgOf(rulesDir) })
+  assert.equal(fresh.keys.includes('rule-global'), false, '块新鲜时 global 走摘要，不重复注入')
+  const stale = buildRulesPrefix({ identity: {}, rulesDir, config: cfgOf(rulesDir), agentsStale: true })
+  assert.equal(stale.hasAgentsMarkers, false, '陈旧块必须按无块处理')
+  assert.equal(stale.mode, 'global')
+  assert.deepEqual(stale.keys, ['rule-global'])
+})

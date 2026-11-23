@@ -48,13 +48,23 @@ import { chainIssues, resolveChain } from '../core/rule-reconcile.js'
 import {
   applyProposal, createProposal, listProposals, readProposal, rejectProposal, setSessionPending,
 } from '../core/rule-proposal.js'
-import { agentsPathOf, renderAgentsDigest, titleOfRule } from '../core/rule-render.js'
+import { agentsBlockStale, agentsPathOf, renderAgentsDigest, rulesDigestContent, titleOfRule } from '../core/rule-render.js'
+import { lastInjection } from './inject-stats.js'
 
 /** 与 routes.js 同一个前缀；写死字面量避免 routes ↔ rules-routes 循环 import。 */
 export const RULES_PREFIX = '/whale-memory/api'
 
 function textOf(value) {
   return String(value ?? '')
+}
+
+/**
+ * 摘要总预算（码点）：`rules.summaryBudgetChars` 默认 4000；0/非法回落默认值（0 不是"无限"）。
+ * @param {any} config @returns {number}
+ */
+function summaryBudgetOf(config) {
+  const n = Number(value(config?.rules?.summaryBudgetChars, 4000))
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 4000
 }
 
 /** 配置 `rules.dir` 优先，空则 `$DSH_HOME/rules`。 */
@@ -390,10 +400,43 @@ export function rulesHealthPayload({ root = '', config = {}, detect = detectGit 
     if (last) lastRecovery = JSON.parse(last)
   } catch { /* 没有恢复记录 */ }
 
+  // 黄灯（非红）：不影响 ok，但必须让面板/交接看得到——这些是「规则静默消失」的预兆。
+  const warnings = []
+  try {
+    const digest = rulesDigestContent(list.rules, { dir, budgetChars: summaryBudgetOf(config) })
+    if (digest.skipped?.length) {
+      warnings.push({
+        code: 'summary_budget_skipped',
+        keys: digest.skipped.map((item) => item.key),
+        detail: `摘要预算 ${digest.budgetChars} 码点，${digest.skipped.length} 条规则未进 AGENTS`,
+      })
+    }
+  } catch { /* 摘要重算失败只影响黄灯，不影响健康判定 */ }
+  try {
+    const injected = lastInjection()
+    if (injected?.skipped?.length) {
+      warnings.push({
+        code: 'inject_skipped',
+        keys: injected.skipped.map((item) => item.key),
+        detail: `最近一次注入（mode=${injected.mode || '?'}）有 ${injected.skipped.length} 条规则因预算被跳过`,
+      })
+    }
+  } catch { /* 注入统计缺失=没有事实 */ }
+  try {
+    if (agentsBlockStale({ agentsPath: agentsPathOf(dir), rulesDir: dir })) {
+      warnings.push({
+        code: 'agents_block_stale',
+        file: agentsPathOf(dir),
+        detail: 'AGENTS 管理块旧于规则文件（renderAgents=false 或渲染失败）：hook 已降级注入 global',
+      })
+    }
+  } catch { /* mtime 读不到不算黄灯事实 */ }
+
   return {
     ok: failures.length === 0,
     dir,
     failures,
+    warnings,
     txns: { pending: pendingTxns, lastRecovery },
     counts: {
       rules: list.rules.length,
@@ -655,7 +698,10 @@ function applyPostSteps({ dir, config, backend, mirror, renderAgents, log }) {
   if (value(config?.rules?.renderAgents, true) !== false) {
     try {
       const agentsFn = typeof renderAgents === 'function' ? renderAgents : renderAgentsDigest
-      agentsResult = agentsFn({ rules: postRules, agentsPath: agentsPathOf(dir), rulesDir: dir, log })
+      agentsResult = agentsFn({
+        rules: postRules, agentsPath: agentsPathOf(dir), rulesDir: dir, log,
+        budgetChars: summaryBudgetOf(config),
+      })
     } catch (err) {
       agentsResult = { ok: false, code: 'render_failed', error: String(err?.message || err) }
     }
@@ -1306,7 +1352,7 @@ export function renderAgentsPayload({ root = '', config = {}, log = () => {} } =
   // 架构书 §4.1：rules.renderAgents=false 时自愈与手动渲染都跳过（手动重渲染不得绕过开关）。
   if (value(config?.rules?.renderAgents, true) === false) return { ok: false, error: 'render_disabled' }
   const dir = root || resolveRulesRoot(config)
-  const result = renderAgentsDigest({ rules: dir, agentsPath: agentsPathOf(dir), log })
+  const result = renderAgentsDigest({ rules: dir, agentsPath: agentsPathOf(dir), log, budgetChars: summaryBudgetOf(config) })
   return { ok: Boolean(result.ok), dir, code: textOf(result.code), changed: Boolean(result.changed), count: Number(result.count) || 0 }
 }
 

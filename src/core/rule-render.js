@@ -19,7 +19,7 @@
  * Why 管理块：AGENTS/台账是人工也在编辑的文件，渲染必须可增量、可自愈、可回滚；
  * 用显式标记把"机器负责的字节区间"钉死，才能在用户手改块外内容后依然安全重渲染。
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import { atomicWriteFile, listRules } from './rule-store.js'
@@ -220,22 +220,78 @@ function compareDigestDocs(a, b) {
  * @returns {{content:string, count:number, keys:string[]}}
  */
 export function rulesDigestContent(rules, opts = {}) {
+  // 总预算（R9-14）：默认 4000 码点，防止摘要无限膨胀拖垮每轮 context；0/非法回落默认值。
+  const budgetRaw = Number(opts.budgetChars)
+  const budget = Number.isFinite(budgetRaw) && budgetRaw > 0 ? Math.floor(budgetRaw) : 4000
   const docs = normalizeDocs(rules)
     .map(splitDoc)
     .filter(({ front }) => trimmed(front.status || 'active') === 'active'
       && trimmed(front.type) !== 'rule-candidate'
+      // 链终点过滤（R9-14）：active 但仍带 merged_into/superseded_by 指针的是中间态，
+      // 摘要里再列一遍等于同一事实出现两次；注入/摘要只取链终点。
+      && !trimmed(front.merged_into) && !trimmed(front.superseded_by)
       && (trimmed(front.scope) || 'global') === 'global')
     .sort(compareDigestDocs)
-  const lines = ['## 规则摘要（自动生成，勿手改）']
-  for (const doc of docs) lines.push(digestLine(doc))
   const dir = trimmed(opts.dir) || dirnameOfRules(rules)
+  const header = '## 规则摘要（自动生成，勿手改）'
+  const lines = [header]
+  const keys = []
+  const skipped = []
+  // 脚注也吃预算：先预留，避免最后一行把总量顶破。
+  const footer = dir ? `规则文件目录：${displayPath(dir)}` : ''
+  const footerCost = footer ? Array.from(footer).length + 1 : 0
+  let used = Array.from(header).length
+  for (const doc of docs) {
+    const line = digestLine(doc)
+    const cost = Array.from(line).length + (keys.length ? 1 : 0)
+    if (used + cost + footerCost > budget) {
+      // 排序已是 铁律编号→priority→key：到界即截断，后面的更低优先级不再尝试塞入。
+      skipped.push({ key: trimmed(doc.front.key), chars: Array.from(line).length })
+      continue
+    }
+    lines.push(line)
+    keys.push(trimmed(doc.front.key))
+    used += cost
+  }
   // 传数组（apply 后的 postRules）时没有目录信息，脚注宁可省略也不写半截路径。
-  if (docs.length && dir) lines.push(`规则文件目录：${displayPath(dir)}`)
+  if (keys.length && footer) lines.push(footer)
   return {
     content: lines.join('\n'),
-    count: docs.length,
-    keys: docs.map(({ front }) => trimmed(front.key)),
+    count: keys.length,
+    keys,
+    skipped,
+    chars: used + (keys.length && footer ? footerCost : 0),
+    budgetChars: budget,
   }
+}
+
+/**
+ * AGENTS 管理块是否陈旧（R9-14）：块存在，但文件 mtime 落后于规则目录里最新规则。
+ *
+ * 为什么需要：`renderAgents=false` 时摘要不重渲染，旧块里的全局规则会"零次出现"；
+ * hook 必须能判定块陈旧并降级注入 global（宁可在旧块仍在时双份，也不能一条都看不见）。
+ *
+ * @param {{agentsPath?:string, rulesDir?:string}} [args]
+ * @returns {boolean}
+ */
+export function agentsBlockStale({ agentsPath = '', rulesDir = '' } = {}) {
+  const file = trimmed(agentsPath)
+  const dir = trimmed(rulesDir)
+  if (!file || !dir) return false
+  let agentsMtime
+  try { agentsMtime = statSync(file).mtimeMs } catch { return false }
+  if (!fileHasMarkers(file)) return false
+  let newest = 0
+  try {
+    for (const name of readdirSync(dir)) {
+      if (!name.endsWith('.md')) continue
+      try {
+        const m = statSync(join(dir, name)).mtimeMs
+        if (m > newest) newest = m
+      } catch { /* 刚好被换掉：跳过 */ }
+    }
+  } catch { return false }
+  return newest > agentsMtime
 }
 
 /** 规则来源目录（用于「完整正文」脚注）；没有目录时给 `~/.dsh/rules` 口径的空串。 */
@@ -440,11 +496,12 @@ function rewriteBlock({ path, begin, end, body, log, label, createIfMissing = fa
  */
 export function renderAgentsDigest({
   rules, agentsPath, rulesDir = '', root = '', lock = null, createIfMissing = false, log = () => {},
+  budgetChars = null,
 } = {}) {
   const path = trimmed(agentsPath)
   if (!path) return { ok: false, code: 'no_agents_path' }
   const lockRoot = trimmed(root) || trimmed(rulesDir) || dirnameOfRules(rules)
-  const digest = rulesDigestContent(rules, { dir: rulesDir })
+  const digest = rulesDigestContent(rules, { dir: rulesDir, budgetChars })
   // 空摘要不创建文件：建一个空洞的管理块只会给用户留个空壳资产。
   const allowCreate = Boolean(createIfMissing) && digest.count > 0
   let outcome
@@ -475,6 +532,8 @@ export function renderAgentsDigest({
     count: digest.count,
     keys: digest.keys,
     chars: Array.from(digest.content).length,
+    // 跳过的规则必须回报给调用方/health（黄），不得静默从摘要里消失。
+    ...(digest.skipped?.length ? { skipped: digest.skipped } : {}),
     path,
   }
 }

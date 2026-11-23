@@ -504,3 +504,30 @@ test('renderAgentsDigest：createIfMissing=true 但规则为空 → 不创建空
   assert.equal(got.code, 'no_markers')
   assert.equal(existsSync(path), false)
 })
+
+test('R9-14：摘要总预算——超出按 priority→key 截断，被切规则回报 skipped', () => {
+  const docs = [
+    doc({ key: 'iron-rule-1', number: 1, text: '必须保留审计日志，并在每次写入后核对快照。' }),
+    doc({ key: 'rule-a', type: 'rule', number: null, priority: 'P1', text: '必须把过程稿归档到临时目录。' }),
+    doc({ key: 'rule-b', type: 'rule', number: null, priority: 'P2', text: '必须每周清理一次候选冷却日志。' }),
+  ]
+  const got = rulesDigestContent(docs, { budgetChars: 120 })
+  assert.ok(got.skipped.length >= 1, `低优先级规则应被截断：${JSON.stringify(got)}`)
+  assert.equal(got.count + got.skipped.length, docs.length, '不能被截断的规则必须原样留在摘要里')
+  for (const item of got.skipped) {
+    assert.equal(got.keys.includes(item.key), false, `被截断的 ${item.key} 不得同时在摘要里`)
+  }
+  // 预算内的结果必须真的在预算内（脚注也计入）。
+  assert.ok(Array.from(got.content).length <= 120, `content 超预算：${got.chars}`)
+})
+
+test('R9-14：链终点过滤——active 但带 merged_into/superseded_by 指针的规则不进摘要', () => {
+  const merged = doc({ key: 'rule-old', type: 'rule', number: null, text: '这条已被合并。' })
+  merged.front.merged_into = 'rule-new'
+  const superseded = doc({ key: 'rule-gone', type: 'rule', number: null, text: '这条已被取代。' })
+  superseded.front.superseded_by = 'rule-new'
+  const terminal = doc({ key: 'rule-new', type: 'rule', number: null, text: '这是链终点。' })
+  const got = rulesDigestContent([merged, superseded, terminal])
+  assert.deepEqual(got.keys, ['rule-new'], '只允许链终点进摘要')
+  assert.equal(got.content.includes('已被合并'), false)
+})

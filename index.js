@@ -217,6 +217,9 @@ export async function runRulesSelfHeal({ config, backend, log = () => {}, store 
         agentsPath: agentsPathOf(dir),
         rulesDir: dir,
         createIfMissing: bool(config?.rules?.createAgentsIfMissing, true),
+        budgetChars: Number(config?.rules?.summaryBudgetChars) > 0
+          ? Math.floor(Number(config.rules.summaryBudgetChars))
+          : 4000,
         log,
       })
       if (result.agents && result.agents.ok === false && result.agents.code !== 'no_markers') {

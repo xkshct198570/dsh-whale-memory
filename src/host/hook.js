@@ -24,7 +24,8 @@ import { bool, num, value } from './config-values.js'
 import { judgeReply } from '../core/adoption.js'
 import { listRules } from '../core/rule-store.js'
 import { isRuleStatement } from '../core/rules.js'
-import { agentsPathOf, fileHasMarkers } from '../core/rule-render.js'
+import { agentsBlockStale, agentsPathOf, fileHasMarkers } from '../core/rule-render.js'
+import { recordInjection } from './inject-stats.js'
 import { refineProposal } from '../core/rule-refine.js'
 import {
   buildProposalAskLine,
@@ -172,6 +173,7 @@ function compareForInject(a, b) {
  */
 export function buildRulesPrefix({
   identity = {}, rulesDir, config = {}, rules = null, agentsPath = '', budget = null,
+  agentsStale = false,
 } = {}) {
   const dir = trimmed(rulesDir) || resolveRuleRoot('', config)
   const configured = Number.isFinite(budget) ? Number(budget) : num(config?.rules?.injectChars, RULE_INJECT_DEFAULT)
@@ -180,7 +182,8 @@ export function buildRulesPrefix({
   const ident = identity && typeof identity === 'object' ? identity : {}
   const roleId = trimmed(ident.roleId)
   const workspace = trimmed(ident.workspace)
-  const markers = fileHasMarkers(agentsPath || agentsPathOf(dir))
+  // 块陈旧 = 有标记块但内容旧于规则（renderAgents=false 时的常见态）：按无块处理、降级注入 global。
+  const markers = fileHasMarkers(agentsPath || agentsPathOf(dir)) && agentsStale !== true
 
   if (limit === 0) {
     return { text: '', keys: [], skipped: [], chars: 0, mode: 'off', hasAgentsMarkers: markers, disabled: true }
@@ -196,7 +199,9 @@ export function buildRulesPrefix({
     }
   }
   const active = docs.filter((doc) => textOf(doc?.front?.status || 'active') === 'active'
-    && textOf(doc?.front?.type) !== 'rule-candidate')
+    && textOf(doc?.front?.type) !== 'rule-candidate'
+    // 链终点过滤（R9-14）：active 但带 merged_into/superseded_by 指针的中间态不得注入。
+    && !textOf(doc?.front?.merged_into) && !textOf(doc?.front?.superseded_by))
 
   const scoped = active.filter((doc) => scopeMatches(doc.front.scope, roleId, workspace))
   // global 只作降级：AGENTS 有标记块时摘要已经能看见，再注入就是双份预算双份漂移风险。
@@ -345,6 +350,20 @@ export function installHook(ctx, {
     return max
   }
 
+  /**
+   * AGENTS 文件指纹（R9-14）：inode+size+mtime，只 stat 不读内容。
+   * 文件不存在/读不到返回 '0'；与"内容为空"区分开（空文件仍有真实指纹）。
+   * @param {string} path @returns {string}
+   */
+  const fileStatKey = (path) => {
+    try {
+      const st = statSync(path)
+      return `${st.ino}:${st.size}:${st.mtimeMs}`
+    } catch {
+      return '0'
+    }
+  }
+
   /** 清规则前缀缓存（service.invalidateCache 清整表时也顺带清掉）。 */
   const invalidateRulesCache = () => {
     let cleared = 0
@@ -372,20 +391,29 @@ export function installHook(ctx, {
   const getRulesPrefix = ({ identity, rulesDir, agentsPath }) => {
     evictExpiredRules()
     const budget = Math.max(0, Math.floor(num(config?.rules?.injectChars, RULE_INJECT_DEFAULT)))
-    const key = `${RULES_KEY_PREFIX}v2|d:${dirMtime(rulesDir)}|f:${rulesMaxMtime(rulesDir)}|b:${budget}`
+    const rulesMtime = rulesMaxMtime(rulesDir)
+    // AGENTS 指纹只 stat 不整读（R9-14）：每步 readFileSync 整个 AGENTS 是纯浪费；
+    // inode+size+mtime 足以发现内容/换文件，块陈旧单独用 mtime 比较判定。
+    const agentsSig = fileStatKey(agentsPath)
+    const agentsStale = agentsBlockStale({ agentsPath, rulesDir })
+    const key = `${RULES_KEY_PREFIX}v3|d:${dirMtime(rulesDir)}|f:${rulesMtime}|b:${budget}`
       + `|r:${trimmed(identity.roleId)}|w:${normalizeScopePath(identity.workspace)}`
-      + `|m:${fileHasMarkers(agentsPath) ? 1 : 0}`
+      + `|a:${agentsSig}|s:${agentsStale ? 1 : 0}`
     const hit = cache.get(key)
     // 空结果也缓存：没有适用规则时每步重扫目录（读+校验全部规则文件）是纯浪费。
-    if (hit && Date.now() < hit.exp) return { ...hit.meta, text: hit.text, cached: true }
+    if (hit && Date.now() < hit.exp) {
+      recordInjection({ ...hit.meta, cached: true })
+      return { ...hit.meta, text: hit.text, cached: true }
+    }
     let built
     try {
-      built = buildRulesPrefix({ identity, rulesDir, config, agentsPath })
+      built = buildRulesPrefix({ identity, rulesDir, config, agentsPath, agentsStale })
     } catch (err) {
       log(`[whale-memory] rules inject fail-open: ${err?.name || err?.message || err}`)
       built = { text: '', keys: [], skipped: [], chars: 0, mode: 'none', hasAgentsMarkers: false }
     }
     const meta = { keys: built.keys, skipped: built.skipped, chars: built.chars, mode: built.mode }
+    recordInjection({ ...meta, cached: false })
     cache.set(key, { text: built.text, exp: Date.now() + RULES_CACHE_TTL_MS, meta })
     return { ...meta, text: built.text, cached: false }
   }
