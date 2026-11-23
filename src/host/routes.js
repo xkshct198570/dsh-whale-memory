@@ -15,6 +15,7 @@ import { Config } from './config.js'
 import { HttpSyncTransport, pullFromGateway, pushToGateway } from '../core/sync.js'
 import { WHALE_PROTOCOL } from '../core/backend.js'
 import { handleRules } from './rules-routes.js'
+import { createHostAdapter } from './ctx-adapter.js'
 
 const PREFIX = '/whale-memory/api'
 
@@ -155,6 +156,8 @@ export function createRoutes({
   migration = null,
   ctx, reflect, log = () => {},
 }) {
+  // 宿主能力只经 adapter（R9-09）：LLM/默认模型选择缺失时降级 null + 一次 domain=host 日志。
+  const host = createHostAdapter(ctx, { log })
   /**
    * 面板写入口写后立即清召回缓存：规则正文/AGENTS 摘要已变，下一步注入不能吃 30s 旧前缀。
    * 走 service.invalidateCache（清整表，含规则前缀与会话条目），与 hook 的 invalidateRulesCache 等价。
@@ -716,14 +719,10 @@ export function createRoutes({
     // getLlm 透传给规则 apply：面板手改合并/冲突时需要模型只改措辞（R3b）。
     if (await handleRules({
       req, res, path, config, backend, log,
-      getLlm: () => (ctx?.get?.('llm') ?? null),
+      // 宿主能力只经 adapter（R9-09）：缺失降级 null + 一次 domain=host 日志。
+      getLlm: () => host.llm(),
       // R9-10：面板 apply/改写需要 provider/model 才能调模型；缺选择由 core 转 needs_manual。
-      getSelection: () => {
-        try {
-          const model = ctx?.get?.('agentDefaultModel')
-          return typeof model?.currentSelection === 'function' ? model.currentSelection() : null
-        } catch { return null }
-      },
+      getSelection: () => host.selection(),
       invalidateCache: invalidateRulesCache,
     })) return undefined
 

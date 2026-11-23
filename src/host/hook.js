@@ -26,6 +26,7 @@ import { listRules } from '../core/rule-store.js'
 import { isRuleStatement } from '../core/rules.js'
 import { agentsBlockStale, agentsPathOf, fileHasMarkers } from '../core/rule-render.js'
 import { recordInjection } from './inject-stats.js'
+import { createHostAdapter } from './ctx-adapter.js'
 import { refineProposal } from '../core/rule-refine.js'
 import {
   buildProposalAskLine,
@@ -300,6 +301,8 @@ export function installHook(ctx, {
   identityState = null,
   log = () => {},
 }) {
+  // 宿主能力只经 adapter（R9-09）：缺 llm/模型选择时降级 null，并落一次 domain=host 日志。
+  const host = createHostAdapter(ctx, { log })
   const cache = new Map()
   const inflight = new Set()
   /**
@@ -458,8 +461,8 @@ export function installHook(ctx, {
         config,
         identity: identityInfo,
         traceId,
-        getLlm: () => (typeof ctx?.get === 'function' ? ctx.get('llm') : null),
-        getSelection: () => (typeof ctx?.get === 'function' ? ctx.get('agentDefaultModel')?.currentSelection?.() : null),
+        getLlm: () => host.llm(),
+        getSelection: () => host.selection(),
         backend,
         log,
       }), CONFIRM_TIMEOUT_MS)
@@ -540,8 +543,8 @@ export function installHook(ctx, {
               id: created.proposal.id,
               rulesDir: resolveRuleRoot('', config),
               config,
-              getLlm: () => (typeof ctx?.get === 'function' ? ctx.get('llm') : null),
-              getSelection: () => (typeof ctx?.get === 'function' ? ctx.get('agentDefaultModel')?.currentSelection?.() : null),
+              getLlm: () => host.llm(),
+              getSelection: () => host.selection(),
               log,
             }).then((out) => {
               if (out && out.state === 'failed') log(`[whale-memory] rules proposal refine skipped id=${created.proposal.id} code=${out.code || '-'}`)

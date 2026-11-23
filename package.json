@@ -42,7 +42,7 @@
     "sqlite"
   ],
   "scripts": {
-    "test": "node --test test/unit/*.test.mjs test/contract/*.test.mjs test/hook/*.test.mjs test/data/*.test.mjs test/worker/*.test.mjs test/lifecycle/*.test.mjs test/sync/*.test.mjs test/client/*.test.mjs",
+    "test": "node --test test/unit/*.test.mjs test/contract/*.test.mjs test/hook/*.test.mjs test/data/*.test.mjs test/worker/*.test.mjs test/lifecycle/*.test.mjs test/sync/*.test.mjs test/client/*.test.mjs test/integration/*.test.mjs",
     "test:unit": "node --test test/unit/*.test.mjs",
     "test:contract": "node --test test/contract/*.test.mjs",
     "test:hook": "node --test test/hook/*.test.mjs",
@@ -54,7 +54,8 @@
     "test:all": "npm run test",
     "check": "node scripts/check.mjs",
     "i18n": "node scripts/i18n-check.mjs",
-    "eval": "node scripts/eval.mjs"
+    "eval": "node scripts/eval.mjs",
+    "test:integration": "node --test test/integration/*.test.mjs"
   },
   "dsh": {
     "manifestVersion": 1,
@@ -71,5 +72,9 @@
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "3.19.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.1.0",
+    "@deepseek-ai/cordis-plugin-timer": "^1.2.0"
   }
 }
