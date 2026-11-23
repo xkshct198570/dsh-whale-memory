@@ -988,50 +988,6 @@ export function writeRule(root, input, opts = {}) {
   }
 }
 
-/**
- * 删除规则：默认 status=retired 留文件；只有 rule-candidate + force=true 才物理删。
- * @param {string} root @param {string} key
- * @param {{force?:boolean,fs?:typeof nodeFs,git?:boolean,exec?:Function}} [opts]
- * @returns {{ok:boolean,deleted?:boolean,retired?:boolean,rule?:object,error?:string,detail?:any}}
- */
-export function deleteRule(root, key, opts = {}) {
-  const base = baseDir(root)
-  const fs = opts.fs || nodeFs
-  const got = readRule(base, key)
-  if (!got.ok) return got
-  const doc = got.rule
-  if (opts.force === true && doc.front.type === 'rule-candidate') {
-    const lock = acquireRepoLock(base, { fs, timeoutMs: opts.timeoutMs, staleMs: opts.staleMs })
-    if (!lock.ok) return { ok: false, error: lock.error }
-    try {
-      const old = readRuleSource(doc.file, { fs })
-      if (!old.ok) return { ok: false, error: old.error }
-      const snap = writeHistorySnapshot(base, key, old.text, { fs })
-      if (!snap.ok) return { ok: false, error: 'snapshot_failed', detail: snap.error }
-      try { fs.unlinkSync(doc.file) } catch (err) { return { ok: false, error: 'delete_failed', detail: String(err?.message || err) } }
-      regenerateManifest(base, { fs })
-      if (opts.git !== false) {
-        commitRuleChanges(base, `rules: delete candidate ${key}`, {
-          exec: opts.exec,
-          paths: [relative(base, doc.file), MANIFEST_FILE],
-        })
-      }
-      return { ok: true, deleted: true }
-    } finally {
-      lock.release()
-    }
-  }
-  const next = normalizeRuleDoc({
-    ...doc.front,
-    status: 'retired',
-    updated: today(),
-    version: Number(doc.front.version) + 1,
-  }, doc.text)
-  const saved = writeRule(base, next, opts)
-  if (!saved.ok) return saved
-  return { ok: true, retired: true, rule: saved.rule }
-}
-
 // ---------------------------------------------------------------------------
 // 新建 / 停用 / 恢复（面板直写，不经提案决策流水线）
 // ---------------------------------------------------------------------------
@@ -1065,28 +1021,6 @@ function manualModalityOf(text) {
   if (MANUAL_EXCEPT_RE.test(s)) return 'except'
   if (MANUAL_ONLY_RE.test(s)) return 'only'
   return 'must'
-}
-
-/**
- * 旧编号永不回收：所有规则（含 retired/archived）的编号都算占用；已彻底删除的编号
- * 只剩 manifest 墓碑，也必须继续占位——否则删掉最高号后新规则会回收该号，违反"编号稳定。
- * @param {Array<object>} rules @param {Array<{number:number}>} [retired] manifest.retired 墓碑
- * @returns {Set<number>}
- */
-function occupiedNumbers(rules, retired = []) {
-  const numbers = new Set()
-  for (const doc of Array.isArray(rules) ? rules : []) {
-    // 只有 iron-rule 占号；普通规则/候选带 number（历史手写文件）也不得压高 nextNumber。
-    const front = doc?.front && typeof doc.front === 'object' ? doc.front : doc
-    if (String(front?.type ?? '') !== 'iron-rule') continue
-    const n = Number(front?.number)
-    if (Number.isInteger(n) && n > 0) numbers.add(n)
-  }
-  for (const item of Array.isArray(retired) ? retired : []) {
-    const n = Number(item?.number)
-    if (Number.isInteger(n) && n > 0) numbers.add(n)
-  }
-  return numbers
 }
 
 const IRON_RULE_FILE_RE = /^iron-rule-(\d+)\.md$/i
@@ -1538,20 +1472,6 @@ export function purgeRule({ root = '', key, identity = {}, traceId = '', now = D
   } finally {
     lock.release()
   }
-}
-
-/**
- * 按正常写流程回滚到某个历史快照（先校验，再快照当前版本，再落盘）。
- * @param {string} root @param {string} key @param {string} rev
- * @param {{fs?:typeof nodeFs,git?:boolean,exec?:Function}} [opts]
- * @returns {{ok:boolean,rule?:object,rolledBackTo?:string,error?:string,detail?:any}}
- */
-export function rollbackTo(root, key, rev, opts = {}) {
-  const snap = readSnapshot(root, key, rev)
-  if (!snap.ok) return snap
-  const saved = writeRule(root, snap.rule, opts)
-  if (!saved.ok) return saved
-  return { ...saved, rolledBackTo: rev }
 }
 
 // ---------------------------------------------------------------------------
@@ -2959,14 +2879,6 @@ export function gitShow(dir, rev, opts = {}) {
     ? ['show', `${revision}:${opts.file}`]
     : ['show', '--stat', '--no-color', '--no-renames', revision]
   const r = runGit(dir, args, opts)
-  return r.ok ? { ok: true, text: r.out } : r
-}
-
-/** revert --no-edit（冲突时返回错误，不自动解冲突、不联网）。 */
-export function gitRevert(dir, rev, opts = {}) {
-  const revision = String(rev ?? '').trim()
-  if (!revision || revision.startsWith('-')) return { ok: false, error: 'invalid_rev' }
-  const r = runGit(dir, ['revert', '--no-edit', revision], opts)
   return r.ok ? { ok: true, text: r.out } : r
 }
 

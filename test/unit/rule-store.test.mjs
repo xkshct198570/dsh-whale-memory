@@ -18,7 +18,6 @@ import {
   atomicWriteFile,
   createRule,
   defaultRuleRoot,
-  deleteRule,
   diffLines,
   ensureRuleRepo,
   listRules,
@@ -33,7 +32,6 @@ import {
   regenerateManifest,
   resolveRevision,
   revertRule,
-  rollbackTo,
   serializeRuleDocument,
   updateRule,
   validateRule,
@@ -292,40 +290,8 @@ test('历史只保留 20 份；rollback 恢复正文与 front', (t) => {
   const target = history.entries[3]
   const snap = readSnapshot(root, 'rule-1', target.rev)
   assert.equal(snap.ok, true, snap.error)
-  const rolled = rollbackTo(root, 'rule-1', target.rev, { git: false })
-  assert.equal(rolled.ok, true, rolled.error)
-  assert.equal(rolled.rolledBackTo, target.rev)
-  const got = readRule(root, 'rule-1')
-  assert.equal(got.rule.text, snap.rule.text)
-  assert.equal(got.rule.front.version, snap.rule.front.version)
-  assert.equal(got.rule.front.priority, snap.rule.front.priority)
-
-  const missing = rollbackTo(root, 'rule-1', '20000101000000000', { git: false })
-  assert.equal(missing.ok, false)
-  assert.equal(missing.error, 'snapshot_not_found')
-})
-
-test('delete：普通规则 force 也只 retired 留文件；候选 force 才物理删', (t) => {
-  const root = freshRoot(t)
-  assert.equal(writeDoc(root, frontOf(), '必须保留审计行。').ok, true)
-  const retired = deleteRule(root, 'rule-1', { force: true, git: false })
-  assert.equal(retired.ok, true)
-  assert.equal(retired.retired, true)
-  const got = readRule(root, 'rule-1')
-  assert.equal(got.ok, true)
-  assert.equal(got.rule.front.status, 'retired')
-  assert.equal(got.rule.front.version, 2)
-
-  const cand = writeRule(root, {
-    front: frontOf({ key: 'cand-2', type: 'rule-candidate', number: 2, status: 'proposal' }),
-    text: '先观察一周再决定。',
-  }, { git: false })
-  assert.equal(cand.ok, true, cand.error)
-  assert.ok(cand.path.includes('proposals'))
-  const deleted = deleteRule(root, 'cand-2', { force: true, git: false })
-  assert.equal(deleted.ok, true)
-  assert.equal(deleted.deleted, true)
-  assert.equal(readRule(root, 'cand-2').error, 'rule_not_found')
+  assert.ok(snap.rule.front.version >= 1, '快照必须能还原出对应版本的 front')
+  assert.match(snap.rule.text, /必须执行第 \d+ 版检查。/)
 })
 
 test('purgeRule：删文件 + 最后一版 history 快照 + 墓碑，nextNumber 不回收（删17→18，删18→19）', (t) => {

@@ -20,7 +20,7 @@
  * 就又会回到「守卫只看合并正文、affected[].new_text 直写」的 v3.7 缺口。
  */
 import { createHash } from 'node:crypto'
-import { existsSync, readFileSync, readdirSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { normalizeRuleText } from './rules.js'
 import {
@@ -590,11 +590,4 @@ function cfgBoolGuard(config) {
   return Boolean(raw)
 }
 
-/** 目录存在性（测试/调用方可用；不写盘）。 */
-export function planFileNames(dir) {
-  try {
-    return readdirSync(dir)
-  } catch {
-    return []
-  }
-}
+
