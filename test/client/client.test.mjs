@@ -645,6 +645,7 @@ test('WP1 推荐开启徽标：四个需外部条件的开关带 recommend，bad
   }
   assert.ok(CLIENT.includes("recommend: meta && meta.recommend ? t('settings.recommend') : undefined"), '推荐标记未进卡片元数据')
   assert.match(CLIENT, /recommendChip/, '缺少推荐徽标样式')
+  assert.match(CLIENT, /recommend: !checked \? meta\.recommend : undefined/, '已开启的开关仍挂「推荐开启」')
 })
 
 test('WP2 设置信息架构：顺序固定、首屏四组展开、其余默认收起、布局根因修复', () => {
