@@ -208,7 +208,8 @@ function guardEntry(code, ok, detail = '') {
  *   now?:number, log?:Function, exec?:Function}} args
  *   proposal: 候选 JSON（含 draft/relation/affected 快照）
  *   decisions: `{text?, affected?:[{key,new_text}], acceptAffected?:string[],
- *     acknowledgeDropped?:boolean|string[]}`（面板/LLM 结果，必须过守卫）
+ *     acknowledgeDropped?:Array<{key:string,clauses:string[]}>}`（面板/LLM 结果，必须过守卫；
+ *     只认子句粒度，裸 key/布尔不再作为放行通道——架构书 §3.6）
  * @returns {{ok:true, plan:object} | {ok:false, error:string, code:string,
  *   failures:Array<object>, needsManual?:boolean, detail?:string}}
  */
@@ -323,10 +324,22 @@ export function buildApplyPlan({
   if (!mergedText) return failed('empty_rewrite')
 
   const strict = cfgBoolGuard(config)
+  // acknowledgeDropped 只收子句粒度 `[{key, clauses[]}]`（R9-14 / 架构书 §3.6）：
+  // 旧布尔/裸 key 会让"勾选一次"放弃整条规则的全部条款，是安全洞，直接拒绝而不是静默忽略。
   const ackRaw = decided.acknowledgeDropped
-  const acknowledgeDropped = Array.isArray(ackRaw)
-    ? ackRaw
-    : (ackRaw === true ? acceptedAffected.map((doc) => doc.key) : [])
+  let acknowledgeDropped = []
+  if (ackRaw !== undefined && ackRaw !== null && ackRaw !== false) {
+    const bad = !Array.isArray(ackRaw) || ackRaw.some((item) => !item || typeof item !== 'object'
+      || !trimmed(item.key) || !Array.isArray(item.clauses))
+    if (bad) {
+      return failed('invalid_acknowledge', [{
+        code: 'invalid_acknowledge',
+        key: '',
+        detail: 'acknowledgeDropped 必须是 [{key, clauses:[...]}]（子句粒度，不接受布尔/裸 key）',
+      }])
+    }
+    acknowledgeDropped = ackRaw.map((item) => ({ key: trimmed(item.key), clauses: item.clauses.map((c) => trimmed(c)).filter(Boolean) }))
+  }
   const rewrites = rewriteMapOf(decided)
 
   // 目标 front：refine 沿用旧编号/created；新建取号只走 occupancy()（R9-20 单一真源）。

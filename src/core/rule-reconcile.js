@@ -1201,14 +1201,56 @@ export function retainsClause(mergedNorm, clause) {
 // ---------------------------------------------------------------------------
 
 /**
+ * acknowledgeDropped 归一为 `key → Set(规范化子句)`。
+ *
+ * 只收 `[{key, clauses[]}]`（子句粒度）；裸字符串/布尔一律忽略（不再有 key 粒度通道）。
+ *
+ * @param {unknown} value @returns {Map<string, Set<string>>}
+ */
+function ackMapOf(value) {
+  const map = new Map()
+  for (const item of Array.isArray(value) ? value : []) {
+    const key = trimmed(item?.key)
+    if (!key) continue
+    const clauses = Array.isArray(item?.clauses)
+      ? item.clauses
+      : (typeof item?.clauses === 'string' ? [item.clauses] : [])
+    const set = map.get(key) || new Set()
+    for (const clause of clauses) {
+      const norm = normalizeForGuard(clause)
+      if (norm) set.add(norm)
+    }
+    map.set(key, set)
+  }
+  return map
+}
+
+/**
+ * 某条旧子句是否被 owner 明确确认丢弃：子句规范化后相等，或互相包含（标点/同义变体）。
+ * @param {Map<string, Set<string>>} ack @param {string} key @param {string} clause
+ * @returns {boolean}
+ */
+function ackCovers(ack, key, clause) {
+  const set = ack.get(trimmed(key))
+  if (!set || !set.size) return false
+  const norm = normalizeForGuard(clause)
+  if (!norm) return false
+  for (const agreed of set) {
+    if (agreed === norm || norm.includes(agreed) || agreed.includes(norm)) return true
+  }
+  return false
+}
+
+/**
  * 改写守卫（架构书 §3.6）：逐条核对受影响旧规则，全过才允许落盘。
  *
  * 逐文件调用：`newText` 对**它替换的旧规则**校验；调用方把一批旧规则 + 该文件新正文传进来。
  *
  * @param {{affected?:Array<any>, mergedText?:string, draft?:object|null,
- *   strict?:boolean, acknowledgeDropped?:string[], relation?:string}} args
+ *   strict?:boolean, acknowledgeDropped?:Array<{key:string,clauses:string[]}>, relation?:string}} args
  *   affected: 旧规则（`{front,text}` 或扁平 front）；acknowledgeDropped: 非 strict 时 owner
- *   显式确认丢弃的规则 key 列表——这是**唯一**能放行"丢例外/丢条件"的通道；
+ *   显式确认丢弃的**子句**清单（`[{key, clauses[]}]`）——这是**唯一**能放行"丢例外/丢条件"的通道。
+ *   只认子句粒度：key 粒度一键放弃整条规则的全部条款会让「勾选一次」变成安全洞（架构书 §3.6）。
  *   relation: `conflict` 时按冲突口径判模态（新正文表达**新模态**，旧模态允许被取代），
  *   其余关系（refine/merge/编辑）仍要求旧模态保留。
  * @returns {{ok:boolean, failures:Array<{code:string,key:string,detail:string}>}}
@@ -1219,7 +1261,7 @@ export function guardRewrite({
   const failures = []
   const merged = textOf(mergedText)
   const mergedNorm = normalizeForGuard(merged)
-  const acknowledged = new Set((Array.isArray(acknowledgeDropped) ? acknowledgeDropped : []).map((k) => trimmed(k)))
+  const acknowledged = ackMapOf(acknowledgeDropped)
   const draftScope = trimmed(draft?.scope)
   const draftIsIron = trimmed(draft?.type) === 'iron-rule'
   const conflict = trimmed(relation) === 'conflict'
@@ -1238,7 +1280,7 @@ export function guardRewrite({
     const { front } = normalizeDoc(doc)
     const key = trimmed(front.key) || '<unknown>'
     const oldIron = trimmed(front.type) === 'iron-rule'
-    const droppedOk = !strict && acknowledged.has(key)
+    const droppedOk = !strict
 
     if ((oldIron || draftIsIron) && VAGUE_RE.test(merged)) {
       failures.push({ code: 'vague_word', key, detail: '铁律不得含模糊词（尽量/最好/尽可能…）' })
@@ -1250,7 +1292,8 @@ export function guardRewrite({
       const clauses = Array.isArray(front[field]) ? front[field] : []
       for (const clause of clauses) {
         if (retainsClause(mergedNorm, clause)) continue
-        if (droppedOk) continue
+        // 逐子句放行：这条子句必须出现在该 key 的 acknowledgeDropped.clauses 里才算确认。
+        if (droppedOk && ackCovers(acknowledged, key, clause)) continue
         failures.push({ code, key, detail: `旧${field === 'exceptions' ? '例外' : '条件'}未保留：${trimmed(clause)}` })
       }
     }

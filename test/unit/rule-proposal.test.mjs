@@ -568,7 +568,7 @@ test('confirmPendingForSession：映射 30min TTL，过期即 no_pending', async
   clearSessionPending('s2')
 })
 
-test('applyProposal：面板布尔 acknowledgeDropped 只在 guardStrict=false 时放行丢例外', async (t) => {
+test('applyProposal：acknowledgeDropped 子句粒度——strict 拒绝，非 strict 逐子句确认才放行', async (t) => {
   const root = freshRoot(t)
   seed(root, { number: 5, exceptions: ['用户原件'] })
   const made = createProposal({
@@ -580,7 +580,7 @@ test('applyProposal：面板布尔 acknowledgeDropped 只在 guardStrict=false �
     rulesDir: root,
     config: { rules: { guardStrict: true } },
     git: false,
-    decisions: { text: '源文件必须保留。', acknowledgeDropped: true },
+    decisions: { text: '源文件必须保留。', acknowledgeDropped: [{ key: 'rule-src-keep', clauses: ['用户原件'] }] },
   })
   assert.equal(strict.ok, false)
   assert.equal(strict.error, 'rule_guard_failed')
@@ -590,7 +590,7 @@ test('applyProposal：面板布尔 acknowledgeDropped 只在 guardStrict=false �
     rulesDir: root,
     config: { rules: { guardStrict: false } },
     git: false,
-    decisions: { text: '源文件必须保留。', acknowledgeDropped: true },
+    decisions: { text: '源文件必须保留。', acknowledgeDropped: [{ key: 'rule-src-keep', clauses: ['用户原件'] }] },
   })
   assert.equal(lax.ok, true, JSON.stringify({ err: lax.error, failures: lax.failures }))
   const kept = readRule(root, 'rule-src-keep')
@@ -900,4 +900,22 @@ test('R9-14：审计 beforeText 取锁内旧正文（refine 不记成新建）',
   assert.ok(writesRun, '必须写 writes 审计')
   // 列序：ts,trace_id,action,node_id,reason,before_text,after_text,… → before_text = args[5]
   assert.equal(writesRun.args[5], oldText, 'beforeText 必须是磁盘旧正文，不是空串')
+})
+
+
+test('R9-14：acknowledgeDropped 旧布尔形状被明确拒绝（不静默放行）', async (t) => {
+  const root = freshRoot(t)
+  seed(root, { number: 5, exceptions: ['用户原件'] })
+  const made = createProposal({
+    text: '按 rule:rule-src-keep 源文件必须保留，例外：用户原件', identity: IDENTITY, rulesDir: root, config: { rules: {} },
+  })
+  const result = await applyProposal({
+    id: made.proposal.id,
+    rulesDir: root,
+    config: { rules: { guardStrict: false } },
+    git: false,
+    decisions: { text: '源文件必须保留。', acknowledgeDropped: true },
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.error, 'invalid_acknowledge')
 })

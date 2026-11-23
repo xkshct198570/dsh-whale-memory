@@ -159,7 +159,8 @@ test('守卫归一与风险判定：guard 缺失放行，失败/丢弃必须勾�
   assert.equal(clean.requiresAck, false)
   const guardRisk = api.proposalRiskOf({ relation: 'merge', guard: { ok: false, failures: [{ code: 'dup' }] } })
   assert.equal(guardRisk.risky, true)
-  assert.equal(guardRisk.requiresAck, true)
+  // R9-14：守卫失败要改正文/重试，勾选 ack 放行是假通道（只放行"被丢弃的子句"）。
+  assert.equal(guardRisk.requiresAck, false)
   assert.deepEqual(guardRisk.reasons, ['guard'])
   const droppedRisk = api.proposalRiskOf({
     relation: 'merge',
@@ -193,8 +194,19 @@ test('改写提交：正文+条件/例外/作用域合成，decisions 只带契�
   assert.equal(composed, '正文\n\n条件：\n- c1\n- c2\n\n例外：\n- e1\n\n作用域：workspace:w')
   assert.equal(api.composeProposalText({ text: '' }), '')
   assert.equal(api.composeProposalText(null), '')
-  const decisions = api.proposalDecisionsFor({ text: '  x  ', acknowledgeDropped: true, acceptAffected: ['R-1'] })
-  assert.deepEqual(decisions, { text: 'x', acknowledgeDropped: true, acceptAffected: ['R-1'] })
+  // R9-14：ack 载荷是子句粒度 [{key, clauses[]}]，由丢弃清单生成；没有丢弃就不带 ack 字段。
+  const decisions = api.proposalDecisionsFor({
+    text: '  x  ',
+    acknowledgeDropped: true,
+    dropped: [{ key: 'R-1', text: '用户原件' }],
+    acceptAffected: ['R-1'],
+  })
+  assert.deepEqual(decisions, { text: 'x', acknowledgeDropped: [{ key: 'R-1', clauses: ['用户原件'] }], acceptAffected: ['R-1'] })
+  assert.deepEqual(
+    api.proposalDecisionsFor({ text: 'y', acknowledgeDropped: true }),
+    { text: 'y' },
+    '没有丢弃子句时勾选不得生成空 ack 载荷',
+  )
   assert.deepEqual(api.proposalDecisionsFor({}), {})
   assert.deepEqual(api.proposalDecisionsFor({ text: '', acknowledgeDropped: false }), {})
 })
@@ -233,7 +245,8 @@ test('风险条：警告色克制、列出守卫/丢弃原因、勾选 acknowled
   const item = itemSource()
   assert.match(item, /const gated = risk\.requiresAck && !ack/, '缺少勾选门禁')
   assert.ok(item.includes('disabled: applyDisabled'), '收录按钮未按门禁禁用')
-  assert.ok(item.includes('acknowledgeDropped: risk.requiresAck ? ack : false'), '未把勾选结果写进 decisions')
+  assert.ok(item.includes('acknowledgeDropped: ack === true'), '未把勾选结果写进 decisions')
+  assert.ok(item.includes('dropped: risk.dropped'), '未把丢弃清单交给 decisions（无法生成子句粒度 ack）')
 })
 
 test('收录二次确认说明写入文件+commit+渲染 AGENTS+镜像', () => {

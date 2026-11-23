@@ -24,6 +24,7 @@ const statusOnly = (status) => Object.freeze({ status, localeKey: null, unmapped
 export const ERROR_TABLE = Object.freeze({
   affected_inactive: mapped(409, 'affected_inactive'),
   affected_missing: mapped(409, 'affected_missing'),
+  invalid_acknowledge: mapped(422, 'invalid_acknowledge'),
   rule_guard_failed: mapped(422, 'rule_guard_failed'),
   target_conflict: mapped(409, 'target_conflict'),
   target_missing: mapped(409, 'target_missing'),

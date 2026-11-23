@@ -402,16 +402,24 @@ test('guardRewrite：隐私命中 → privacy 拒绝', () => {
   assert.ok(got.failures.some((f) => f.code === 'privacy'))
 })
 
-test('guardRewrite：strict 下 acknowledgeDropped 不能绕过；非 strict + owner 显式确认才放行', () => {
-  const args = {
+test('guardRewrite：strict 下 acknowledgeDropped 不能绕过；非 strict 必须逐子句确认才放行', () => {
+  const base = {
     affected: [oldRule()],
     mergedText: '以后都别删源文件。',
     draft: { scope: 'global', type: 'iron-rule' },
-    acknowledgeDropped: ['rule-17'],
   }
-  const strict = guardRewrite({ ...args, strict: true })
+  // R9-14 改语义：确认粒度从「整条 key」降到「子句」。旧形状（裸 key/布尔）不再放行任何东西。
+  const strict = guardRewrite({ ...base, strict: true, acknowledgeDropped: [{ key: 'rule-17', clauses: ['用户原件', '正在被引用的文件'] }] })
   assert.equal(strict.ok, false, 'strict 模式必须拒绝')
-  const lax = guardRewrite({ ...args, strict: false })
+  const legacyShape = guardRewrite({ ...base, strict: false, acknowledgeDropped: ['rule-17'] })
+  assert.equal(legacyShape.ok, false, '裸 key 形状不得再作为放行通道')
+
+  const partial = guardRewrite({ ...base, strict: false, acknowledgeDropped: [{ key: 'rule-17', clauses: ['用户原件'] }] })
+  assert.equal(partial.ok, false, '只确认一条子句时，另一条仍必须拒绝')
+  assert.ok(partial.failures.some((failure) => failure.code === 'dropped_exception' && String(failure.detail).includes('正在被引用')),
+    JSON.stringify(partial.failures))
+
+  const lax = guardRewrite({ ...base, strict: false, acknowledgeDropped: [{ key: 'rule-17', clauses: ['用户原件', '正在被引用的文件'] }] })
   assert.equal(lax.ok, true, JSON.stringify(lax.failures))
 })
 

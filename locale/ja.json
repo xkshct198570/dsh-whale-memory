@@ -672,6 +672,7 @@
   "err.rule_guard_failed": "ルールガードに失敗しました",
   "err.rule_proposal_not_found": "提案が見つからないか処理済みです",
   "err.rule_proposal_expired": "提案の有効期限が切れています",
+  "err.invalid_acknowledge": "破棄確認の形式が不正です：ルールごとに破棄する条項（key + 条項）を列挙してください。ルール単位の一括承認は受け付けません。",
   "rules.gitMissingDetail": "git が無くてもローカルスナップショットで履歴 / diff / ロールバック可",
   "rules.proposalsCount": "未確認 {n} 件",
   "rules.proposalsJump": "未確認の提案へ移動",

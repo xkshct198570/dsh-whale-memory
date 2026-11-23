@@ -672,6 +672,7 @@
   "err.rule_guard_failed": "Rule guard failed",
   "err.rule_proposal_not_found": "Proposal not found or already handled",
   "err.rule_proposal_expired": "Proposal expired",
+  "err.invalid_acknowledge": "Invalid acknowledge payload: list dropped clauses per rule (key + clause); whole-rule acknowledgement is not accepted.",
   "rules.gitMissingDetail": "Without git, local snapshots still cover history / diff / rollback",
   "rules.proposalsCount": "Pending: {n}",
   "rules.proposalsJump": "Jump to pending proposals",

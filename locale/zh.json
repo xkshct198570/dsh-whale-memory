@@ -672,6 +672,7 @@
   "err.rule_guard_failed": "规则守卫未通过",
   "err.rule_proposal_not_found": "提案不存在或已处理",
   "err.rule_proposal_expired": "提案已过期",
+  "err.invalid_acknowledge": "确认丢弃的子句格式不合规：必须逐条列出（规则 key + 子句），不接受整条规则一键放行。",
   "rules.gitMissingDetail": "无 git 时仍可用本地快照做历史 / diff / 回滚",
   "rules.proposalsCount": "待确认 {n}",
   "rules.proposalsJump": "跳到待确认提案",
