@@ -814,28 +814,38 @@ function rollbackPlan(base, plan, historyBefore, { exec = null, gitAvailable = f
 }
 
 
-/** 取 LLM 合并回包文本；兼容 chat 与 stream 两种宿主接口。 */
+/**
+ * 取 LLM 合并回包文本；兼容 chat 与 stream 两种宿主接口。
+ *
+ * provider/model 两条路径都必填（R9-10）：宿主可能按 provider 路由计费/权限；缺选择时
+ * 不能让模型调用"猜默认"，一律 `no_model` 交给上层转 needs_manual（架构书 §3.8）。
+ *
+ * @param {{llm:any, prompt:{system:string,user:string}, selection?:{provider?:string,model?:string},
+ *   log?:Function}} args
+ * @returns {Promise<{ok:boolean, text?:string, error?:string}>}
+ */
 export async function callLlmMerge({ llm, prompt, selection = null, log = () => {} }) {
   const messages = [
     { role: 'system', content: [{ type: 'text', text: prompt.system }] },
     { role: 'user', content: [{ type: 'text', text: prompt.user }] },
   ]
+  const provider = textOf(selection?.provider)
+  const model = textOf(selection?.model)
   try {
     if (typeof llm?.chat === 'function') {
+      if (!provider || !model) return { ok: false, error: 'no_model' }
       const out = await llm.chat({
         messages,
         system: prompt.system,
         user: prompt.user,
-        ...(selection?.provider ? { provider: selection.provider } : {}),
-        ...(selection?.model ? { model: selection.model } : {}),
+        provider,
+        model,
       })
       const text = textOf(typeof out === 'string' ? out : (out?.text ?? out?.content ?? out?.value?.text))
       if (!text) return { ok: false, error: 'llm_empty' }
       return { ok: true, text }
     }
     if (typeof llm?.stream === 'function') {
-      const provider = textOf(selection?.provider)
-      const model = textOf(selection?.model)
       if (!provider || !model) return { ok: false, error: 'no_model' }
       let text = ''
       for await (const chunk of llm.stream({

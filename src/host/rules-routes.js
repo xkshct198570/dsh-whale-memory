@@ -1445,12 +1445,13 @@ function statusForError(code) {
  *
  * @param {{req:import('node:http').IncomingMessage,res:import('node:http').ServerResponse,
  *   path:string,config?:any,backend?:any,detect?:Function,log?:Function,
- *   getLlm?:Function,navigate?:Function}} args
- *   getLlm/navigate 可选：路由默认拿不到宿主 ctx，传了就用（聊天/测试可注入）。
+ *   getLlm?:Function,getSelection?:Function,navigate?:Function}} args
+ *   getLlm/getSelection/navigate 可选：路由默认拿不到宿主 ctx，传了就用（聊天/测试可注入）。
  * @returns {Promise<boolean>}
  */
 export async function handleRules({
   req, res, path, config, backend, detect = detectGit, log = () => {}, getLlm = () => null, git = true,
+  getSelection = () => null,
   invalidateCache = () => {},
 }) {
   const p = textOf(path)
@@ -1642,6 +1643,8 @@ export async function handleRules({
       body: body.value,
       detect,
       getLlm,
+      // R9-10：面板 apply 的模型改写必须拿到 provider/model，缺选择由 core 转 needs_manual。
+      getSelection,
       git,
       log,
     }))

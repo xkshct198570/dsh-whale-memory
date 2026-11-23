@@ -346,6 +346,8 @@ test('applyProposal：合并走 LLM 改写（保留旧例外）→ 新规则 + �
     config: { rules: { llm: true } },
     git: false,
     getLlm: () => llm,
+    // R9-10：模型调用必须带 provider/model（旧用例只给 llm 不给选择，已是非法接线）。
+    getSelection: () => ({ provider: 'stub', model: 'stub' }),
   })
   assert.equal(result.ok, true, JSON.stringify({ err: result.error, failures: result.failures }))
   assert.equal(llmCalls.length, 1)
@@ -918,4 +920,50 @@ test('R9-14：acknowledgeDropped 旧布尔形状被明确拒绝（不静默放�
   })
   assert.equal(result.ok, false)
   assert.equal(result.error, 'invalid_acknowledge')
+})
+
+test('R9-10：LLM 改写缺 provider/model → needs_manual(no_model)，且不调用模型', async (t) => {
+  const root = freshRoot(t)
+  seed(root, { type: 'iron-rule', number: 5, exceptions: ['用户原件'] }, '源文件必须保留，例外：用户原件。')
+  const made = createProposal({
+    text: '按 rule:rule-src-keep 记成铁律：源文件必须保留，例外：用户原件', identity: IDENTITY, rulesDir: root, config: { rules: {} },
+  })
+  assert.equal(made.proposal.relation.relation, 'refine')
+  const calls = []
+  const llm = { chat: async (args) => { calls.push(args); return '{"merged_text":"源文件必须保留。"}' } }
+  const out = await applyProposal({
+    id: made.proposal.id,
+    rulesDir: root,
+    config: { rules: { llm: true } },
+    git: false,
+    getLlm: () => llm,
+    getSelection: () => ({}),
+  })
+  assert.equal(out.ok, false)
+  assert.equal(out.status, 'needs_manual')
+  assert.equal(out.code, 'no_model')
+  assert.equal(calls.length, 0, '缺 selection 不得猜测默认模型去调用')
+})
+
+test('R9-10：面板 LLM 接线——provider/model 透传到 llm.chat', async (t) => {
+  const root = freshRoot(t)
+  seed(root, { type: 'iron-rule', number: 5, exceptions: ['用户原件'] }, '源文件必须保留，例外：用户原件。')
+  const made = createProposal({
+    text: '按 rule:rule-src-keep 记成铁律：源文件必须保留，例外：用户原件', identity: IDENTITY, rulesDir: root, config: { rules: {} },
+  })
+  const calls = []
+  const llm = { chat: async (args) => { calls.push(args); return JSON.stringify({ merged_text: '源文件必须保留，例外：用户原件。', affected: [] }) } }
+  const out = await applyProposal({
+    id: made.proposal.id,
+    rulesDir: root,
+    config: { rules: { llm: true } },
+    git: false,
+    getLlm: () => llm,
+    getSelection: () => ({ provider: 'deepseek', model: 'deepseek-chat' }),
+  })
+  assert.equal(out.ok, true, JSON.stringify({ err: out.error, failures: out.failures }))
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].provider, 'deepseek')
+  assert.equal(calls[0].model, 'deepseek-chat')
+  assert.ok(calls[0].system, 'prompt.system 必须随调用下发（防正文指令污染）')
 })

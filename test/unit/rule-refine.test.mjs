@@ -30,7 +30,7 @@ test('提炼：模型只改草稿措辞，来源原文保持原样', async (t) =
   }) }
   const out = await refineProposal({
     id: made.proposal.id, rulesDir: root, config: { rules: { llm: true } },
-    getLlm: () => llm, getSelection: () => ({ model: 'stub' }),
+    getLlm: () => llm, getSelection: () => ({ provider: 'stub', model: 'stub' }),
   })
   assert.equal(out.ok, true, out.code)
   const after = readProposal({ rulesDir: root, config: { rules: { llm: true } }, id: made.proposal.id }).proposal
@@ -51,7 +51,7 @@ test('提炼：模型输出带围栏/闲话也能解析；不合规输出保留�
   const bad = { chat: async () => JSON.stringify({ text: '这是一句描述，不是规则。', conditions: [], exceptions: [], summary: 'x' }) }
   const out = await refineProposal({
     id: made.proposal.id, rulesDir: root, config: { rules: { llm: true } },
-    getLlm: () => bad, getSelection: () => ({ model: 'stub' }),
+    getLlm: () => bad, getSelection: () => ({ provider: 'stub', model: 'stub' }),
   })
   assert.equal(out.ok, false)
   assert.equal(out.state, 'failed')
@@ -76,7 +76,7 @@ test('提炼：候选已被裁定（rejected）后模型回包不得覆盖状态
   } }
   const out = await refineProposal({
     id: made.proposal.id, rulesDir: root, config: { rules: { llm: true } },
-    getLlm: () => llm, getSelection: () => ({ model: 'stub' }),
+    getLlm: () => llm, getSelection: () => ({ provider: 'stub', model: 'stub' }),
   })
   assert.equal(out.ok, false)
   assert.equal(out.code, 'proposal_changed')

@@ -717,6 +717,13 @@ export function createRoutes({
     if (await handleRules({
       req, res, path, config, backend, log,
       getLlm: () => (ctx?.get?.('llm') ?? null),
+      // R9-10：面板 apply/改写需要 provider/model 才能调模型；缺选择由 core 转 needs_manual。
+      getSelection: () => {
+        try {
+          const model = ctx?.get?.('agentDefaultModel')
+          return typeof model?.currentSelection === 'function' ? model.currentSelection() : null
+        } catch { return null }
+      },
       invalidateCache: invalidateRulesCache,
     })) return undefined
 
