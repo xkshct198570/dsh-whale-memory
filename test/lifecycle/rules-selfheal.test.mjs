@@ -239,15 +239,29 @@ test('干净安装 E2E：无 marker 空仓 → 播种整包默认铁律 → AGEN
   const agentsPath = join(home, 'AGENTS.md')
   const result = await runRulesSelfHeal({ config: cfgOf(rulesDir), backend })
   const { readdirSync } = await import('node:fs')
-  const expected = readdirSync(defaultRulesDir()).filter((name) => name.endsWith('.md') && name.toUpperCase() !== 'README.MD').length
-  assert.equal(result.seeded?.seeded, expected, `空仓应播种整包默认铁律（${expected} 条）`)
+  const defaultNames = readdirSync(defaultRulesDir())
+    .filter((name) => name.endsWith('.md') && name.toUpperCase() !== 'README.MD')
+  const expected = defaultNames.length
+  // 被并条目（带 merged_into 指针）仍是落盘规则文件，但摘要只渲染链终点：
+  // 计数必须按「终态条数」断言，否则合并一条就误判成播种漏了一条。
+  const merged = defaultNames.filter((name) => {
+    const source = nodeFs.readFileSync(join(defaultRulesDir(), name), 'utf8')
+    return /^merged_into:\s*["']?[A-Za-z0-9-]+["']?\s*$/m.test(source)
+  })
+  const terminal = expected - merged.length
+  assert.equal(result.seeded?.seeded, expected, `空仓应播种整包默认铁律（${expected} 条文件）`)
   assert.equal(result.rules, expected)
   assert.equal(result.agents?.created, true, result.agents?.code)
   const content = nodeFs.readFileSync(agentsPath, 'utf8')
   const lines = content.split('\n').filter((line) => line.startsWith('- '))
-  assert.equal(lines.length, expected, '整包默认铁律必须全部进 AGENTS 摘要')
+  assert.equal(lines.length, terminal, `链终点规则必须全部进 AGENTS 摘要（${terminal} 条）`)
   assert.match(content, /- iron-rule-safety /)
   assert.match(content, /- 铁律1 · /)
+  // 被并条不得以独立行出现（否则用户会看到两条互相矛盾的铁律）。
+  for (const name of merged) {
+    const key = name.slice(0, -3)
+    assert.equal(content.includes(`- ${key} `), false, `${key} 已合并却仍单独出现在摘要`)
+  }
   assert.match(content, /^<!-- whale-memory:rules:begin -->\n/, '最小管理块从 begin 开始')
   assert.match(content, /<!-- whale-memory:rules:end -->\n$/, '以 end 结束')
 })

@@ -234,7 +234,9 @@ export function expandOneHop(db, { seeds = [], identity = {}, minConf = 0.6, cap
     FROM edges e JOIN nodes n ON n.id = CASE WHEN e.from_id IN (${marks}) THEN e.to_id ELSE e.from_id END
     WHERE (e.from_id IN (${marks}) OR e.to_id IN (${marks}))
       AND e.etype IN ('topic','reference') AND e.conf >= ?
-      AND n.status = 'active'${where}
+      AND n.status = 'active'
+      -- 规则镜像只服务面板检索：扩散路径同样不得把它带回对话上下文（R8-08）。
+      AND n.origin NOT LIKE 'rule:%'${where}
     LIMIT ?`
   let rows
   try {

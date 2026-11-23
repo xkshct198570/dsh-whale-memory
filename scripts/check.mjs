@@ -10,6 +10,7 @@
  * 用法：node scripts/check.mjs   失败项逐条打印 `[gate] EXx FAIL: 原因`，退出码 1。
  */
 import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
 import { join, dirname } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -562,6 +563,24 @@ if (guardReasons.length) {
   console.error(`[gate] GUARD FAIL: ${guardReasons.join('；')}`)
 }
 
+// 说明书是离线交付物：MD 真源存在、≤250 行、生成块逐字一致（改了 MD 忘了重生成＝用户看旧说明）。
+gate('E16', () => {
+  const reasons = []
+  const manual = join(root, 'docs/MANUAL.zh.md')
+  if (!existsSync(manual) || !statSync(manual).isFile()) {
+    reasons.push('缺少 docs/MANUAL.zh.md')
+  } else {
+    const lines = readFileSync(manual, 'utf8').replace(/\r\n/g, '\n').trim().split('\n').length
+    if (lines > 250) reasons.push(`docs/MANUAL.zh.md ${lines} 行 > 250（小白手册要短）`)
+  }
+  try {
+    execFileSync(process.execPath, [join(root, 'scripts/manual-build.mjs'), '--check'], { stdio: 'pipe' })
+  } catch {
+    reasons.push('client 说明书生成块与 docs/MANUAL.*.md 不一致（运行 node scripts/manual-build.mjs --write）')
+  }
+  return reasons
+})
+
 // ---------------------------------------------------------------------------
 for (const [id, fn] of gates) {
   try {
@@ -576,5 +595,5 @@ if (failed) {
   console.error(`[gate] FAILED：${failed} 项未过（见上）`)
   process.exitCode = 1
 } else {
-  console.log(`[gate] OK ${pkg.name}@${pkg.version}：E1–E15 全通过（禁区/waterfall 守卫也过）`)
+  console.log(`[gate] OK ${pkg.name}@${pkg.version}：E1–E16 全通过（禁区/waterfall 守卫也过）`)
 }

@@ -333,3 +333,14 @@ test('mirrorStatus：只改 front.scope/priority/status（正文不变）→ sta
   assert.match(row.tags, /rule-scope:workspace:\/tmp\/ws/)
   assert.equal(row.workspace, '/tmp/ws')
 })
+
+test('mirrorStatus：front.updated 是日期不是时刻——今天更新的规则重建后不得误报 stale（UTC+8 凌晨回归）', (t) => {
+  const { root, backend } = fresh(t)
+  const today = new Date()
+  const ymd = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`
+  addRule(root, 1, { updated: ymd })
+  assert.equal(mirrorRules({ backend, rules: listRules(root).rules }).ok, true)
+  const status = mirrorStatus({ backend, rules: listRules(root).rules })
+  assert.equal(status.stale, 0, '当天日期的规则被误判成镜像过期')
+  assert.equal(status.mirrored, 1)
+})

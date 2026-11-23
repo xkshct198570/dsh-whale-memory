@@ -296,7 +296,13 @@ export function mirrorStatus({ backend, rules } = {}) {
       const row = byKey.get(key)
       if (!row) { missing += 1; continue }
       const hashOk = row.text_hash === contentHash(body)
-      const fileUpdated = Date.parse(textOf(front?.updated))
+      // front.updated 是“日期”不是“时刻”：直接 Date.parse('YYYY-MM-DD') 会按 UTC 零点，
+      // 在 UTC+8 凌晨会比本地 now 还大 4–8 小时，导致“刚重建完仍全量报 stale”。
+      // 日期型按本地当天零点比较；带时刻的值原样解析。
+      const updatedText = textOf(front?.updated)
+      const fileUpdated = /^\d{4}-\d{2}-\d{2}$/.test(updatedText)
+        ? Date.parse(`${updatedText}T00:00:00`)
+        : Date.parse(updatedText)
       const newerFile = Number.isFinite(fileUpdated) && row.updated_at < fileUpdated
       if (hashOk && !newerFile && !driftOf(row, front)) mirrored += 1
       else stale += 1

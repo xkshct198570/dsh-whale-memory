@@ -76,8 +76,8 @@ function agentsFile(dir, body = '- 旧行') {
 // R8-06 契约变更：摘要由「global active 铁律」扩为「global active 全收」——普通全局规则
 // 也必须出现在 AGENTS（铁律按编号在前、普通规则按 priority→key 在后），否则普通规则只剩
 // 面板可见、模型永远读不到。原断言 `count=3` / 普通规则不进摘要按 v3.8 §4.1 作废。
-test('rulesDigestContent：只收 global+active（铁律按编号前、普通按 priority→key 后），正文截 200 字', () => {
-  const long = '必须'.repeat(120)
+test('rulesDigestContent：只收 global+active（铁律按编号前、普通按 priority→key 后），正文截 500 字', () => {
+  const long = '必须'.repeat(300)
   const got = rulesDigestContent([
     doc({ key: 'iron-rule-17', number: 17, text: '删文档前先核对绝对路径。' }),
     doc({ key: 'iron-rule-13', number: 13, text: '只在本工作区生效。' }),
@@ -98,8 +98,8 @@ test('rulesDigestContent：只收 global+active（铁律按编号前、普通按
   const longLine = got.content.split('\n').find((line) => line.startsWith('- 铁律20'))
   // 摘要 60 字后追加「（文件：…）」指针，取两者之间的正文再数长度。
   const excerpt = longLine.slice(longLine.indexOf('：') + 1, longLine.indexOf('（文件：'))
-  // 200 字 + 截断省略号（长文本才有）
-  assert.equal(Array.from(excerpt).length, 201)
+  // 500 字 + 截断省略号（长文本才有）
+  assert.equal(Array.from(excerpt).length, 501)
   assert.match(excerpt, /…$/)
   assert.match(longLine, /（文件：iron-rule-20\.md）$/)
 })
@@ -127,13 +127,13 @@ test('rulesDigestContent：正文单行化 + 控制字符剔除 + 标记字面�
   assert.match(line, /第一行 第二行 第三行结束。余下/)
 })
 
-test('rulesDigestContent：无 summary 时 200 码点回退最后一个句末（不切半句）', () => {
+test('rulesDigestContent：无 summary 时 500 码点回退最后一个句末（不切半句）', () => {
   const head = `${'甲'.repeat(100)}。`
-  const text = `${head}${'乙'.repeat(150)}。`
+  const text = `${head}${'乙'.repeat(500)}。`
   const got = rulesDigestContent([doc({ key: 'iron-rule-25', number: 25, text })])
   const line = got.content.split('\n').find((item) => item.startsWith('- 铁律25'))
   const excerpt = line.slice(line.indexOf('：') + 1, line.indexOf('（文件：'))
-  assert.equal(excerpt, `${head}…`, '前 200 码点内最后句末在第 100 位，必须回退到句末')
+  assert.equal(excerpt, `${head}…`, '前 500 码点内最后句末在第 100 位，必须回退到句末')
 })
 
 test('titleOfRule：标题压单行并按码点切片（不切代理对）', () => {

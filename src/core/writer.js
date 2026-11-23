@@ -372,6 +372,10 @@ function resolveOptions(opts) {
     dailyCap: Math.max(0, Math.floor(finite(plain(o.dailyCap), 200))),
     protect: plain(o.protect) !== false,
     redact: plain(o.redact) !== false,
+    // 忽略规则：面板每行一条正则；只做「不进库」判定，不参与合并/去重。
+    ignorePatterns: Array.isArray(o.ignorePatterns)
+      ? o.ignorePatterns.map((item) => String(item ?? '').trim()).filter(Boolean)
+      : [],
   }
 }
 
@@ -449,6 +453,16 @@ function decideByRules(db, event, opts = {}) {
   const original = normalize(String(event?.text ?? ''))
   if (!original) return { action: 'REJECT', reason: 'invalid_text', mode: options.mode }
   if (original.length > options.maxChars) return { action: 'REJECT', reason: 'text_too_long', mode: options.mode }
+
+  // 1.5 忽略规则：命中任一正则即不进库（仍写审计 REJECT/ignored，不静默丢弃）。
+  // 坏正则只跳过这一条：一条写错的规则不能挡住全部写入。
+  for (const pattern of options.ignorePatterns) {
+    try {
+      if (new RegExp(pattern).test(original)) {
+        return { action: 'REJECT', reason: 'ignored', mode: options.mode }
+      }
+    } catch { /* 非法正则：跳过，不阻断写入 */ }
+  }
 
   // 2. 隐私：默认脱敏后继续，严格入口直接拒绝
   const privacy = privacyCheck(original, { redact: options.redact })
@@ -896,6 +910,9 @@ function resolveConfig(config) {
     dailyCap: finite(plain(w.dailyCap), 200),
     protect: plain(w.protect) !== false,
     redact,
+    ignorePatterns: Array.isArray(w.ignorePatterns)
+      ? w.ignorePatterns.map((item) => String(item ?? '').trim()).filter(Boolean)
+      : [],
   }
 }
 

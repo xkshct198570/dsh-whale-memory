@@ -146,14 +146,6 @@ function levelRank(level) {
   return LEVEL[level] ?? LEVEL.normal
 }
 
-/** 规则镜像行 id 集合：扩散路径（relations.js 不返回 origin）按 id 排除，保证召回零规则。 */
-function ruleNodeIds(db) {
-  try {
-    return new Set(db.prepare("SELECT id FROM nodes WHERE origin LIKE 'rule:%'").all().map((row) => String(row.id)))
-  } catch {
-    return new Set()
-  }
-}
 
 /**
  * 本地检索。
@@ -247,14 +239,14 @@ export function search(db, opts = {}) {
   const seen = new Set(hits.map((h) => h.id))
   const relBySeed = new Map(hits.slice(0, 3).map((h) => [h.id, h.rel]))
   if (opts.diffusion !== false && hits.length > 0) {
-    const ruleIds = ruleNodeIds(db)
     for (const row of expandOneHop(db, {
       seeds: hits.slice(0, 3),
       identity: opts.identity,
       minConf: opts.minConf,
       cap: 20,
     })) {
-      if (seen.has(row.id) || ruleIds.has(String(row.id))) continue
+      // 规则镜像由 expandOneHop 的 SQL 直接排除（origin LIKE 'rule:%'），不再每轮拉全表 id 集合。
+      if (seen.has(row.id)) continue
       seen.add(row.id)
       // 边的方向不固定：via 是种子那一端，另一头才是扩散命中。
       const fromId = String(row.from_id)

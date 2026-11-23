@@ -1074,3 +1074,19 @@ test('reference_time：事件时间进 valid_at，created_at 仍是系统时间�
   const row2 = db.prepare('SELECT valid_at,created_at FROM nodes WHERE id=?').get(r2.id)
   assert.equal(Number(row2.valid_at), Number(row2.created_at))
 })
+
+test('忽略规则：命中正则不落节点只记 REJECT/ignored；坏正则不阻断其它写入', (t) => {
+  const db = freshDb(t)
+  const cfg = auto({ ignorePatterns: ['密码是\\d+'] })
+  const hit = processEvent(db, event('密码是123456'), cfg)
+  assert.equal(hit.action, 'REJECT')
+  assert.equal(hit.reason, 'ignored')
+  assert.equal(db.prepare('SELECT count(*) AS n FROM nodes').get().n, 0)
+  const row = db.prepare('SELECT action, reason FROM writes ORDER BY ts DESC LIMIT 1').get()
+  assert.equal(String(row.action), 'REJECT')
+  assert.match(String(row.reason), /ignored/)
+
+  // 非法正则只跳过该条：一条写错的规则不能挡住全部写入。
+  const ok = processEvent(db, event('今天天气是晴'), auto({ ignorePatterns: ['(['] }))
+  assert.equal(ok.action, 'ADD')
+})

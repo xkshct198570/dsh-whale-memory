@@ -301,7 +301,11 @@ test('规则设置组 9 字段：默认值/生效/依赖与 UI 控件齐全', ()
     const field = key.split('.')[1]
     assert.ok(settings.includes(`idOf('rules', '${field}')`), `设置页缺少 rules.${field} 控件`)
   }
-  assert.ok(settings.includes("t('settings.groupRules')"), '设置页缺少规则分组标题')
+  // WP2 起分组卡改用 titleKey（卡片自己取文案，避免调用方重复传 t）；两种写法都算接上分组标题。
+  assert.ok(
+    settings.includes("t('settings.groupRules')") || settings.includes("titleKey: 'settings.groupRules'"),
+    '设置页缺少规则分组标题',
+  )
   assert.ok(settings.includes('draft.rules.enabled'), '设置页未接 draft.rules')
 })
 

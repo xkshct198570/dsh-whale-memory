@@ -15,7 +15,7 @@
  * 目录可能又空了；若以"空目录"为判据就会把铁律重新灌回来，等于用户永远删不掉。`.seeded.json`
  * 才是判据——播过一次就不再播，剩下的一切以文件现状为准。
  *
- * Why 一次 commit：默认播种是"一次安装动作"，18 个文件各自 commit 会把规则仓的 history 打成噪音，
+ * Why 一次 commit：默认播种是"一次安装动作"，20 个文件各自 commit 会把规则仓的 history 打成噪音，
  * 也没法用一条提交回滚整批默认值。写文件时 `git:false`，最后统一提交一次；仓库不存在时先用
  * `initRuleRepo` 只建仓（不建首 commit），保证首启也只有一个提交点、且该提交包含全部默认规则。
  */
@@ -165,7 +165,7 @@ function compactInvalid(invalid) {
 }
 
 /**
- * 让出事件循环一次（R9-21b）：首启 16 条默认规则不得在同一个 tick 里同步写完。
+ * 让出事件循环一次（R9-21b）：首启 20 个默认规则文件不得在同一个 tick 里同步写完。
  *
  * 为什么用 setImmediate：它排在 I/O 之后的 check 阶段，先把「启动路径」让出去；
  * `setTimeout(0)` 要多等一个 timers 阶段，且启动自愈本身就跑在 setTimeout 里（别自己饿死自己）。
@@ -189,7 +189,7 @@ function yieldToEventLoop() {
  * 4. `SEED_VERSION` 参与：marker.version 落后时升级写回，即使本次没有新文件；
  * 5. 播种在调用方持有的仓库锁内完成（本函数自己拿锁；锁内写规则传 lockHeld:true），
  *    一次 git commit（显式路径）；`git:false` 只写文件。
- * 6. async：逐文件 `setImmediate` 让出事件循环（R9-21b），首启 16 条不在同一 tick 跑完；
+ * 6. async：逐文件 `setImmediate` 让出事件循环（R9-21b），首启 20 个文件不在同一 tick 跑完；
  *    锁跨 tick 由「活 pid 不接管」保证安全（架构书 §2.7）。
  *
  * @param {{root?:string, defaultsDir?:string, marker?:string, log?:Function}} [args]
@@ -427,7 +427,7 @@ async function seedEntries({ base, defaults, files, fs, log }) {
   const tombstonedKeys = new Set(readTombstones(base, { fs }).map((item) => String(item.key)))
   let tombstoned = 0
   for (const name of files) {
-    // 一次 setImmediate 写一条（R9-21b）：首启 16 条默认规则不得在同一个 tick 里跑完。
+    // 一次 setImmediate 写一条（R9-21b）：首启 20 个默认规则文件不得在同一个 tick 里跑完。
     await yieldToEventLoop()
     const file = join(defaults, name)
     if (tombstonedKeys.has(keyOfDefaultFile(name))) {

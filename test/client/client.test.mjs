@@ -613,3 +613,77 @@ test('R10：设置只提交脏叶子；提案 apply/reject 用同步 ref 闸防�
   // 详情 PATCH 回传版本，Host 才能做 CAS（否则 node_changed 是死码）。
   assert.match(CLIENT, /expectedUpdatedAt: loaded\.status === 'ok'/)
 })
+
+test('WP1 首启推荐：只在全默认配置出现，应用只提交差异，同步以 dry-run 起步', () => {
+  assert.ok(CLIENT.includes('function configIsDefaults(cfg)'), '缺少首启默认值判定')
+  assert.match(CLIENT, /if \(key === 'sync\.bridgeUrl'\) continue/, 'profile 注入的桥地址不应算作用户改动')
+  assert.match(CLIENT, /const firstRunSeenRef = useRef\(readFirstRunSeen\(\)\)/, '缺少首启已读标记')
+  assert.match(CLIENT, /if \(load\.status !== 'ok' \|\| firstRunSeenRef\.current\) return/, '已处理过仍会弹')
+  assert.match(CLIENT, /if \(!configIsDefaults\(serverRef\.current\)\) return/, '已有配置也会弹 / 会覆盖')
+  assert.match(CLIENT, /next\.sync = \{ \.\.\.draft\.sync, enabled: true, mode: 'both', dryRun: true \}/,
+    '同步推荐未以 dry-run 起步（会直接改远端）')
+  assert.match(CLIENT, /const okSaved = await persist\(next\)/, '向导未走差异提交路径')
+  assert.match(CLIENT, /if \(okSaved\) markFirstRunSeen\(\)/, '保存后未记首启已处理')
+  for (const key of ['settings.firstRunTitle', 'settings.firstRunDesc', 'settings.firstRunApply',
+    'settings.firstRunLater', 'settings.firstRunReflectNote',
+    'settings.firstRunSyncNote', 'settings.firstRunSyncUnset', 'settings.recommend']) {
+    for (const lang of LANGS) assert.ok(String(dicts[lang][key] || '').trim(), `${lang} 缺少 ${key}`)
+  }
+})
+
+test('WP1 推荐开启徽标：四个需外部条件的开关带 recommend，badge 枚举不被污染', () => {
+  const meta = settingsMeta()
+  for (const key of ['reflect.enabled', 'sync.enabled', 'write.searchFeed']) {
+    assert.equal(meta[key].recommend, true, `${key} 缺推荐标记`)
+  }
+  const rules = new Function(`${contractBlock('rules-settings:contract')
+    .replace(/\/\/ >>> rules-settings:contract[^\n]*/, '')
+    .replace(/\/\/ <<< rules-settings:contract[^\n]*/, '')}\nreturn RULES_SETTINGS_META`)()
+  assert.equal(rules['rules.llm'].recommend, true, 'rules.llm 缺推荐标记')
+  for (const [key, item] of Object.entries(meta)) {
+    assert.ok(['general', 'local', 'needsConfig'].includes(item.badge), `${key} badge 枚举被污染`)
+  }
+  assert.ok(CLIENT.includes("recommend: meta && meta.recommend ? t('settings.recommend') : undefined"), '推荐标记未进卡片元数据')
+  assert.match(CLIENT, /recommendChip/, '缺少推荐徽标样式')
+})
+
+test('WP2 设置信息架构：顺序固定、首屏四组展开、其余默认收起、布局根因修复', () => {
+  assert.match(CLIENT, /const SETTINGS_GROUP_ORDER = Object\.freeze\(\[\s*'recall', 'write', 'identity', 'rules', 'backend', 'sync',\s*'reflect', 'consolidate', 'privacy', 'edges', 'panel', 'advanced', 'embed',\s*\]\)/)
+  assert.match(CLIENT, /SETTINGS_GROUP_ORDER\.map\(\(key\) => \(groupNodes\[key\]/, '未按顺序渲染分组')
+  assert.match(CLIENT, /h\(React\.Fragment, \{ key \}, groupNodes\[key\]\(\)\)/, '分组列表缺稳定 key')
+  // 折叠卡自己取文案：调用方必须注入 t，否则首渲染就 ReferenceError。
+  assert.equal((CLIENT.match(/t, titleKey: 'settings\.group/g) || []).length, 13, '13 个分组卡必须全部注入 t')
+  assert.match(CLIENT, /t, titleKey: 'settings\.groupRecall'/)
+  assert.match(CLIENT, /SETTINGS_CORE_GROUP_KEYS = new Set\(\[\s*'settings\.groupRecall', 'settings\.groupWrite', 'settings\.groupIdentity', 'settings\.groupRules',\s*\]\)/)
+  assert.match(CLIENT, /function readGroupOpen\(/, '缺展开状态读取')
+  assert.match(CLIENT, /function writeGroupOpen\(/, '缺展开状态持久化')
+  assert.match(CLIENT, /titleKey === 'settings\.groupDanger'/, '危险区未强制展开')
+  // 布局根因：input 不再继承 flex-basis；grid 不再 stretch。
+  assert.match(CLIENT, /fieldInput: \{\s*flex: '0 0 auto', width: '100%'/, 'input 仍会被 column flex-basis 拉高')
+  assert.match(CLIENT, /groupGrid: \{\s*display: 'grid', gridTemplateColumns: 'repeat\(auto-fit, minmax\(260px, 1fr\)\)',\s*gap: '10px', alignItems: 'start',/, 'grid 仍会拉伸空卡')
+  assert.match(CLIENT, /settingCard: \{[\s\S]{0,220}?alignSelf: 'start'/, '设置卡未禁止拉伸')
+  assert.match(CLIENT, /numberInput: \{[^}]*maxWidth: '180px'/, '数值输入未限宽')
+  assert.ok(CLIENT.includes("'aria-controls': 'settings-group-' + titleKey + '-body'"), '折叠卡缺 aria-controls 关联')
+  assert.ok(CLIENT.includes("id: alwaysOpen ? undefined : 'settings-group-' + titleKey + '-body'"), '折叠卡内容区缺 id 关联')
+})
+
+test('WP3 说明书：MD 真源生成块一致、页头按钮与抽屉键盘契约、术语表入口', () => {
+  assert.ok(CLIENT.includes('// >>> manual:generated'), '缺少说明书生成块')
+  const start = CLIENT.indexOf('// >>> manual:generated')
+  const end = CLIENT.indexOf('// <<< manual:generated', start)
+  assert.ok(end > start, '说明书生成块标记不完整')
+  const block = CLIENT.slice(start, end)
+  const jsonText = block.slice(block.indexOf('const MANUAL_DOC = ') + 'const MANUAL_DOC = '.length).trim()
+  const docs = JSON.parse(jsonText)
+  assert.ok(String(docs.zh || '').split('\n').length >= 100, '中文说明书内容过少')
+  assert.ok(String(docs.zh).includes('## 5. 术语表'), '说明书缺少术语表')
+  assert.ok(String(docs.zh).includes('## 6. FAQ'), '说明书缺少 FAQ')
+  assert.ok(CLIENT.includes('function ManualDrawer'), '缺少说明书抽屉')
+  assert.ok(CLIENT.includes('function MiniMarkdown'), '缺少离线 Markdown 渲染')
+  assert.match(CLIENT, /onClick: \(\) => setManualOpen\(true\)/, '页头没有说明书按钮')
+  assert.match(CLIENT, /e\.key === 'Escape'/, '说明书抽屉缺 Esc 关闭')
+  assert.match(CLIENT, /onOpenManual: \(\) => setManualOpen\(true\)/, '设置页未接说明书入口')
+  for (const key of ['manual.button', 'manual.title', 'manual.close', 'manual.zhOnly']) {
+    for (const lang of LANGS) assert.ok(String(dicts[lang][key] || '').trim(), `${lang} 缺少 ${key}`)
+  }
+})
