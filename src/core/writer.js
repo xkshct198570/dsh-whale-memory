@@ -1125,7 +1125,6 @@ function collectJudgeText(llm, selection, prompt, modelOverride) {
       try { controller.abort() } catch { /* 已结束的 stream 再 abort 无害 */ }
       finish({ ok: false, error: 'timeout' })
     }, JUDGE_TIMEOUT_MS)
-    if (typeof timer.unref === 'function') timer.unref()
     void (async () => {
       let text = ''
       try {
