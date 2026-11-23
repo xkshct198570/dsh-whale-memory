@@ -659,6 +659,7 @@
   "settings.rulesMirrorAutoDesc": "ルールファイル変更後に DB へ自動同期（召回用）。オフ＝手動で「ミラーを再構築」。",
   "settings.rulesAskCooldownDays": "確認クールダウン（日）",
   "settings.rulesAskCooldownDaysDesc": "同じルールを再確認する最短間隔。0＝毎回確認。",
+  "settings.rulesConfigLayerNote": "次の3つのキーは設定ファイル層でのみ有効です（パネルにスイッチはありません）：rules.renderAgents（AGENTS 要約を再描画するか）、rules.injectChars（毎ターンの注入文字予算、0=無効）、rules.createAgentsIfMissing（空の環境で AGENTS 管理ブロックを自動作成するか）。変更するにはプラグイン設定を編集してホストを再起動してください。",
   "settings.depRulesEnabled": "ルール機能がオフのため、この項目は無効です",
   "rules.typeCandidate": "候補ルール",
   "rules.importSkipped": "既に存在するためスキップしました",

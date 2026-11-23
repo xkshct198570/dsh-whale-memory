@@ -586,3 +586,15 @@ test('手动同步方向跟随 sync.mode（off 时按钮仍双向，不误当禁
   assert.match(CLIENT, /direction: syncDir, dryRun: true/, '预演未使用 syncDir')
   assert.match(CLIENT, /direction: syncDir, dryRun: false, confirm: true/, '实跑未使用 syncDir')
 })
+
+test('R9-07 收尾：记忆详情错误态可重试；设置页有配置层键 Note', () => {
+  // 错误态必须带 onRetry，且重载由 reloadTick 驱动（id 变化仍会重置）。
+  assert.match(CLIENT, /onRetry: \(\) => setReloadTick\(\(n\) => n \+ 1\)/, '详情错误态缺重试按钮')
+  assert.ok(CLIENT.includes('}, [id, reloadTick])'), '详情重载 effect 未随 reloadTick 重跑')
+  // 配置层键 Note：三语都有，且在规则分组里渲染。
+  for (const lang of LANGS) assert.ok(String(dicts[lang]['settings.rulesConfigLayerNote'] || '').trim(), `${lang} 缺配置层键说明`)
+  assert.ok(CLIENT.includes("t('settings.rulesConfigLayerNote')"), '设置页未渲染配置层键 Note')
+  for (const key of ['rules.renderAgents', 'rules.injectChars', 'rules.createAgentsIfMissing']) {
+    assert.ok(String(dicts.zh['settings.rulesConfigLayerNote']).includes(key), `Note 未点名 ${key}`)
+  }
+})

@@ -659,6 +659,7 @@
   "settings.rulesMirrorAutoDesc": "Sync rule files into the DB for recall after changes; off = manual \"Rebuild mirror\".",
   "settings.rulesAskCooldownDays": "Ask cooldown (days)",
   "settings.rulesAskCooldownDaysDesc": "Minimum gap before asking about the same rule again; 0 = ask every time.",
+  "settings.rulesConfigLayerNote": "Three keys only work at the config-file layer (no panel switch): rules.renderAgents (re-render the AGENTS digest), rules.injectChars (per-turn injection budget; 0 disables), rules.createAgentsIfMissing (create a minimal AGENTS block on a blank machine). Edit the plugin config and restart the host to change them.",
   "settings.depRulesEnabled": "Rules feature is off, so this setting has no effect",
   "rules.typeCandidate": "Candidate rule",
   "rules.importSkipped": "Iron law already exists; skipped",
