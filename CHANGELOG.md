@@ -6,6 +6,7 @@
 - hook：提案检测调度改宿主无关 `setImmediate`，不再读取 `ctx.setTimeout`（cordis `timer` accessor，未 inject 即抛 → 真机聊天提案 0 次成功）；日志拆 `pre-step fail-open` 与独立 `rules proposal fail-open`。
 - rule-store：编号占用真源 = `iron-rule-<n>.md` 文件名编号 ∪ 解析成功 front 编号 ∪ 墓碑（非法 front 文件也占号，create 不再复用编号/覆盖原文件；>999 文件名不锁死分配）；manifest / `/rules/health` / 列表 nextNumber / plan / 提案同口径。
 - rule-store：写失败四处回滚（文件 / manifest / history / git index）；正文与 history 快照 durable 写（fsync）；非降级 commit 失败返回 `commit_failed` 并回滚，不再 `ok:true` 丢提交；history ENOENT 视为已回滚。
+- 契约变更（测试语义同步改写）：提案期 `draft.number` 与 manifest 同口径（文件名∪front∪墓碑），不再『先按 active 给号、apply 才顺延』；`rule-proposal` 相应用例按新契约改写（断言 draft=4 而非 3+顺延）。
 - 测试：808（807 pass / 1 skip / 0 fail），新增 `rule-store-r9`（编号占用/manifest 半写/commit 回滚/fsync/>999/提案同口径）与 `proposal-scheduler`（Proxy 复刻 cordis accessor + 失败标签）回归。
 
 ## 0.6.0 — 2026-11-22（规则化 · 文件卫生 · 已发布）
