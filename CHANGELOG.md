@@ -1,6 +1,14 @@
 # Changelog
 
-## 0.6.0 — 2026-11-22（规则化 · 文件卫生 · 未发布）
+## 0.6.1 — 2026-11-23（未发布 · R9 稳定性修复）
+
+真机链路与写不变式（架构书 v3.9 / 计划 v1.9 的 R9-01/02/03）。
+- hook：提案检测调度改宿主无关 `setImmediate`，不再读取 `ctx.setTimeout`（cordis `timer` accessor，未 inject 即抛 → 真机聊天提案 0 次成功）；日志拆 `pre-step fail-open` 与独立 `rules proposal fail-open`。
+- rule-store：编号占用真源 = `iron-rule-<n>.md` 文件名编号 ∪ 解析成功 front 编号 ∪ 墓碑（非法 front 文件也占号，create 不再复用编号/覆盖原文件；>999 文件名不锁死分配）；manifest / `/rules/health` / 列表 nextNumber / plan / 提案同口径。
+- rule-store：写失败四处回滚（文件 / manifest / history / git index）；正文与 history 快照 durable 写（fsync）；非降级 commit 失败返回 `commit_failed` 并回滚，不再 `ok:true` 丢提交；history ENOENT 视为已回滚。
+- 测试：808（807 pass / 1 skip / 0 fail），新增 `rule-store-r9`（编号占用/manifest 半写/commit 回滚/fsync/>999/提案同口径）与 `proposal-scheduler`（Proxy 复刻 cordis accessor + 失败标签）回归。
+
+## 0.6.0 — 2026-11-22（规则化 · 文件卫生 · 已发布）
 
 规则真源从数据库迁到本地 git 规则仓（`~/.dsh/rules/`），DB 只做镜像；提案制（识别→编译→关系判定→守卫→用户确认→git commit→渲染/镜像）。
 - `src/core/rule-store.js`：YAML 子集 front matter、严格校验、原子写、history 快照（20/key）、manifest 编号（空号 6 不复用）、git commit/log/show/revert、同 key 跨进程锁。
@@ -12,7 +20,7 @@
 - 路由：rules 列表/详情/git-status/rebuild/import-legacy/propose/apply/reject/render-agents/update/diff/versions/revert。
 - UI：新增「规则」页签（规则库/待确认/历史）、提案收录/改写/拒绝、编辑/diff/回滚、Git 状态条与安装指引、设置「规则」组 11 字段；三语 812 键。
 - 文件卫生：配套 `~/ops/file-hygiene.mjs`（scan/trash/purge/extract-check/backup-check）与灾备排除项；铁律 17 入台账。
-- 测试 789（788 pass/1 skip）；干净 profile 单装/共装 3/3（whale/persona/both，目录与 tarball 两种源）；旧 `~/ops/dsh-blank-install-test.mjs` 本轮未复跑。
+- 测试 799（798 pass/1 skip）；干净 profile 单装/共装归档证据 5/6（whale/persona/both 的目录/部分 tarball 源；6/6 待 R9-15 重跑）；旧 `~/ops/dsh-blank-install-test.mjs` 本轮未复跑。
 - 默认铁律：`defaults/` 内置 16 条通用默认铁律（1–5、7–12、14–17 + 无编号 safety；铁律 13 为本机对照组专用，留在本地仓，不进公开包）。首次启动自动播种到空规则仓并单次 commit；`.seeded.json` 标记保证用户删/停用后不复活。
 - 规则管理：`POST /rules/create`（自动编号，铁律 1–17 占用后从 18 起）、`POST /rules/delete {mode:retire|reactivate}`（保留文件/编号/历史）；面板新增「新建规则」、详情「停用/重新启用」、默认铁律徽标与说明。
 - R8 返工：plan/apply（planHash+oldHash CAS、逐文件守卫、.txn 崩溃恢复、仓库锁、显式 git paths）、墓碑独立 `retired/`、编号只归铁律、镜像退出召回、摘要单行/标记防御、CSRF/JSON 闸、`/rules/health`、UI needs_manual/历史/默认徽标。

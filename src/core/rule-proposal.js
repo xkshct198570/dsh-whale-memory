@@ -304,8 +304,10 @@ export function createProposal({
   // 只与 active 正式规则比对：superseded/retired 已经失效，候选里的 `rule-candidate` 不是同层级。
   const activeRules = listed.rules.filter((doc) => textOf(doc.front.status) === 'active'
     && textOf(doc.front.type) !== 'rule-candidate')
-  // 墓碑编号必须并入：purge 掉最高号后，候选不能再拿回作废号。
-  const manifest = computeManifest(activeRules, readManifest(base)?.retired)
+  // 编号口径必须与 manifest/create/health 同源：用全量规则（含 inactive/候选外的历史文件）
+  // ＋文件名＋墓碑算 nextNumber；关系判定仍只看 activeRules。
+  // （非 `iron-rule-<n>.md` 文件名的 inactive 铁律，只能靠全量 rules 的 front 号占位。）
+  const manifest = computeManifest(listed.rules, readManifest(base)?.retired, storeApi.fileRuleNumbers(base))
 
   const compiled = compileStructured(raw, signals, {
     existingRules: activeRules,

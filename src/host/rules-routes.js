@@ -35,7 +35,7 @@ import { readJson, sendJson, isWriteMethod, writeRequestProblem } from './http-k
 import { value } from './config-values.js'
 import { detectGit, gitRequired, refreshGit } from './git-detector.js'
 import {
-  DIFF_LINE_LIMIT, computeManifest, createRule, defaultRuleRoot, diffLines, ensureRuleRepo, gitLog,
+  DIFF_LINE_LIMIT, computeManifest, createRule, defaultRuleRoot, diffLines, ensureRuleRepo, fileRuleNumbers, gitLog,
   isValidRuleKey, listRules, purgeRule, reactivateRule, readHistory, readManifest, readRule,
   readTombstones, resolveRevision, retireRule, revertRule, updateRule,
 } from '../core/rule-store.js'
@@ -85,7 +85,7 @@ export function rulesListPayload({ root = '', config = {}, detect = detectGit, f
   const dir = root || resolveRulesRoot(config)
   const list = listRules(dir)
   // 墓碑必须参与列表的 nextNumber：purge 过的编号不复用，列表页的"下一个编号"不能回落。
-  const manifest = computeManifest(list.rules, readManifest(dir)?.retired)
+  const manifest = computeManifest(list.rules, readManifest(dir)?.retired, fileRuleNumbers(dir))
   const rules = list.rules.map((doc) => ({
     key: textOf(doc.front.key),
     type: textOf(doc.front.type),
@@ -304,7 +304,7 @@ export function rulesHealthPayload({ root = '', config = {}, detect = detectGit 
   if (!manifest) {
     push('manifest_missing', { file: `${dir}/manifest.json` })
   } else {
-    const computed = computeManifest(list.rules, manifest.retired)
+    const computed = computeManifest(list.rules, manifest.retired, fileRuleNumbers(dir))
     if (Number(manifest.total) !== computed.total) {
       push('manifest_total_mismatch', { expected: computed.total, actual: Number(manifest.total) })
     }

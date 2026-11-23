@@ -504,10 +504,10 @@ export function installHook(ctx, {
         log(`[whale-memory] rules proposal fail-open: ${err?.name || err?.message || err}`)
       }
     }
-    // 不阻塞主链路：宿主 setTimeout 优先（随插件生命周期清理），否则 setImmediate。
-    if (typeof ctx?.setTimeout === 'function') {
-      try { ctx.setTimeout(run, 0); return } catch { /* 宿主不支持就降级 */ }
-    }
+    // 不阻塞主链路：只依赖全局调度能力，不摸宿主 ctx 服务。
+    // 为什么不 `ctx.setTimeout`：它是 cordis `timer` 服务的 mixin accessor，插件 inject 没有 timer 时
+    // **属性读取本身就会抛**（`typeof` 也挡不住），异常冒泡会被外层误记成 recall 失败——R9-01 真机死链。
+    // `run` 内已判 disposed，dispose 后即使定时器晚到也只空转，不需要宿主托管。
     if (typeof setImmediate === 'function') { setImmediate(run); return }
     setTimeout(run, 0)
   }
@@ -617,9 +617,16 @@ export function installHook(ctx, {
       if (parts.length) cache.set(sid, { text: parts.join('\n'), exp: Date.now() + CACHE_TTL_MS })
 
       // 5) 提案检测：召回之后、后台跑；仅有可裁定的人（owner 在聊天里）才问。
-      if (rulesOn && query) offerProposal({ sid, query, identityInfo: ident.identity, traceId })
+      // 单独兜底：这一步的异常不得污染上一层，也不得再被记成 recall 失败（R9-01 观测修正）。
+      if (rulesOn && query) {
+        try {
+          offerProposal({ sid, query, identityInfo: ident.identity, traceId })
+        } catch (err) {
+          log(`[whale-memory] rules proposal fail-open: ${err?.name || 'Error'} · ${err?.message || err}`)
+        }
+      }
     } catch (err) {
-      log(`[whale-memory] recall fail-open: ${err?.name || 'Error'} · ${err?.stack ? String(err.stack).split('\n').slice(0, 3).join(' | ') : (err?.message || err)}`)
+      log(`[whale-memory] pre-step fail-open: ${err?.name || 'Error'} · ${err?.stack ? String(err.stack).split('\n').slice(0, 3).join(' | ') : (err?.message || err)}`)
     }
     return decision
   }

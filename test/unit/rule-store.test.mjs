@@ -6,7 +6,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import * as nodeFs from 'node:fs'
-import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
@@ -247,9 +247,13 @@ test('跨进程并发写同一 key：锁内串行，文件始终完整、快照�
 test('原子写失败不破坏旧文件；tmp 被清理', (t) => {
   const root = freshRoot(t)
   assert.equal(writeDoc(root, frontOf(), '必须保留第一版正文。').ok, true)
+  // 按目标文件名定位失败点（不数调用序号）：只有写目标正文那一次 rename 落 `rule-1.md`。
   const badFs = {
     ...nodeFs,
-    renameSync() { throw new Error('rename blocked') },
+    renameSync(from, to) {
+      if (String(to).endsWith('/rule-1.md')) throw new Error('rename blocked')
+      return nodeFs.renameSync(from, to)
+    },
   }
   const failed = writeDoc(root, frontOf({ version: 2 }), '必须替换成第二版正文。', { fs: badFs })
   assert.equal(failed.ok, false)
@@ -258,6 +262,9 @@ test('原子写失败不破坏旧文件；tmp 被清理', (t) => {
   const got = readRule(root, 'rule-1')
   assert.equal(got.rule.text, '必须保留第一版正文。')
   assert.deepEqual(readdirSync(root).filter((n) => n.includes('.tmp-')), [])
+  // R9-03：失败的写尝试不得留下"幻影快照"（history 里没有本次 rev）。
+  const historyDir = join(root, 'history', 'rule-1')
+  assert.deepEqual(existsSync(historyDir) ? readdirSync(historyDir) : [], [])
 })
 
 test('atomicWriteFile：正常写覆盖、失败保留原内容', (t) => {
@@ -625,12 +632,16 @@ test('updateRule：git 不可用时只写文件（commit 降级，不抛）', (t
 test('updateRule：中途失败用写前快照回滚（manifest 失败场景）', (t) => {
   const root = freshRoot(t)
   assert.equal(writeDoc(root, frontOf(), '必须先验证再覆盖正式库。').ok, true)
-  let renames = 0
+  // 失败点按语义定位：正文已写、history 已有快照之后再重建 manifest ——
+  // 那次 rename 落 `manifest.json` 即抛（不依赖 ensure 是否先写过 manifest 的调用序号）。
   const badFs = {
     ...nodeFs,
     renameSync(from, to) {
-      renames += 1
-      if (renames === 3) throw new Error('manifest rename blocked')
+      const historyDir = join(root, 'history', 'rule-1')
+      const hasSnapshot = existsSync(historyDir) && readdirSync(historyDir).length > 0
+      if (String(to).endsWith('/manifest.json') && hasSnapshot) {
+        throw new Error('manifest rename blocked')
+      }
       return nodeFs.renameSync(from, to)
     },
   }
@@ -641,6 +652,11 @@ test('updateRule：中途失败用写前快照回滚（manifest 失败场景）'
   const got = readRule(root, 'rule-1')
   assert.equal(got.rule.text, '必须先验证再覆盖正式库。')
   assert.equal(got.rule.front.version, 1)
+  // 四处回滚的证据：history 不增、manifest 与磁盘一致（R9-03 断言补强）。
+  const historyDir = join(root, 'history', 'rule-1')
+  assert.deepEqual(existsSync(historyDir) ? readdirSync(historyDir) : [], [])
+  const manifest = JSON.parse(readFileSync(join(root, 'manifest.json'), 'utf8'))
+  assert.deepEqual(manifest.keys, ['rule-1'], 'manifest 必须回到写前（只剩原规则）')
 })
 
 test('updateRule：连续编辑同 key 得到 2,3,4…，互不覆盖且每次一份快照', (t) => {

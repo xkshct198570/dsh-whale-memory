@@ -27,6 +27,7 @@ import {
   RESERVED_NUMBERS,
   computeManifest,
   defaultRuleRoot,
+  fileRuleNumbers,
   isRetiredNumber,
   listRules,
   normalizeRuleDoc,
@@ -301,7 +302,7 @@ export function buildApplyPlan({
   // 目标 front：refine 沿用旧编号/created；新建按草案号或 manifest 下一个空号。
   // 编号只属于 iron-rule（R8-01）：普通规则/候选一律 number=null（store 校验会拒非 null）。
   const retired = Array.isArray(readManifest(base)?.retired) ? readManifest(base).retired : []
-  const manifest = computeManifest(allRules, retired)
+  const manifest = computeManifest(allRules, retired, fileRuleNumbers(base))
   const targetType = trimmed(draft.type) || 'rule'
   const targetIsIron = targetType === 'iron-rule'
   const retiredNumbers = new Set(retired.map((item) => Number(item?.number)).filter((n) => Number.isInteger(n) && n > 0))
@@ -311,6 +312,8 @@ export function buildApplyPlan({
     const n = Number(doc.front.number)
     if (Number.isInteger(n) && n > 0) occupiedNumbers.add(n)
   }
+  // 非法 front 的 iron-rule-<n>.md 也占号：提案/apply 不得把号发给已被磁盘占用的编号。
+  for (const n of fileRuleNumbers(base)) occupiedNumbers.add(n)
   for (const n of RESERVED_NUMBERS) occupiedNumbers.add(n)
   /** 顺延到第一个合法空号（跳过保留号/占号/墓碑）；nextNumber 兜底也要过同一把筛。
    *  铁律编号硬顶 1–999：到顶返回 null（调用方给 number_exhausted，绝不越界发号）。 */

@@ -96,6 +96,14 @@ function contextText(state, sid = 's1') {
   return state.context.text({ scope: { session: { id: sid } } })
 }
 
+/**
+ * 提案检测自 R9-01 起用 `setImmediate` 调度（宿主无关），断言前必须先让排队的 run() 跑完。
+ * 这是唯一的调度契约变更：不再依赖假 ctx 同步 `setTimeout`。
+ */
+function flushProposalScheduler() {
+  return new Promise((resolve) => setImmediate(resolve))
+}
+
 // ---------------------------------------------------------------------------
 // buildRulesPrefix（纯函数口径）
 // ---------------------------------------------------------------------------
@@ -249,6 +257,7 @@ test('hook：owner 规则句 → 本轮 context 追加一条候选提示 + 候�
   const hook = installHook(ctx, { backend: quietBackend(), config: cfgOf(rulesDir) })
   t.after(() => hook.dispose())
   await state.pre(preStepPayload('s1', '以后都别删源文件'), async () => ({ kind: 'enter' }))
+  await flushProposalScheduler()
   const text = contextText(state)
   assert.equal((text.match(/【规则候选】/g) || []).length, 1, '每会话每轮最多一条')
   // R8-05：提示行由 buildProposalAskLine 生成，必须带可执行 nonce（不是"去问用户"）。
@@ -264,6 +273,7 @@ test('hook：askMode=panel（不含 chat）→ 不自动起草（面板手动 /r
   const hook = installHook(ctx, { backend: quietBackend(), config: cfgOf(rulesDir, {}, { askMode: 'panel' }) })
   t.after(() => hook.dispose())
   await state.pre(preStepPayload('s1', '以后都别删源文件'), async () => ({ kind: 'enter' }))
+  await flushProposalScheduler()
   assert.equal(contextText(state).includes('【规则候选】'), false)
   assert.equal(listProposals({ rulesDir }).proposals.length, 0)
 })
@@ -275,9 +285,11 @@ test('hook：冷却中的候选只进面板不提示', async (t) => {
   const hook = installHook(ctx, { backend: quietBackend(), config: cfg })
   t.after(() => hook.dispose())
   await state.pre(preStepPayload('s1', '以后都别删源文件'), async () => ({ kind: 'enter' }))
+  await flushProposalScheduler()
   const made = listProposals({ rulesDir }).proposals[0]
   rejectProposal({ id: made.id, reason: '不需要', rulesDir, config: cfg })
   await state.pre(preStepPayload('s1', '以后都别删源文件'), async () => ({ kind: 'enter' }))
+  await flushProposalScheduler()
   assert.equal(contextText(state).includes('【规则候选】'), false)
   const cooling = listProposals({ rulesDir }).proposals.find((item) => item.cooling === true)
   assert.ok(cooling, '候选仍在面板可查（cooling:true）')
@@ -290,6 +302,7 @@ test('hook：确认短语 → 下一轮自动收录，context 给【规则已收
   const hook = installHook(ctx, { backend: quietBackend(), config: cfgOf(rulesDir) })
   t.after(() => hook.dispose())
   await state.pre(preStepPayload('s1', '以后都别删源文件'), async () => ({ kind: 'enter' }))
+  await flushProposalScheduler()
   assert.equal(listProposals({ rulesDir }).proposals[0].status, 'pending')
   // R8-05 契约变更：只认「收录 <id8>」nonce（原「确认」断言作废）。
   const nonce = proposalNonce(listProposals({ rulesDir }).proposals[0])
@@ -308,6 +321,7 @@ test('hook：需要改写且无模型 → 【规则待人工处理】并转面�
   const hook = installHook(ctx, { backend: quietBackend(), config: cfgOf(rulesDir) })
   t.after(() => hook.dispose())
   await state.pre(preStepPayload('s1', '源文件必须保留，过程稿归档到临时目录'), async () => ({ kind: 'enter' }))
+  await flushProposalScheduler()
   const pending = listProposals({ rulesDir, status: 'pending' }).proposals
   assert.equal(pending.length, 1)
   assert.equal(pending[0].relation.relation, 'merge')

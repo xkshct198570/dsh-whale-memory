@@ -741,18 +741,18 @@ test('applyProposal：写事务日志并在 commit 成功后清空（.txn 不留
 // R8-01 编号不变式在 apply 的复核：停用/取代号不复用，墓碑号拒绝
 // ---------------------------------------------------------------------------
 
-test('applyProposal：停用/取代最高号仍占号 → 新提案自动顺延，不复用该号', async (t) => {
+test('applyProposal：superseded 文件仍占号 → 提案期就不承诺该号（R9-02 口径）', async (t) => {
   const root = freshRoot(t)
   seed(root, { key: 'iron-rule-1', type: 'iron-rule', number: 1, object: '审计日志', exceptions: [] }, '审计日志必须保留。')
   seed(root, { key: 'iron-rule-2', type: 'iron-rule', number: 2, object: '过程稿', action: '归档', exceptions: [] }, '过程稿必须归档。')
   seed(root, { key: 'iron-rule-3', type: 'iron-rule', number: 3, object: '报告', status: 'superseded', exceptions: [] }, '报告必须保留。')
   const made = createProposal({ text: '以后都别删源文件', identity: IDENTITY, rulesDir: root, config: { rules: {} } })
-  // 提案期按 active 算号 → 3（已被 superseded 规则占着）；apply 必须复核并顺延到 4。
-  assert.equal(made.proposal.draft.number, 3)
+  // R9-02 契约变更：提案期算号也按"文件名 ∪ 墓碑"占用（不只 active），
+  // 所以 superseded 的 3 号从一开始就不会被承诺给候选——不再出现"先给 3、apply 才顺延 4"的假承诺。
+  assert.equal(made.proposal.draft.number, 4)
   const result = await applyProposal({ id: made.proposal.id, rulesDir: root, config: { rules: {} }, git: false })
   assert.equal(result.ok, true, JSON.stringify({ err: result.error, failures: result.failures }))
   assert.equal(result.applied.number, 4, 'superseded 文件仍占号，不得复用 3')
-  assert.equal(result.applied.numberAdjusted?.reason, 'occupied', '顺延原因必须回给面板')
   const numbers = listRules(root).rules.map((doc) => Number(doc.front.number)).filter((n) => n > 0)
   assert.equal(new Set(numbers).size, numbers.length, '编号必须唯一')
 })

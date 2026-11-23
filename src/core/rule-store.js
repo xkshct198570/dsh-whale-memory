@@ -799,7 +799,9 @@ export function writeHistorySnapshot(root, key, content, opts = {}) {
   try {
     fs.mkdirSync(dir, { recursive: true })
     const rev = uniqueStamp(dir, fs)
-    fs.writeFileSync(join(dir, `${rev}.md`), String(content), 'utf8')
+    // 快照也要 fsync：断电后「正文已新、旧版本没落盘」等于丢了可回滚的上一版。
+    const written = durableWriteFile(join(dir, `${rev}.md`), String(content), { fs })
+    if (!written.ok) return { ok: false, error: `snapshot_write_failed:${written.error}` }
     pruneHistory(dir, fs)
     return { ok: true, rev }
   } catch (err) {
@@ -989,12 +991,19 @@ export function writeRule(root, input, opts = {}) {
     if (!ensured.ok) return { ok: false, error: 'ensure_failed', detail: { root: base, error: ensured.error } }
 
     const existing = listRules(base)
+    // 编号唯一性用占用集合（文件名 ∪ front ∪ 墓碑）而不是"解析成功的规则"：
+    // 手改坏的 iron-rule-N.md 解析失败也必须挡住新建/改写撞号（R9-02）。
+    // 自己那条要剔出去（改自己的正文/版本不能被自己判成撞号）。
     const numbers = new Map()
     for (const doc of existing.rules) {
       if (doc.front.key === normalized.front.key) continue
       if (doc.front.type !== 'iron-rule') continue
       if (!(Number.isInteger(doc.front.number) && doc.front.number > 0)) continue
       numbers.set(doc.front.number, doc.front.key)
+    }
+    for (const n of fileRuleNumbers(base, { fs })) {
+      if (n === normalized.front.number) continue
+      if (!numbers.has(n)) numbers.set(n, `iron-rule-${n}.md`)
     }
     const check = validateRule(normalized.front, normalized.text, { numbers })
     if (!check.ok) return { ok: false, error: 'invalid_rule', detail: check.errors }
@@ -1005,39 +1014,65 @@ export function writeRule(root, input, opts = {}) {
     const target = rulePath(base, normalized.front)
     const oldFile = findRuleFile(base, normalized.front.key)
     let snapshot = null
+    let oldSource = null
     if (oldFile) {
       const old = readRuleSource(oldFile, { fs })
       if (!old.ok) return { ok: false, error: 'snapshot_read_failed', detail: old.error }
-      snapshot = writeHistorySnapshot(base, normalized.front.key, old.text, { fs })
+      oldSource = old.text
+      snapshot = writeHistorySnapshot(base, normalized.front.key, oldSource, { fs })
       if (!snapshot.ok) return { ok: false, error: 'snapshot_failed', detail: snapshot.error }
     }
+    // 显式路径：本文件 + manifest（+ 旧文件若被移走）；不用 add -A，避免把候选/快照带进提交。
+    const paths = Array.isArray(opts.commitPaths)
+      ? [...new Set([...opts.commitPaths, relative(base, target), MANIFEST_FILE, ...(oldFile && oldFile !== target ? [relative(base, oldFile)] : [])])]
+      : [relative(base, target), MANIFEST_FILE, ...(oldFile && oldFile !== target ? [relative(base, oldFile)] : [])]
+    const rollback = () => rollbackWriteAttempt(base, {
+      target, oldFile, oldSource, key: normalized.front.key, historyRev: snapshot?.rev || '', paths, fs, exec: opts.exec,
+    })
 
-    const written = atomicWriteFile(target, serialized.text, { fs })
-    if (!written.ok) return { ok: false, error: 'write_failed', detail: written.error }
+    // 正文与 history 都走 durableWriteFile（tmp+fsync+rename+fsync dir）：R9-03 起"原子"升级为"持久"。
+    const written = durableWriteFile(target, serialized.text, { fs })
+    if (!written.ok) {
+      const cleanup = snapshot?.rev ? removeHistoryEntry(base, normalized.front.key, snapshot.rev, fs) : null
+      return { ok: false, error: 'write_failed', detail: written.error, rollbackFailures: cleanup ? [cleanup] : [] }
+    }
     if (oldFile && oldFile !== target) {
       try { fs.unlinkSync(oldFile) } catch (err) {
         // 两份文件同时存在会让 listRules 报编号冲突；回滚新文件，保持旧状态。
-        try { fs.unlinkSync(target) } catch { /* best effort */ }
-        return { ok: false, error: 'move_failed', detail: String(err?.message || err) }
+        const rolled = rollback()
+        return {
+          ok: false, error: 'move_failed', detail: String(err?.message || err),
+          rolledBack: rolled.ok, rollbackFailures: rolled.failures,
+        }
       }
     }
 
     const manifest = regenerateManifest(base, { fs })
-    if (!manifest.ok) return { ok: false, error: 'manifest_failed', detail: manifest.error }
+    if (!manifest.ok) {
+      const rolled = rollback()
+      return {
+        ok: false, error: 'manifest_failed', detail: manifest.error,
+        rolledBack: rolled.ok, rollbackFailures: rolled.failures,
+      }
+    }
 
     let git = null
     if (opts.git !== false) {
-      // 显式路径：本文件 + manifest（+ 旧文件若被移走）；不用 add -A，避免把候选/快照带进提交。
-      const paths = Array.isArray(opts.commitPaths)
-        ? opts.commitPaths
-        : [relative(base, target), MANIFEST_FILE, ...(oldFile && oldFile !== target ? [relative(base, oldFile)] : [])]
       const done = commitRuleChanges(base, `rules: ${normalized.front.key} v${normalized.front.version}`, {
         exec: opts.exec,
         paths,
       })
+      if (!done.ok && !isGitDegraded(done.error)) {
+        // 非降级提交失败：真源必须回到写前（文件/manifest/history/index 四处），不得 ok:true 丢提交。
+        const rolled = rollback()
+        return {
+          ok: false, error: 'commit_failed', detail: { stage: 'commit', error: done.error || 'git_failed' },
+          rolledBack: rolled.ok, rollbackFailures: rolled.failures,
+        }
+      }
       git = done.ok
         ? { ok: true, committed: Boolean(done.committed), message: done.message }
-        : { ok: false, committed: false, message: done.message, error: done.error || 'git_failed' }
+        : { ok: false, committed: false, degraded: true, message: done.message, error: done.error || 'git_failed' }
     }
     return {
       ok: true,
@@ -1166,6 +1201,64 @@ function occupiedNumbers(rules, retired = []) {
   return numbers
 }
 
+const IRON_RULE_FILE_RE = /^iron-rule-(\d+)\.md$/i
+
+/**
+ * 目录内 `iron-rule-<n>.md` 的文件名编号集合（parse-only：只看文件名，不读 front、不跑校验）。
+ *
+ * 为什么必须单独存在：手改成非法 front 的规则文件解析失败，不会进 `listRules().rules`；
+ * 若编号占用只看"解析成功的规则"，分配器会把这个号再发一次并覆盖原文件（R9-02 复现过）。
+ * 文件名是磁盘上"这个号已被占"的最后证据，崩溃/手改都不能让它消失。
+ *
+ * @param {string} root @param {{fs?: typeof nodeFs}} [opts] @returns {Set<number>}
+ */
+export function fileRuleNumbers(root, opts = {}) {
+  const fs = opts.fs || nodeFs
+  const base = baseDir(root)
+  const numbers = new Set()
+  let entries = []
+  try {
+    entries = fs.readdirSync(base, { withFileTypes: true })
+  } catch { /* 目录不存在/不可读：没有文件名证据，交给调用方的其它校验报错 */ }
+  for (const entry of entries) {
+    if (!entry || (!entry.isFile?.() && !entry.isSymbolicLink?.())) continue
+    const match = IRON_RULE_FILE_RE.exec(String(entry.name))
+    if (!match) continue
+    const n = Number(match[1])
+    // >999 的文件名不是合法铁律编号（validate 会拒绝），不得让它把 nextNumber 顶到 1000+ 锁死新建。
+    if (Number.isInteger(n) && n > 0 && n <= RULE_NUMBER_MAX) numbers.add(n)
+  }
+  return numbers
+}
+
+/**
+ * 编号占用唯一真源 = 文件名编号 ∪ 解析成功的铁律 front 编号 ∪ 墓碑编号。
+ *
+ * - 文件名：非法 front 的文件也占号，分配器不得复用（R9-02 不变式）；
+ * - front：兼容"文件名不规整但 front 有号"的历史文件；
+ * - 墓碑：purge 后编号作废、永不复用。
+ *
+ * @param {string} root @param {{fs?: typeof nodeFs, listed?: {rules?: Array<object>}}} [opts]
+ *   `listed` 可传已解析的 listRules 结果，避免一次分配重复解析全部规则。
+ * @returns {Set<number>}
+ */
+export function occupancy(root, opts = {}) {
+  const fs = opts.fs || nodeFs
+  const base = baseDir(root)
+  const numbers = fileRuleNumbers(base, { fs })
+  const rules = Array.isArray(opts.listed?.rules) ? opts.listed.rules : listRules(base).rules
+  for (const doc of rules) {
+    if (String(doc?.front?.type ?? '') !== 'iron-rule') continue
+    const n = Number(doc?.front?.number)
+    if (Number.isInteger(n) && n > 0) numbers.add(n)
+  }
+  for (const item of readTombstones(base, { fs })) {
+    const n = Number(item?.number)
+    if (Number.isInteger(n) && n > 0) numbers.add(n)
+  }
+  return numbers
+}
+
 /**
  * 新建一条规则（面板直写路径，**不经过** writer 决策/提案流水线）。
  *
@@ -1234,9 +1327,9 @@ export function createRule({ root = '', draft = {}, identity = {}, traceId = '',
 
     const listed = listRules(base)
     // 编号只属于 iron-rule：普通规则 number=null（不占号、不压 nextNumber）。
-    // 墓碑（retired/*.json）也占号：彻底删除后编号作废、永不复用（删 17 后新建仍 18）。
+    // 占用 = 文件名编号 ∪ 解析成功编号 ∪ 墓碑：非法 front 的文件也占号，绝不复用（R9-02）。
     const number = type === 'iron-rule'
-      ? nextRuleNumber(occupiedNumbers(listed.rules, readTombstones(base, { fs })))
+      ? nextRuleNumber(occupancy(base, { fs, listed }))
       : null
     if (type === 'iron-rule' && number > RULE_NUMBER_MAX) {
       return { ok: false, error: 'number_exhausted', detail: { max: RULE_NUMBER_MAX } }
@@ -1244,7 +1337,7 @@ export function createRule({ root = '', draft = {}, identity = {}, traceId = '',
     // `rule:<domain>-<hash8>` → `rule-<domain>-<hash8>`（面板/文件里的 key 形状）。
     const key = type === 'iron-rule' ? `iron-rule-${number}` : ruleKeyOf(text).replace(/^rule:/, 'rule-')
     if (!isValidRuleKey(key)) return { ok: false, error: 'invalid_draft', detail: { reason: 'invalid_key', key } }
-    if (listed.rules.some((doc) => String(doc.front.key) === key)) {
+    if (listed.rules.some((doc) => String(doc.front.key) === key) || existsSync(join(base, `${key}.md`))) {
       return { ok: false, error: 'duplicate_rule', detail: { key, reason: 'key_exists' } }
     }
 
@@ -1279,7 +1372,14 @@ export function createRule({ root = '', draft = {}, identity = {}, traceId = '',
 
     // git:false：文件 + manifest 由 writeRule 一次做完，提交由下面这一条统一出。
     const written = writeRule(base, { front, text }, { git: false, fs, lockHeld: true })
-    if (!written.ok) return { ok: false, error: written.error || 'write_failed', detail: written.detail }
+    if (!written.ok) {
+      // 回滚证据必须原样上抛：调用方/测试要能区分"没写"与"写了又回滚干净"（R9-03）。
+      return {
+        ok: false, error: written.error || 'write_failed', detail: written.detail,
+        ...(written.rolledBack !== undefined ? { rolledBack: written.rolledBack } : {}),
+        ...(written.rollbackFailures ? { rollbackFailures: written.rollbackFailures } : {}),
+      }
+    }
 
     const message = `rule: create ${key} (#${number})`
     const commitPaths = [relative(base, written.path), MANIFEST_FILE]
@@ -1457,11 +1557,16 @@ export function purgeRule({ root = '', key, identity = {}, traceId = '', now = D
       return { ...removed, rolledBack: failures.length === 0, rollbackFailures: failures }
     }
 
+    // 显式路径：被删文件（git rm 已暂存，git add 也能记录删除）+ manifest + 墓碑。
+    const paths = [relative(base, doc.file), MANIFEST_FILE, ...(tomb ? [relative(base, tomb.path)] : [])]
     const manifest = regenerateManifest(base, { fs })
     if (!manifest.ok) {
       const failures = [restoreFile(), dropTombstone()].filter(Boolean)
       const rebuilt = regenerateManifest(base, { fs, allowShrink: true })
       if (!rebuilt.ok) failures.push(`manifest:${rebuilt.error}`)
+      // 失败也要清 index：`git rm` 的删除已暂存，文件却已还原，留着就是幻影删除（R9-03）。
+      const reset = resetIndexPaths(base, paths, { exec: opts.exec })
+      if (!reset.ok) failures.push(`index:${reset.error}`)
       return { ok: false, error: 'manifest_failed', detail: manifest.error, rolledBack: failures.length === 0, rollbackFailures: failures }
     }
 
@@ -1472,8 +1577,6 @@ export function purgeRule({ root = '', key, identity = {}, traceId = '', now = D
       }
     }
 
-    // 显式路径：被删文件（git rm 已暂存，git add 也能记录删除）+ manifest + 墓碑。
-    const paths = [relative(base, doc.file), MANIFEST_FILE, ...(tomb ? [relative(base, tomb.path)] : [])]
     const commit = commitRuleChanges(base, `rule: purge ${key} (#${number})`, { exec: opts.exec, paths })
     if (!commit.ok) {
       // git 不可用是降级（文件已删、commit 跳过）；只有真的提交失败才回滚。
@@ -1821,10 +1924,9 @@ function updateRuleLocked({ root = '', key, patch, now = Date.now() } = {}, opts
   // git:false 由本函数自己控制 commit 文案；若让 writeRule 提交，消息会是 `rules: <key> v<n>`，
   // 面板/审计需要的是 `rule: update ...`，所以这里统一由 updateRule 提交一次。
   const saved = writeRule(base, nextDoc, { fs, git: false, lockHeld: true })
-  if (!saved.ok) {
-    const restored = atomicWriteFile(doc.file, oldSource)
-    return { ok: false, error: saved.error, detail: saved.detail, rolledBack: restored.ok }
-  }
+  // writeRule 的失败路径已自带四处回滚（R9-03），这里不再补第二次 restore：
+  // 二次 restore 用真 fs、且会掩盖 history/manifest/index 是否真的回滚干净（旧测试假绿成因）。
+  if (!saved.ok) return saved
 
   const paths = [relative(base, saved.path), MANIFEST_FILE, ...(saved.path !== doc.file ? [relative(base, doc.file)] : [])]
   let commit = null
@@ -1940,10 +2042,9 @@ function revertRuleLocked({ root = '', key, rev, now = Date.now() } = {}, opts =
     return { ok: false, error: 'snapshot_read_failed', detail: String(err?.message || err) }
   }
   const saved = writeRule(base, nextDoc, { fs, git: false, lockHeld: true })
-  if (!saved.ok) {
-    const restored = atomicWriteFile(doc.file, oldSource)
-    return { ok: false, error: saved.error, detail: saved.detail, rolledBack: restored.ok }
-  }
+  // writeRule 的失败路径已自带四处回滚（R9-03），这里不再补第二次 restore：
+  // 二次 restore 用真 fs、且会掩盖 history/manifest/index 是否真的回滚干净（旧测试假绿成因）。
+  if (!saved.ok) return saved
 
   const paths = [relative(base, saved.path), MANIFEST_FILE, ...(saved.path !== doc.file ? [relative(base, doc.file)] : [])]
   let commit = null
@@ -2048,6 +2149,10 @@ export function resetGitIndex(root, paths, opts = {}) {
   const base = baseDir(root)
   const clean = normalizeCommitPaths(base, paths)
   if (!clean.length) return { ok: true, paths: clean }
+  // git 不可用 / 未建仓：没有 index 可清，这是"无需回滚"不是回滚失败。
+  // （R9-03：回滚失败清单只该记真失败，否则 git:false 的临时仓会被误判成半写。）
+  const repo = isGitRepo(base, { exec: opts.exec })
+  if (!repo.ok) return { ok: true, paths: clean, skipped: 'no_repo' }
   const reset = runGit(base, ['reset', '-q', '--', ...clean], { exec: opts.exec })
   return reset.ok ? { ok: true, paths: clean } : { ok: false, paths: clean, error: reset.error }
 }
@@ -2057,21 +2162,57 @@ function resetIndexPaths(root, paths, opts = {}) {
   return resetGitIndex(root, paths, opts)
 }
 
-/** 写回旧文件 + 删掉本事务新增的历史快照 + 重建 manifest + 清 index；返回 failures。 */
-function rollbackRuleWrite(base, { file, oldSource, key, historyRev, paths, fs, exec }) {
+/** 删除本事务新增的 history 快照；返回失败描述或 null（幂等：没 rev 时不动）。 */
+function removeHistoryEntry(base, key, rev, fs = nodeFs) {
+  if (!rev) return null
+  try {
+    fs.unlinkSync(join(base, 'history', key, `${rev}.md`))
+    return null
+  } catch (err) {
+    // ENOENT = 快照本来就不存在（重复回滚/写失败前未落盘）：视为已回滚，不制造假半写。
+    if (err?.code === 'ENOENT') return null
+    return `history:${err?.message || err}`
+  }
+}
+
+/**
+ * 回滚一次写尝试：新建（删新文件）、更新（写回旧正文）、搬迁（删新路径 + 还原旧路径）
+ * 三种形态统一走这里，回滚覆盖文件/manifest/history/git index 四处（R9-03 不变式③）。
+ *
+ * @param {string} base 规则仓根
+ * @param {{target:string, oldFile?:string|null, oldSource?:string|null, key:string,
+ *   historyRev?:string, paths?:string[], fs?:typeof nodeFs, exec?:Function}} [ctx]
+ * @returns {{ok:boolean, failures:string[]}}
+ */
+function rollbackWriteAttempt(base, { target, oldFile = null, oldSource = null, key, historyRev = '', paths = [], fs = nodeFs, exec } = {}) {
   const failures = []
-  const restored = atomicWriteFile(file, oldSource, { fs })
-  if (!restored.ok) failures.push(`file:${restored.error}`)
-  if (historyRev) {
-    try { fs.unlinkSync(join(base, 'history', key, `${historyRev}.md`)) } catch (err) {
-      failures.push(`history:${err?.message || err}`)
+  if (oldFile && oldSource !== null && oldSource !== undefined) {
+    if (target && target !== oldFile) {
+      try { fs.unlinkSync(target) } catch (err) {
+        if (err?.code !== 'ENOENT') failures.push(`file:${err?.message || err}`)
+      }
+    }
+    const restored = durableWriteFile(oldFile, oldSource, { fs })
+    if (!restored.ok) failures.push(`file:${restored.error}`)
+  } else if (target) {
+    try { fs.unlinkSync(target) } catch (err) {
+      if (err?.code !== 'ENOENT') failures.push(`file:${err?.message || err}`)
     }
   }
+  const historyFailure = removeHistoryEntry(base, key, historyRev, fs)
+  if (historyFailure) failures.push(historyFailure)
   const manifest = regenerateManifest(base, { fs })
   if (!manifest.ok) failures.push(`manifest:${manifest.error}`)
   const reset = resetIndexPaths(base, paths, { exec })
   if (!reset.ok) failures.push(`index:${reset.error}`)
   return { ok: failures.length === 0, failures }
+}
+
+/** 兼容旧调用签名（同路径更新/回滚）：行为即 rollbackWriteAttempt。 */
+function rollbackRuleWrite(base, { file, oldSource, key, historyRev, paths, fs, exec }) {
+  return rollbackWriteAttempt(base, {
+    target: file, oldFile: file, oldSource, key, historyRev, paths, fs, exec,
+  })
 }
 
 /** 回滚"新建文件"：删文件 + 重建 manifest + 清 index（create 的 commit 失败路径）。 */
@@ -2192,7 +2333,7 @@ export function isRetiredNumber(root, number, opts = {}) {
 export function allocatableRuleNumber(root, opts = {}) {
   const fs = opts.fs || nodeFs
   const base = baseDir(root)
-  return nextRuleNumber(occupiedNumbers(listRules(base).rules, readTombstones(base, { fs })))
+  return nextRuleNumber(occupancy(base, { fs }))
 }
 
 // ---------------------------------------------------------------------------
@@ -2458,10 +2599,11 @@ function normalizeRetired(retired) {
  *
  * @param {Array<object>} rules listRules 的 rules
  * @param {Array<{key:string,number:number,at:string}>} [retired] manifest.retired 墓碑
+ * @param {Iterable<number>} [extraNumbers] 解析失败的 `iron-rule-<n>.md` 文件名编号（仍占号）
  * @returns {{nextNumber:number,total:number,unnumbered:number,byStatus:Record<string,number>,
  *   retired:Array<{key:string,number:number,at:string}>}}
  */
-export function computeManifest(rules, retired = []) {
+export function computeManifest(rules, retired = [], extraNumbers = []) {
   const tombstones = normalizeRetired(retired)
   const byStatus = {}
   const numbers = []
@@ -2474,7 +2616,8 @@ export function computeManifest(rules, retired = []) {
     if (Number.isInteger(n) && n > 0) numbers.push(n)
     else if (isUnnumberedRule(doc?.front)) unnumbered += 1
   }
-  const occupied = numbers.concat(tombstones.map((item) => item.number))
+  const extra = Array.from(extraNumbers || []).filter((n) => Number.isInteger(n) && n > 0)
+  const occupied = numbers.concat(tombstones.map((item) => item.number), extra)
   return {
     nextNumber: nextRuleNumber(occupied),
     total: numbers.length,
@@ -2518,7 +2661,9 @@ export function regenerateManifest(root, opts = {}) {
     return { ok: false, error: 'retired_shrink', detail: { missing } }
   }
   const list = listRules(base)
-  const view = computeManifest(list.rules, retired)
+  // 非法 front 的 `iron-rule-<n>.md` 仍占号：manifest.nextNumber 必须与分配器同口径，
+  // 否则面板显示"下一个 18"而 create 实际给 19（R9-02）。
+  const view = computeManifest(list.rules, retired, fileRuleNumbers(base, { fs }))
   const manifest = {
     ...view,
     keys: list.rules.map((doc) => doc.front.key),
