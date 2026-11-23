@@ -186,7 +186,9 @@ test('概览渲染引用 metrics / series / recent_failures，并覆盖四个新
   assert.ok(body.includes("t('overview.trend')"), '缺少 7 日曲线块')
   assert.ok(body.includes("t('overview.failures')"), '缺少最近失败块')
   assert.match(body, /css\.trendScroll/, '7 日曲线未走滚动容器')
-  assert.match(CLIENT, /trendScroll: \{ overflowX: 'auto' \}/, '7 日曲线缺少窄屏横向滚动样式')
+  // R9-07：单纯 overflowX:auto 会隐式生成纵向滚动容器（Chromium 实测 sticky 失效），
+  // 7 日曲线同样补 overflowY:clip，保持"整个面板只有一个纵向滚动根"。
+  assert.match(CLIENT, /trendScroll: \{ overflowX: 'auto', overflowY: 'clip' \}/, '7 日曲线缺窄屏横向滚动或 overflowY:clip')
 })
 
 test('概览渲染引用的 overview.* 键三语都存在（防拼错）', () => {

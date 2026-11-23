@@ -151,6 +151,7 @@ test('详情：错误态可重试 + versions 合并进历史 + git 提交 subjec
 test('长列表只横滚（纵向交给页根）；窄屏横向滚动容器保留', () => {
   const table = tableSource()
   assert.match(table, /overflowX: 'auto'/, '窄屏横向滚动被删')
+  assert.match(table, /overflowY: 'clip'/, '表格容器缺 overflowY:clip（sticky 表头会被页根滚走，Chromium 实测）')
   assert.doesNotMatch(table, /overflowY: 'auto'/, '表格容器仍在纵向滚动（应交给页根）')
   assert.doesNotMatch(table, /maxHeight/, '表格容器仍设高度（70vh 已按 R9-07 去掉）')
   assert.ok(table.indexOf("overflowX: 'auto'") < table.indexOf("h('table'"), '滚动容器必须在表格外层')

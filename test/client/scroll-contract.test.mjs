@@ -63,15 +63,18 @@ test('纵向滚动容器收敛：只有页根 + 抽屉二次滚动块带 data-wm
   }
 })
 
-test('表格容器只横滚：overflowX auto 且无 maxHeight/overflowY', () => {
+test('表格容器只横滚：overflowX auto + overflowY clip 且无 maxHeight', () => {
+  // Chromium 实测（1280×800）：只写 overflowX:auto 会隐式生成纵向滚动容器，sticky 表头随页根滚走
+  // （th 从 2px 跑到 -398px）；加 overflowY:clip 后贴住（+1px）。所以契约必须是 clip，不是"省略"。
   const wrappers = CLIENT.match(
-    /style: \{ overflowX: 'auto', scrollbarWidth: 'thin', scrollbarColor: 'var\(--dsw-alias-border-l1\) transparent' \}/g,
+    /style: \{ overflowX: 'auto', overflowY: 'clip', scrollbarWidth: 'thin', scrollbarColor: 'var\(--dsw-alias-border-l1\) transparent' \}/g,
   ) || []
   assert.ok(wrappers.length >= 6, `表格横向滚动容器应覆盖全部表格（当前 ${wrappers.length} 处）`)
   for (const name of ['function RulesTable(props) {', 'function MemoryTable(props) {']) {
     const start = CLIENT.indexOf(name)
     const body = CLIENT.slice(start, start + 1200)
     assert.match(body, /overflowX: 'auto'/, `${name} 缺横向滚动容器`)
+    assert.match(body, /overflowY: 'clip'/, `${name} 缺 overflowY:clip（否则表头 sticky 会被页根滚走）`)
     assert.doesNotMatch(body, /overflowY: 'auto'/, `${name} 仍在纵向滚动`)
     assert.doesNotMatch(body, /maxHeight/, `${name} 仍在容器上设高度`)
     assert.ok(body.indexOf("overflowX: 'auto'") < body.indexOf("h('table'"), `${name} 滚动容器必须在表格外层`)
