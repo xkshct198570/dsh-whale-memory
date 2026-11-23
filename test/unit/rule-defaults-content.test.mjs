@@ -2,7 +2,7 @@
  * 默认铁律内容单测：包内 `defaults/` 是市场安装后的默认铁律。
  *
  * 口径：
- * - `defaults/rules/` = 16 文件：15 条带编号（1–17 除空号 6、除 13）+ 1 条无编号安全行（number: 0，key=iron-rule-safety）；
+ * - `defaults/rules/` = 18 文件：17 条带编号（1–19 除空号 6、除本地专用 13）+ 1 条无编号安全行（number: 0，key=iron-rule-safety）；
  * - `defaults/rules-local/iron-rule-13.md` = 本机对照组专属，仅 workspace 作用域，不参与默认播种；
  * - 每条都必须能被规则仓同一套 parse/normalize/validate 口径接受，正文指令形态、无理由句与模糊词。
  */
@@ -27,7 +27,7 @@ const readmePath = join(root, 'defaults', 'README.md')
 
 const VAGUE_RE = /(尽量|最好|尽可能|大概|也许|可能)/
 const REASON_RE = /(因为|由于|理由是)/
-const EXPECTED_NUMBERS = [1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+const EXPECTED_NUMBERS = [1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
 
 /** 读一个目录下的 .md 文件（README 不算规则），返回原文与解析结果。 */
 function loadDocs(dir) {
@@ -44,11 +44,11 @@ const generalDocs = loadDocs(rulesDir)
 const localDocs = loadDocs(localDir)
 const allDocs = [...generalDocs, ...localDocs]
 
-test('defaults/rules 是 16 个文件：15 条带号 + 1 条无编号安全行', () => {
-  assert.equal(generalDocs.length, 16)
+test('defaults/rules 是 18 个文件：17 条带号 + 1 条无编号安全行', () => {
+  assert.equal(generalDocs.length, 18)
   const safety = generalDocs.filter(({ name }) => name === 'iron-rule-safety.md')
   assert.equal(safety.length, 1, '安全行必须单独成文件')
-  assert.equal(generalDocs.filter(({ name }) => name !== 'iron-rule-safety.md').length, 15)
+  assert.equal(generalDocs.filter(({ name }) => name !== 'iron-rule-safety.md').length, 17)
 })
 
 test('rules-local 只有本机专用的 iron-rule-13.md', () => {
@@ -56,8 +56,8 @@ test('rules-local 只有本机专用的 iron-rule-13.md', () => {
   assert.deepEqual(localDocs.map(({ name }) => name), ['iron-rule-13.md'])
 })
 
-test('17 个文件全部可解析，且 front 字段与 serializeRuleDocument 顺序一致（19 字段，summary 可选）', () => {
-  assert.equal(allDocs.length, 17)
+test('19 个文件全部可解析，且 front 字段与 serializeRuleDocument 顺序一致（19 字段，summary 可选）', () => {
+  assert.equal(allDocs.length, 19)
   for (const { name, parsed } of allDocs) {
     assert.ok(parsed.ok, `${name} 解析失败：${parsed.error}`)
   }
@@ -66,7 +66,8 @@ test('17 个文件全部可解析，且 front 字段与 serializeRuleDocument �
   const expected = RULE_FIELDS.filter((field) => field !== 'summary')
   for (const { name, doc } of allDocs) {
     assert.deepEqual(Object.keys(doc.front), expected, `${name} 字段集/顺序不符合序列化口径`)
-    assert.equal(Number(doc.front.version), 1, `${name} version 必须是 1`)
+    // version 是规则自身的版本号：17 在真源被升过版（v2），默认包跟随真源；只要求正整数。
+    assert.ok(Number.isInteger(Number(doc.front.version)) && Number(doc.front.version) >= 1, `${name} version 必须是正整数`)
   }
   // 追加断言：带 summary 的文档按 RULE_FIELDS 全序序列化并能 round-trip，且 summary 在末尾。
   const sample = serializeRuleDocument({ front: { ...allDocs[0].doc.front, summary: '一句话摘要' }, text: allDocs[0].doc.text })
@@ -87,7 +88,7 @@ test('全部文件通过 validateRule（numbers Map 排除自身）', () => {
   }
 })
 
-test('编号集合 = 1–17 除空号 6 的 15 个带号 + 1 个 number=0，且无重复', () => {
+test('编号集合 = 1–19 除空号 6 的 17 个带号 + 1 个 number=0，且无重复', () => {
   const numbers = generalDocs.map(({ doc }) => doc.front.number).sort((a, b) => a - b)
   assert.deepEqual([...new Set(numbers)], numbers, 'rules/ 内编号不得重复')
 
@@ -95,10 +96,10 @@ test('编号集合 = 1–17 除空号 6 的 15 个带号 + 1 个 number=0，且�
   assert.equal(zero.length, 1, '必须恰有一条无编号（number: 0）的安全行')
 
   const numbered = numbers.filter((n) => n > 0)
-  assert.deepEqual(numbered, EXPECTED_NUMBERS.filter((n) => n !== 6 && n !== 13), '带号规则只允许 1–17 除 6 与 13')
+  assert.deepEqual(numbered, EXPECTED_NUMBERS.filter((n) => n !== 6 && n !== 13), '带号规则只允许 1–19 除 6 与 13')
   assert.ok(!numbers.includes(6), '空号 6 永不复用')
-  assert.ok(!numbers.includes(18), '安全行不是「铁律18」')
-  assert.equal(numbered.length, 15)
+  assert.ok(numbers.includes(18) && numbers.includes(19), '18/19 必须随包播种（D2）')
+  assert.equal(numbered.length, 17)
 })
 
 test('安全行：key=iron-rule-safety、number=0、全局作用域', () => {
@@ -147,13 +148,14 @@ test('origin 以 default: 开头，key 与文件名一致', () => {
   }
 })
 
-test('统一 front 口径：iron-rule / P0 / active / 日期 2026-11-22 / 未合并', () => {
+test('统一 front 口径：iron-rule / P0 / active / 入仓日期（22 或 23）/ 未合并', () => {
   for (const { name, doc } of allDocs) {
     assert.equal(doc.front.type, 'iron-rule', `${name} type`)
     assert.equal(doc.front.priority, 'P0', `${name} priority`)
     assert.equal(doc.front.status, 'active', `${name} status`)
-    assert.equal(doc.front.created, '2026-11-22', `${name} created`)
-    assert.equal(doc.front.updated, '2026-11-22', `${name} updated`)
+    // 18/19 是 2026-11-23 入仓；其余 2026-11-22。日期只证明入仓日，不做格式化断言。
+    assert.ok(['2026-11-22', '2026-11-23'].includes(doc.front.created), `${name} created=${doc.front.created}`)
+    assert.ok(['2026-11-22', '2026-11-23'].includes(doc.front.updated), `${name} updated=${doc.front.updated}`)
     assert.equal(doc.front.merged_into, '', `${name} merged_into`)
     assert.equal(doc.front.superseded_by, '', `${name} superseded_by`)
     assert.equal(doc.front.role, '', `${name} role`)

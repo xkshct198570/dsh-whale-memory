@@ -59,12 +59,12 @@ function textOf(value) {
 }
 
 /**
- * 摘要总预算（码点）：`rules.summaryBudgetChars` 默认 4000；0/非法回落默认值（0 不是"无限"）。
+ * 摘要总预算（码点）：`rules.summaryBudgetChars` 默认 6000；0/非法回落默认值（0 不是「无限」）。
  * @param {any} config @returns {number}
  */
 function summaryBudgetOf(config) {
-  const n = Number(value(config?.rules?.summaryBudgetChars, 4000))
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 4000
+  const n = Number(value(config?.rules?.summaryBudgetChars, 6000))
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 6000
 }
 
 /** 配置 `rules.dir` 优先，空则 `$DSH_HOME/rules`。 */

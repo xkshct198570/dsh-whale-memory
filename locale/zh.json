@@ -659,7 +659,7 @@
   "settings.rulesMirrorAutoDesc": "规则文件变化后自动同步进 DB 供召回；关闭＝手动点「重建镜像」。",
   "settings.rulesAskCooldownDays": "询问冷却（天）",
   "settings.rulesAskCooldownDaysDesc": "同一规则再次询问的最短间隔，0＝每次都问。",
-  "settings.rulesConfigLayerNote": "另有三个只在配置文件层生效的键（面板不提供开关）：rules.renderAgents（是否重渲染 AGENTS 摘要）、rules.injectChars（每轮注入字符预算，0=关闭）、rules.createAgentsIfMissing（空机是否自动创建 AGENTS 管理块）。改它们需编辑插件配置并重启宿主。",
+  "settings.rulesConfigLayerNote": "另有四个只在配置文件层生效的键（面板不提供开关）：rules.renderAgents（是否重渲染 AGENTS 摘要）、rules.injectChars（每轮注入字符预算，0=关闭）、rules.createAgentsIfMissing（空机是否自动创建 AGENTS 管理块）、rules.summaryBudgetChars（摘要总预算码点，默认 6000）。改它们需编辑插件配置并重启宿主。",
   "settings.depRulesEnabled": "规则功能已关闭，此项不生效",
   "rules.typeCandidate": "候选规则",
   "rules.importSkipped": "该铁律已存在，未重复导入",

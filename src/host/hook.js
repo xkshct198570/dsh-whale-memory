@@ -24,7 +24,7 @@ import { bool, num, value } from './config-values.js'
 import { judgeReply } from '../core/adoption.js'
 import { listRules } from '../core/rule-store.js'
 import { isRuleStatement } from '../core/rules.js'
-import { agentsBlockStale, agentsPathOf, fileHasMarkers } from '../core/rule-render.js'
+import { agentsBlockStale, agentsPathOf, fileHasMarkers, renderAgentsDigest } from '../core/rule-render.js'
 import { recordInjection } from './inject-stats.js'
 import { createHostAdapter } from './ctx-adapter.js'
 import { refineProposal } from '../core/rule-refine.js'
@@ -305,6 +305,8 @@ export function installHook(ctx, {
   const host = createHostAdapter(ctx, { log })
   const cache = new Map()
   const inflight = new Set()
+  /** 规则文件被外部改（git pull/手写）后，摘要块自动补渲染一次；同进程只跑一份（D1）。 */
+  let agentsRenderInFlight = false
   /**
    * 待判定的注入与回复文本，**按会话单槽**而不是 (turn,step) 复合键。
    * why：pre-step 的 turn/step 与 assistant-stream 帧的编号不保证同源同偏移，
@@ -386,6 +388,43 @@ export function installHook(ctx, {
   }
 
   /**
+   * 摘要块陈旧时补渲染一次（D1）：规则文件被手工/git pull 改动后，AGENTS 块不会自己更新，
+   * 新规则既不进摘要也不进注入＝对新会话"隐身"。这里在**检测到陈旧的那一步**异步补渲染。
+   *
+   * 为什么不在 pre-step 同步渲染：渲染要拿仓库锁 + 原子写，不能给对话主链路加阻塞；
+   * 同进程单飞（in_flight）避免多会话同一步各渲染一次；失败只记日志，下一步还会重试。
+   *
+   * @param {{rulesDir:string, agentsPath:string}} args
+   * @returns {void}
+   */
+  const scheduleAgentsRepair = ({ rulesDir, agentsPath }) => {
+    if (agentsRenderInFlight) return
+    agentsRenderInFlight = true
+    setImmediate(() => {
+      try {
+        const listed = listRules(rulesDir)
+        const result = renderAgentsDigest({
+          rules: listed.rules,
+          agentsPath,
+          rulesDir,
+          budgetChars: num(config?.rules?.summaryBudgetChars, 6000),
+          log,
+        })
+        if (result && result.ok) {
+          log(`[whale-memory] agents block stale -> re-rendered rules=${result.count} changed=${result.changed}`)
+          invalidateRulesCache()
+        } else if (result) {
+          log(`[whale-memory] agents block stale repair skipped code=${result.code || result.error || 'unknown'}`)
+        }
+      } catch (err) {
+        log(`[whale-memory] agents block stale repair fail-open: ${err?.message || err}`)
+      } finally {
+        agentsRenderInFlight = false
+      }
+    })
+  }
+
+  /**
    * 取作用域前缀（30s 缓存）：键 = 目录 mtime + 规则文件最大 mtime + 预算 + role/workspace
    * + AGENTS 标记态（R8-07：改预算/改规则内容都会换键，1s 内生效；写后由键变化失效，
    * 面板写入口调 invalidateRulesCache 可立即清）。
@@ -399,6 +438,7 @@ export function installHook(ctx, {
     // inode+size+mtime 足以发现内容/换文件，块陈旧单独用 mtime 比较判定。
     const agentsSig = fileStatKey(agentsPath)
     const agentsStale = agentsBlockStale({ agentsPath, rulesDir })
+    if (agentsStale) scheduleAgentsRepair({ rulesDir, agentsPath })
     const key = `${RULES_KEY_PREFIX}v3|d:${dirMtime(rulesDir)}|f:${rulesMtime}|b:${budget}`
       + `|r:${trimmed(identity.roleId)}|w:${normalizeScopePath(identity.workspace)}`
       + `|a:${agentsSig}|s:${agentsStale ? 1 : 0}`

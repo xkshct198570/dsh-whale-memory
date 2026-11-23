@@ -8,9 +8,9 @@ import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, existsSync 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  LEDGER_BEGIN, LEDGER_END, RULES_BEGIN, RULES_END,
-  agentsPathOf, fileHasMarkers, inspectMarkers, ledgerDigestContent,
-  renderAgentsDigest, renderLedgerDigest, rulesDigestContent, titleOfRule,
+  RULES_BEGIN, RULES_END,
+  agentsPathOf, fileHasMarkers, inspectMarkers,
+  renderAgentsDigest, rulesDigestContent, titleOfRule,
 } from '../../src/core/rule-render.js'
 
 function freshDir(t) {
@@ -254,62 +254,6 @@ test('renderAgentsDigest：空规则集渲染占位说明（块仍有效、可�
   const after = readFileSync(path, 'utf8')
   assert.match(after, /## 规则摘要（自动生成，勿手改）/)
   assert.equal(fileHasMarkers(path), true)
-})
-
-// ---------------------------------------------------------------------------
-// renderLedgerDigest
-// ---------------------------------------------------------------------------
-
-function ledgerFile(dir) {
-  const path = join(dir, '台账.md')
-  const content = [
-    '# 台账',
-    '',
-    '## 2. 核心铁律',
-    '',
-    '| 编号 | 标题 | 作用域 | 正文 |',
-    '| --- | --- | --- | --- |',
-    LEDGER_BEGIN,
-    '| 1 | 旧 | global | 旧正文 |',
-    LEDGER_END,
-    '',
-    '## 3. 其它',
-    '',
-  ].join('\n')
-  writeFileSync(path, content, 'utf8')
-  return { path, content }
-}
-
-test('ledgerDigestContent：iron 全文本 + 无编号 P0 排表尾', () => {
-  const got = ledgerDigestContent([
-    doc({ key: 'iron-rule-17', number: 17, action: '文件卫生', text: '删文档前先核对绝对路径。' }),
-    doc({ key: 'rule-safety', number: null, type: 'rule', priority: 'P0', action: '安全', text: '密钥只走环境变量。' }),
-    doc({ key: 'rule-p1', number: 5, type: 'rule', priority: 'P1', text: '普通 P1 不进台账。' }),
-  ])
-  assert.equal(got.count, 2)
-  assert.match(got.content.split('\n')[0], /^\| 17 \| 文件卫生 \| global \| 删文档前先核对绝对路径。 \|$/)
-  assert.match(got.content.split('\n')[1], /^\| — \| 安全 \| global \| 密钥只走环境变量。 \|$/)
-})
-
-test('renderLedgerDigest：只替换表体块；无标记 → no_markers；幂等', (t) => {
-  const dir = freshDir(t)
-  const { path } = ledgerFile(dir)
-  const rules = [doc({ key: 'iron-rule-17', number: 17, action: '文件卫生', text: '删文档前先核对绝对路径。' })]
-  const first = renderLedgerDigest({ rules, ledgerPath: path })
-  assert.equal(first.ok, true, first.code)
-  const after = readFileSync(path, 'utf8')
-  assert.match(after, /## 2\. 核心铁律/)
-  assert.match(after, /\| 编号 \| 标题 \| 作用域 \| 正文 \|/, '表头是静态的，不在块内')
-  assert.match(after, /\| 17 \| 文件卫生 \| global \|/)
-  assert.match(after, /## 3\. 其它/)
-  assert.equal(renderLedgerDigest({ rules, ledgerPath: path }).changed, false)
-
-  const plain = join(dir, 'plain.md')
-  writeFileSync(plain, '没有标记\n', 'utf8')
-  const missing = renderLedgerDigest({ rules, ledgerPath: plain })
-  assert.equal(missing.ok, false)
-  assert.equal(missing.code, 'no_markers')
-  assert.equal(renderLedgerDigest({ rules, ledgerPath: '' }).code, 'no_ledger_path')
 })
 
 test('renderAgentsDigest：路径参数缺失 → no_agents_path（不猜默认路径）', () => {

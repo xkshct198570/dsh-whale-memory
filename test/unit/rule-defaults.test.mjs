@@ -379,7 +379,8 @@ test('播种真实默认目录：整批无非法、safety 无编号、本地专�
   assert.equal(safety.rule.front.type, 'iron-rule')
 
   const manifest = computeManifest(listed.rules)
-  assert.equal(manifest.nextNumber, 18, '1–17 已占（含空号 6），下一条从 18 起')
+  // D2 后默认目录含 18/19：1–19 已占（含空号 6），下一条从 20 起；空机播种必须与真源同集。
+  assert.equal(manifest.nextNumber, 20, '1–19 已占（含空号 6），下一条从 20 起')
   assert.equal(manifest.unnumbered, 1)
   // rules-local/ 是独立目录（本机专用），默认播种不得把它搬过来。
   assert.equal(existsSync(join(rulesRoot, 'iron-rule-13.md')), false)

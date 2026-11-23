@@ -1323,7 +1323,7 @@ export async function applyProposal({
     try {
       agentsResult = agentsFn({
         rules: postRules, agentsPath: agentsPathOf(base), rulesDir: base, log,
-        budgetChars: cfgNum(config?.rules?.summaryBudgetChars, 4000),
+        budgetChars: cfgNum(config?.rules?.summaryBudgetChars, 6000),
       })
     } catch (err) {
       agentsResult = { ok: false, code: 'render_failed', error: String(err?.message || err) }

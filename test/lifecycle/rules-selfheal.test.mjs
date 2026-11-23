@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url'
 import { closeDb, openDb } from '../../src/core/db.js'
 import * as ruleStore from '../../src/core/rule-store.js'
 import { runRulesSelfHeal } from '../../index.js'
+import { defaultRulesDir } from '../../src/core/rule-defaults.js'
 import { RULES_BEGIN, RULES_END, agentsPathOf } from '../../src/core/rule-render.js'
 
 /** 临时规则仓 + 临时 SQLite；`.seeded.json` 预置避免默认播种干扰计数。 */
@@ -233,16 +234,18 @@ test('runRulesSelfHeal：规则目录为空时不自愈出空壳 AGENTS', async 
   assert.equal(existsSync(agentsPath), false)
 })
 
-test('干净安装 E2E：无 marker 空仓 → 播种 16 条默认铁律 → AGENTS 自动创建且全部可见', async (t) => {
+test('干净安装 E2E：无 marker 空仓 → 播种整包默认铁律 → AGENTS 自动创建且全部可见', async (t) => {
   const { home, rulesDir, backend } = fresh(t, { seeded: false })
   const agentsPath = join(home, 'AGENTS.md')
   const result = await runRulesSelfHeal({ config: cfgOf(rulesDir), backend })
-  assert.equal(result.seeded?.seeded, 16, '空仓应播种 16 条默认铁律')
-  assert.equal(result.rules, 16)
+  const { readdirSync } = await import('node:fs')
+  const expected = readdirSync(defaultRulesDir()).filter((name) => name.endsWith('.md') && name.toUpperCase() !== 'README.MD').length
+  assert.equal(result.seeded?.seeded, expected, `空仓应播种整包默认铁律（${expected} 条）`)
+  assert.equal(result.rules, expected)
   assert.equal(result.agents?.created, true, result.agents?.code)
   const content = nodeFs.readFileSync(agentsPath, 'utf8')
   const lines = content.split('\n').filter((line) => line.startsWith('- '))
-  assert.equal(lines.length, 16, '16 条默认铁律必须全部进 AGENTS 摘要')
+  assert.equal(lines.length, expected, '整包默认铁律必须全部进 AGENTS 摘要')
   assert.match(content, /- iron-rule-safety /)
   assert.match(content, /- 铁律1 · /)
   assert.match(content, /^<!-- whale-memory:rules:begin -->\n/, '最小管理块从 begin 开始')

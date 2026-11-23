@@ -231,3 +231,45 @@ test('hook：配置里没有 injectLevels 时不伪造过滤（旧配置兼容�
   assert.equal(seen[0].injectLevels, undefined, '缺失即不过滤，交给 backend 保持旧行为')
   assert.equal(seen[0].showSources, true, 'showSources 缺省 true')
 })
+
+test('D1：规则文件外部变更导致摘要块陈旧 → pre-step 自动补渲染一次（新规则不再隐身）', async (t) => {
+  const { mkdtempSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { writeRule } = await import('../../src/core/rule-store.js')
+  const { RULES_BEGIN, RULES_END } = await import('../../src/core/rule-render.js')
+  const home = mkdtempSync(join(tmpdir(), 'hook-stale-'))
+  t.after(() => rmSync(home, { recursive: true, force: true }))
+  const rulesDir = join(home, 'rules')
+  mkdirSync(rulesDir, { recursive: true })
+  const agentsPath = join(home, 'AGENTS.md')
+  writeFileSync(agentsPath, `# 宿主\n\n${RULES_BEGIN}\n- 旧摘要\n${RULES_END}\n`, 'utf8')
+  // 先把 AGENTS 的 mtime 压到过去，再写规则 → 块一定"旧于规则"。
+  const past = new Date(Date.now() - 60_000)
+  utimesSync(agentsPath, past, past)
+  const front = {
+    key: 'iron-rule-99', type: 'iron-rule', number: 99, priority: 'P0', scope: 'global', role: '',
+    modality: 'must', action: '', object: '', conditions: [], exceptions: [], status: 'active',
+    merged_into: '', superseded_by: '', created: '2026-11-23', updated: '2026-11-23', version: 1, origin: 'unit',
+  }
+  assert.equal(writeRule(rulesDir, { front, text: '必须验证摘要块陈旧会自动补渲染。' }, { git: false }).ok, true)
+
+  const { ctx, state } = fakeCtx()
+  installHook(ctx, {
+    backend: { async recall() { return { prefix: '', hits: 0 } } },
+    config: { ...config, recall: { enabled: false }, rules: { enabled: true, dir: rulesDir, summaryBudgetChars: 6000 } },
+  })
+  await state.pre({
+    agent: { session: { id: 's-stale' } },
+    messages: [{ source: { kind: 'user' }, content: [{ type: 'text', text: '问' }] }],
+  }, async () => ({ kind: 'enter' }))
+  // 补渲染在 setImmediate：等它落地（最多 1s）。
+  let content = ''
+  for (let i = 0; i < 40; i += 1) {
+    content = readFileSync(agentsPath, 'utf8')
+    if (content.includes('iron-rule-99')) break
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  assert.ok(content.includes('铁律99'), `陈旧块未被自动补渲染：${content.slice(0, 200)}`)
+  assert.ok(content.includes('（文件：iron-rule-99.md）'), '补渲染必须带文件指针')
+})

@@ -106,6 +106,8 @@ export const Config = z.object({
     createAgentsIfMissing: z.boolean().default(true).volatile(),
     // 作用域规则每轮注入预算（字符；global 不注入，只作 AGENTS 缺标记时的降级）。
     injectChars: z.natural().min(0).max(4000).default(600).volatile(),
+    // AGENTS 摘要总预算（码点）：19 条铁律约 3.7k，默认 6k 留余量；超限按优先级截断并 health 黄。
+    summaryBudgetChars: z.natural().min(200).max(20000).default(6000).volatile(),
   }).default({}),
 
   panel: z.object({

@@ -3,7 +3,6 @@
  *
  * 职责：
  * - `renderAgentsDigest`：把「global + active」规则渲染成一行一条的摘要，只替换管理块内部；
- * - `renderLedgerDigest`：把台账 §2 表体（iron-rule 全文本）渲染进台账管理块；
  * - `inspectMarkers` / `fileMarkers`：标记块探测（缺失/重复都返回失败码，不猜、不追加）；
  * - 原子写 + `.bak` 轮转（保留最近 5 份）+ 写前 `stat` 比对 + 仓库锁内读-改-写 + 幂等
  *   （内容不变不写，保留 mtime，避免无意义的文件变更事件）。
@@ -29,8 +28,6 @@ import * as ruleStore from './rule-store.js'
 export const RULES_BEGIN = '<!-- whale-memory:rules:begin -->'
 export const RULES_END = '<!-- whale-memory:rules:end -->'
 /** 台账 §2 表体块标记（R6/R7 负责加到台账里）。 */
-export const LEDGER_BEGIN = '<!-- whale-memory:ledger:begin -->'
-export const LEDGER_END = '<!-- whale-memory:ledger:end -->'
 
 /** 摘要里正文摘录长度（一行一条，太长会把 AGENTS 读成本体）。 */
 // 摘要要能独立读懂：60 字只剩半句，真机 AGENTS 实测看不到例外/判据。200 字≈全条正文，
@@ -220,9 +217,10 @@ function compareDigestDocs(a, b) {
  * @returns {{content:string, count:number, keys:string[]}}
  */
 export function rulesDigestContent(rules, opts = {}) {
-  // 总预算（R9-14）：默认 4000 码点，防止摘要无限膨胀拖垮每轮 context；0/非法回落默认值。
+  // 总预算（R9-14，D4 调高）：默认 6000 码点——19 条铁律已占 3722，4000 会截掉最新规则；
+  // 0/非法回落默认值（0 不是「无限」，与 injectChars 同口径）。
   const budgetRaw = Number(opts.budgetChars)
-  const budget = Number.isFinite(budgetRaw) && budgetRaw > 0 ? Math.floor(budgetRaw) : 4000
+  const budget = Number.isFinite(budgetRaw) && budgetRaw > 0 ? Math.floor(budgetRaw) : 6000
   const docs = normalizeDocs(rules)
     .map(splitDoc)
     .filter(({ front }) => trimmed(front.status || 'active') === 'active'
@@ -534,79 +532,6 @@ export function renderAgentsDigest({
     chars: Array.from(digest.content).length,
     // 跳过的规则必须回报给调用方/health（黄），不得静默从摘要里消失。
     ...(digest.skipped?.length ? { skipped: digest.skipped } : {}),
-    path,
-  }
-}
-
-/**
- * 台账 §2 表体（iron-rule 全文本；无编号的 P0 规则排表尾）。
- * 正文必须先单行化再进表格行，否则换行会把 Markdown 表格撕成两段。
- * @param {any} rules
- * @returns {{content:string, count:number, keys:string[]}}
- */
-export function ledgerDigestContent(rules) {
-  const docs = normalizeDocs(rules).map(splitDoc).filter(({ front }) => {
-    const status = trimmed(front.status || 'active')
-    const type = trimmed(front.type)
-    if (status !== 'active' || type === 'rule-candidate') return false
-    if (type === 'iron-rule') return true
-    return trimmed(front.priority).toUpperCase() === 'P0'
-  })
-  const numbered = docs
-    .filter(({ front }) => Number.isInteger(Number(front.number)) && Number(front.number) > 0)
-    .sort((a, b) => Number(a.front.number) - Number(b.front.number))
-  const tail = docs.filter(({ front }) => !(Number.isInteger(Number(front.number)) && Number(front.number) > 0))
-  const rows = []
-  for (const { front, text } of [...numbered, ...tail]) {
-    const number = Number.isInteger(Number(front.number)) && Number(front.number) > 0 ? String(front.number) : '—'
-    const scope = trimmed(front.scope) || 'global'
-    rows.push(`| ${number} | ${titleOfRule(front, text)} | ${scope} | ${singleLine(text).replace(/\|/g, '\\|')} |`)
-  }
-  return {
-    content: rows.join('\n'),
-    count: rows.length,
-    keys: [...numbered, ...tail].map(({ front }) => trimmed(front.key)),
-  }
-}
-
-/**
- * 重渲染台账 §2 表体块（同 AGENTS 机制：缺标记/重复标记都拒绝，绝不追加）。
- * @param {{rules:any, ledgerPath:string, rulesDir?:string, root?:string,
- *   lock?:Function, log?:Function}} args
- * @returns {{ok:boolean, changed?:boolean, count?:number, keys?:string[], chars?:number,
- *   path?:string, code?:string, error?:string}}
- */
-export function renderLedgerDigest({
-  rules, ledgerPath, rulesDir = '', root = '', lock = null, log = () => {},
-} = {}) {
-  const path = trimmed(ledgerPath)
-  if (!path) return { ok: false, code: 'no_ledger_path' }
-  const lockRoot = trimmed(root) || trimmed(rulesDir) || dirnameOfRules(rules)
-  const digest = ledgerDigestContent(rules)
-  let outcome
-  try {
-    outcome = runWithRepoLock(lockRoot, () => rewriteBlock({
-      path,
-      begin: LEDGER_BEGIN,
-      end: LEDGER_END,
-      body: () => digest.content,
-      log,
-      label: 'ledger',
-    }), { lock, log })
-  } catch (err) {
-    log(`[whale-memory] render ledger failed: ${err?.name || err?.message || err}`)
-    return { ok: false, code: 'render_failed', error: String(err?.message || err) }
-  }
-  if (!outcome || outcome.ok !== true) {
-    return { ok: false, code: outcome?.code || (outcome?.error ? 'lock_failed' : 'render_failed'), error: outcome?.error }
-  }
-  log(`[whale-memory] render ledger changed=${outcome.changed} rules=${digest.count}`)
-  return {
-    ok: true,
-    changed: outcome.changed,
-    count: digest.count,
-    keys: digest.keys,
-    chars: Array.from(digest.content).length,
     path,
   }
 }

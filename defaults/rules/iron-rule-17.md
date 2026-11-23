@@ -15,7 +15,7 @@ merged_into: ""
 superseded_by: ""
 created: 2026-11-22
 updated: 2026-11-22
-version: 1
+version: 2
 origin: default:iron-rule-17
 ---
 
