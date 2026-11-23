@@ -175,7 +175,10 @@ export function applyNeighborNotes(db, newNode, opts = {}) {
   const minScore = clamp01(opts.minScore ?? 0.3, 0.3)
   const wanted = new Set(tags.map((t) => t.toLowerCase()))
 
-  const rows = db.prepare('SELECT id, tags, context_note, user_id, role_id, workspace FROM nodes WHERE status=? AND id<>? LIMIT ?')
+  // 固定排序：过去只有 LIMIT 没有 ORDER BY，SQLite 取哪 500 行不确定，
+  // 同 tag 的邻居落在 500 之外就永远拿不到注记（审计 P2）。
+  const rows = db.prepare(`SELECT id, tags, context_note, user_id, role_id, workspace FROM nodes
+    WHERE status=? AND id<>? ORDER BY last_hit_at DESC, created_at DESC, id LIMIT ?`)
     .all('active', String(newNode.id), Math.max(1, Number(opts.maxNodes ?? 500)))
   const ident = newNode.identity || {}
   const candidates = []

@@ -112,7 +112,8 @@ test('P0-2 详情：跨身份按 node_not_found（404）而不是把正文送出
 
   // 改也一样：跨身份 PATCH 先按身份校验，落到 node_not_found，而不是改别人的节点。
   const crossEdit = await patchJson(nodes.a1.id, { patch: { status: 'archived' }, userId: 'user-b' })
-  assert.equal(crossEdit.status, 400)
+  // 状态由 error-table 单一真源给出：node_not_found=404（旧实现一律 400）。
+  assert.equal(crossEdit.status, 404)
   assert.equal(crossEdit.body.error, 'node_not_found')
   assert.equal((await getJson(`/nodes/${encodeURIComponent(nodes.a1.id)}`)).body.node.status, 'active')
 })

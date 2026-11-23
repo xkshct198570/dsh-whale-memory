@@ -14,13 +14,13 @@
  */
 import { closeDb, getMeta, now, openDb, setMeta } from './db.js'
 import { bigrams, contentHash, normalize } from './tokenize.js'
-import { search as searchDb } from './search.js'
+import { search as searchDb, ftsStats } from './search.js'
 import { planBudget, trimHits } from './budget.js'
 import { applyNeighborNotes, relationStats } from './relations.js'
 import { computeMetrics } from './metrics.js'
 import { memoryPressure } from '../host/memory-guard.js'
 import { bool } from '../host/config-values.js'
-import { createWriteQueue, recordEvolution, recordWrite, withTx } from './writer.js'
+import { createWriteQueue, isActiveHashConflict, recordEvolution, recordWrite, withTx } from './writer.js'
 import { DbWorkerClient } from './workers/client.js'
 import { HybridBackend } from './hybrid.js'
 
@@ -308,6 +308,43 @@ function ftsAligned(db) {
  * @param {{ insert: any, exists: any, dryRun?: boolean }} io
  * @returns {{ added: number, skipped: number }}
  */
+/** import 进度在 meta 的 key（小 JSON；避免每批重写 jobs.payload 里的 jsonl）。 */
+function importProgressKey(jobId) {
+  return `import_progress:${Number(jobId)}`
+}
+
+/** 进度形状：cursor + 计划书 §8.3 的全部统计字段。 */
+function emptyImportProgress() {
+  return {
+    cursor: 0, added: 0, skipped: 0, errors: 0, kept: 0, split: 0, rejected: 0,
+    reasons: {}, error_details: [],
+  }
+}
+
+/** 读进度（缺失/坏 JSON 按初始值，不让坏 meta 阻断续跑）。 */
+function readImportProgress(db, jobId) {
+  const base = emptyImportProgress()
+  const raw = getMeta(db, importProgressKey(jobId))
+  if (!raw) return base
+  try {
+    const parsed = JSON.parse(raw)
+    return {
+      ...base,
+      ...parsed,
+      reasons: parsed && typeof parsed.reasons === 'object' && parsed.reasons ? parsed.reasons : {},
+      error_details: Array.isArray(parsed?.error_details) ? parsed.error_details.slice(0, ERROR_DETAIL_LIMIT) : [],
+    }
+  } catch { return base }
+}
+
+/** 写进度 + job 状态（两条语句；崩溃在两者之间时进度落后于数据，但 exists 去重可安全重放）。 */
+function saveImportProgress(db, jobId, progress, state, lastError) {
+  progress.rejected = progress.errors
+  setMeta(db, importProgressKey(jobId), JSON.stringify(progress))
+  db.prepare('UPDATE jobs SET state=?, last_error=?, updated_at=? WHERE id=?')
+    .run(state, lastError || null, now(), Number(jobId))
+}
+
 function landImportRows(db, items, { insert, exists, dryRun = false }) {
   let added = 0
   let skipped = 0
@@ -315,15 +352,21 @@ function landImportRows(db, items, { insert, exists, dryRun = false }) {
     const node = item.node
     if (exists.get(node.text_hash, node.user_id, node.role_id, node.workspace)) { skipped += 1; continue }
     if (!dryRun) {
-      insert.run(
-        node.id, node.text, node.text_hash, node.text_bigrams,
-        node.level, node.memory_type, node.source, node.status,
-        node.role_id, node.user_id, node.workspace, node.tags,
-        node.context_note, node.weight, node.pinned, node.hits, node.last_hit_at,
-        node.vector_state, node.origin, node.trace_id,
-        node.valid_at, node.invalid_at, node.expired_at, node.superseded_by,
-        node.created_at, node.updated_at,
-      )
+      try {
+        insert.run(
+          node.id, node.text, node.text_hash, node.text_bigrams,
+          node.level, node.memory_type, node.source, node.status,
+          node.role_id, node.user_id, node.workspace, node.tags,
+          node.context_note, node.weight, node.pinned, node.hits, node.last_hit_at,
+          node.vector_state, node.origin, node.trace_id,
+          node.valid_at, node.invalid_at, node.expired_at, node.superseded_by,
+          node.created_at, node.updated_at,
+        )
+      } catch (err) {
+        // 并发竞态：别的进程刚插了同文 → 索引拒绝；按“已存在”跳过，不让整批回滚/失败。
+        if (isActiveHashConflict(err)) { skipped += 1; continue }
+        throw err
+      }
       if (item.split) {
         recordWrite(db, { identity: { userId: node.user_id, roleId: node.role_id, workspace: node.workspace } }, {
           action: 'SPLIT', reason: 'split_import', nodeId: node.id, afterText: node.text, mode: 'auto',
@@ -361,11 +404,15 @@ export class LocalBackend {
       ? (typeof config === 'function' ? config : () => config)
       : () => ({ write: { reviewMode: 'auto' } })
     this.writeQueue = null
-    /** @type {Map<string,{lines:string[],next:number,added:number,skipped:number,errors:number,kept:number,splitLines:number,reasons:object,errorDetails:object[],total:number,identity:any,failed:boolean}>} */
-    this._imports = new Map()
   }
 
-  get ready() { return true }
+  /**
+   * 后端可用性：真探测能否拿到连接（打开/迁移失败即 false），不再恒 true。
+   * 只在第一次调用时真开库，之后命中 this.db（连接缓存），不会每次 stats 都重开。
+   */
+  get ready() {
+    try { this._db(); return true } catch { return false }
+  }
 
   _db() {
     if (this.closed) throw new Error('backend_disposed')
@@ -373,6 +420,11 @@ export class LocalBackend {
       this.db = openDb(this.dataDir || undefined)
       this.dbPath = this.db.prepare('PRAGMA database_list').get()?.file || this.dbPath
       setMeta(this.db, 'boot_id', String(process.pid))
+      const info = this.db.schemaInfo
+      if (info?.deduped) this.log(`[whale-memory] schema v4 deduped ${info.deduped} duplicate active node(s)`)
+      if (info && info.uniqueIndex === false) this.log('[whale-memory] unique hash index unavailable (dirty db kept running)')
+      if (this.db.quarantine) this.log(`[whale-memory] corrupt db quarantined: ${this.db.quarantine.renamed.join(',') || this.db.quarantine.reason}`)
+      if (this.db.quickCheckSkipped) this.log(`[whale-memory] quick_check skipped (transient): ${this.db.quickCheckSkipped}`)
     }
     return this.db
   }
@@ -429,8 +481,15 @@ export class LocalBackend {
   }
 
   /** shadow 候选审核（面板「写入」页）。 */
-  reviewWrite(id, decision, reason) {
-    return this._writer().review(id, decision, reason)
+  /**
+   * 审核影子候选：identity 由路由传入，只允许本分区候选/目标（跨分区 id 返回 candidate_not_found）。
+   * @param {number|string} id writes 行 id
+   * @param {'accept'|'reject'} decision
+   * @param {string} [reason]
+   * @param {{ identity?: { userId?: string, roleId?: string, workspace?: string } }} [opts]
+   */
+  reviewWrite(id, decision, reason, opts = {}) {
+    return this._writer().review(id, decision, reason, opts)
   }
 
   async stats() {
@@ -477,6 +536,13 @@ export class LocalBackend {
           last_error: lastFailed, recent_failures: recentFailures,
         },
         pressure: memoryPressure(),
+        fts_errors: ftsStats.errors,
+        fts_last_error: ftsStats.last_error || null,
+        schema: {
+          version: getMeta(db, 'schema_version'),
+          unique_hash_index: this.db?.schemaInfo?.uniqueIndex !== false,
+          quarantined: Boolean(this.db?.quarantine),
+        },
       },
       metrics: { day: metrics.day, values: metrics.values, targets: metrics.targets },
       series: metrics.series,
@@ -722,7 +788,8 @@ export class LocalBackend {
     const dryRun = Boolean(q?.dryRun)
     const insert = db.prepare(IMPORT_INSERT_SQL)
     const exists = db.prepare(
-      'SELECT 1 FROM nodes WHERE text_hash=? AND user_id=? AND role_id=? AND workspace=? LIMIT 1',
+      `SELECT 1 FROM nodes WHERE text_hash=? AND user_id=? AND role_id=? AND workspace=?
+        AND (origin IS NULL OR origin NOT LIKE 'rule:%') LIMIT 1`,
     )
 
     let errors = 0
@@ -895,6 +962,12 @@ export class LocalBackend {
     const where = whereOf(opts?.identity, [['id=?', [target]]])
     const row = db.prepare(`SELECT * FROM nodes${where.sql}`).get(...where.params)
     if (!row) return { ok: false, error: 'node_not_found' }
+    // 乐观并发：客户端回传详情里的 updated_at，期间被别人改过就拒绝，不拿旧快照覆盖。
+    const expected = opts?.expectedUpdatedAt
+    if (expected !== undefined && expected !== null && expected !== ''
+      && String(expected) !== String(row.updated_at)) {
+      return { ok: false, error: 'node_changed' }
+    }
     const text = patch.text === undefined ? row.text : normalize(String(patch.text))
     if (!text || text.length > 500) return { ok: false, error: 'invalid_text' }
     const status = patch.status === undefined ? row.status : String(patch.status)
@@ -923,7 +996,14 @@ export class LocalBackend {
     const traceId = String(opts?.traceId || '').slice(0, 64)
     const mode = opts?.mode === 'sync' ? 'sync' : 'manual'
 
-    return withTx(db, () => {
+    try {
+      return withTx(db, () => {
+      // CAS：读旧行在事务外，若期间被别的写入改过，直接返回 node_changed，
+      // 不用旧快照覆盖新值（审计 P2：丢更新窗口）。
+      const current = db.prepare('SELECT updated_at FROM nodes WHERE id=?').get(target)
+      if (current && String(current.updated_at) !== String(row.updated_at)) {
+        return { ok: false, error: 'node_changed' }
+      }
       if (textChanged || statusChanged || levelChanged || tagsChanged || pointerChanged) {
         db.prepare(`UPDATE nodes SET text=?,text_hash=?,text_bigrams=?,status=?,level=?,tags=?,superseded_by=?,updated_at=?
           WHERE id=?`).run(
@@ -946,8 +1026,13 @@ export class LocalBackend {
       if (levelChanged) audit('EDIT', 'level', row.level, level, 'manual_level')
       if (tagsChanged) audit('EDIT', 'tags', row.tags, tags, 'manual_tags')
       if (pointerChanged) audit('EDIT', 'superseded_by', row.superseded_by ?? '', nextPointer ?? '', 'manual_supersede')
-      return { ok: true, id: target }
-    })
+        return { ok: true, id: target }
+      })
+    } catch (err) {
+      // 编辑后的正文与另一活跃行撞车：回明确错误码，不把 SQLite 约束文案透给面板。
+      if (isActiveHashConflict(err)) return { ok: false, error: 'duplicate_active' }
+      throw err
+    }
   }
 
   /**
@@ -1030,118 +1115,151 @@ export class LocalBackend {
   }
 
   /**
-   * 异步分片导入：>50 行返回 202 + jobId；每批 50 条、用 setImmediate 让出事件循环。
-   * 与同步导入共用 planImportRows / landImportRows（保真字段、长文本拆分、FTS 闸门口径一致）。
+   * 异步分片导入（>50 行）：202 + jobId。
+   *
+   * 持久化分两层，避免每批重写整份 jsonl（审计 A7：4 MiB 上限曾被放大 ~26×）：
+   * - `jobs.payload` 只在入队时写一次 `{ jsonl, identity, total }`；
+   * - 进度（cursor/统计/错误明细）写 `meta['import_progress:<jobId>']` 小 JSON，每批只改它。
+   * 崩溃后 keeper recoverRunningJobs → handler('import') 从 cursor 续跑（铁律 3）。
    * @param {{ jsonl:string, identity?:Identity }} q
    */
   async startImport(q) {
     const db = this._db()
-    const lines = String(q?.jsonl || '').split('\n').map((s) => s.trim()).filter(Boolean)
-    const ts = now()
-    const payload = {
-      total: lines.length, added: 0, skipped: 0, errors: 0, kept: 0, split: 0, rejected: 0,
-      reasons: {}, error_details: [],
-    }
+    const jsonl = String(q?.jsonl || '')
+    const total = jsonl.split('\n').filter((line) => line.trim()).length
+    const payload = { jsonl, identity: q?.identity || {}, total }
     const created = db.prepare('INSERT INTO jobs (kind,state,attempts,payload,created_at,updated_at) VALUES (?,?,?,?,?,?)')
-      .run('import', 'queued', 0, JSON.stringify(payload), ts, ts)
+      .run('import', 'running', 0, JSON.stringify(payload), now(), now())
     const jobId = String(created.lastInsertRowid)
-    this._imports.set(jobId, {
-      lines, next: 0, added: 0, skipped: 0, errors: 0, kept: 0, splitLines: 0,
-      reasons: {}, errorDetails: [], total: lines.length, identity: q?.identity || {}, failed: false,
-    })
-    this._runImport(jobId)
-    return { ok: true, async: true, jobId, total: lines.length }
+    this._resumeImportJob(jobId).catch((err) => this.log(`[whale-memory] import job fail-open: ${err?.message || err}`))
+    return { ok: true, async: true, jobId, total }
   }
 
-  /** 按批推进异步导入（每批 50 行；FTS 闸门不一致则整批回滚并终止，不继续污染索引）。 */
-  _runImport(jobId) {
-    const job = this._imports.get(jobId)
-    if (!job || this.closed) return
-    const db = this._db()
-    db.prepare("UPDATE jobs SET state='running', updated_at=? WHERE id=?").run(now(), Number(jobId))
-    const ident = job.identity || {}
-    const ts = now()
-    const insert = db.prepare(IMPORT_INSERT_SQL)
-    const exists = db.prepare('SELECT 1 FROM nodes WHERE text_hash=? AND user_id=? AND role_id=? AND workspace=? LIMIT 1')
-    const batch = job.lines.slice(job.next, job.next + 50)
-    const batchStart = job.next
-    job.next += batch.length
+  /** 续跑一条 import job（startImport 首跑 / keeper 崩溃恢复都走；进度在 meta，可重复调用）。 */
+  async resumeImportJob(jobId) {
+    return this._resumeImportJob(jobId)
+  }
 
-    /** @type {Array<{ node: object, split: boolean }>} */
-    const items = []
-    batch.forEach((line, i) => {
-      const index = batchStart + i
-      let row
-      try {
-        row = JSON.parse(line)
-      } catch {
-        job.errors += 1
-        job.reasons.invalid_json = (job.reasons.invalid_json || 0) + 1
-        if (job.errorDetails.length < ERROR_DETAIL_LIMIT) {
-          job.errorDetails.push({ index, reason: 'invalid_json', text_hash: contentHash(line).slice(0, 12) })
-        }
-        return
-      }
-      const plan = planImportRows(row, ident, { ts, seq: index })
-      if (plan.kind === 'error') {
-        job.errors += 1
-        job.reasons[plan.reason] = (job.reasons[plan.reason] || 0) + 1
-        if (job.errorDetails.length < ERROR_DETAIL_LIMIT) {
-          job.errorDetails.push({ index, reason: plan.reason, text_hash: plan.textHash.slice(0, 12) })
-        }
-        return
-      }
-      if (plan.split) job.splitLines += 1
-      else job.kept += 1
-      for (const node of plan.rows) items.push({ node, split: plan.split === true })
-    })
+  /** @private */
+  async _resumeImportJob(jobId) {
+    const id = Number(jobId)
+    if (!Number.isInteger(id) || id <= 0) return { ok: false, error: 'invalid_job_id' }
+    const db = this._db()
+    const row = db.prepare('SELECT id,kind,state,payload FROM jobs WHERE id=?').get(id)
+    if (!row || String(row.kind) !== 'import') return { ok: false, error: 'job_not_found' }
+    if (String(row.state) === 'done') return { ok: true, state: 'done', jobId: id }
+    let payload
+    try { payload = JSON.parse(String(row.payload || '{}')) || {} } catch { return { ok: false, error: 'payload_corrupt' } }
+    const lines = String(payload.jsonl || '').split('\n').map((line) => line.trim()).filter(Boolean)
+    if (!lines.length) return { ok: false, error: 'payload_corrupt' }
+    const ident = payload.identity && typeof payload.identity === 'object' ? payload.identity : {}
+    db.prepare("UPDATE jobs SET state='running', updated_at=? WHERE id=?").run(now(), id)
+    const progress = readImportProgress(db, id)
+    let cursor = Math.max(0, Math.min(lines.length, Number(progress.cursor) || 0))
+    let lastBatchStart = cursor
 
     try {
-      db.exec('BEGIN IMMEDIATE')
-      const { added, skipped } = landImportRows(db, items, { insert, exists })
-      if (!ftsAligned(db)) {
-        db.exec('ROLLBACK')
-        job.failed = true
-        job.errors += items.length
-        job.reasons.fts_misaligned = (job.reasons.fts_misaligned || 0) + 1
-        if (job.errorDetails.length < ERROR_DETAIL_LIMIT) {
-          job.errorDetails.push({ index: batchStart, reason: 'fts_misaligned', text_hash: '' })
+    const insert = db.prepare(IMPORT_INSERT_SQL)
+    // 规则镜像行不参与“已存在”判定；任意状态（含 archived）都算已导入，保证二次导入幂等。
+    const exists = db.prepare(`SELECT 1 FROM nodes WHERE text_hash=? AND user_id=? AND role_id=? AND workspace=?
+      AND (origin IS NULL OR origin NOT LIKE 'rule:%') LIMIT 1`)
+    while (cursor < lines.length) {
+      if (this.closed) return { ok: false, error: 'backend_disposed' }
+      const batchStart = cursor
+      lastBatchStart = batchStart
+      const batch = lines.slice(batchStart, batchStart + 50)
+      cursor += batch.length
+      const ts = now()
+      /** @type {Array<{ node: object, split: boolean }>} */
+      const items = []
+      batch.forEach((line, i) => {
+        const index = batchStart + i
+        let parsed
+        try {
+          parsed = JSON.parse(line)
+        } catch {
+          progress.errors += 1
+          progress.reasons.invalid_json = (progress.reasons.invalid_json || 0) + 1
+          if (progress.error_details.length < ERROR_DETAIL_LIMIT) {
+            progress.error_details.push({ index, reason: 'invalid_json', text_hash: contentHash(line).slice(0, 12) })
+          }
+          return
         }
-      } else {
-        db.exec('COMMIT')
-        job.added += added
-        job.skipped += skipped
-      }
-    } catch (err) {
-      try { db.exec('ROLLBACK') } catch { /* noop */ }
-      job.errors += batch.length
-      this.log(`[whale-memory] import batch fail: ${err?.message || err}`)
-    }
+        const plan = planImportRows(parsed, ident, { ts, seq: index })
+        if (plan.kind === 'error') {
+          progress.errors += 1
+          progress.reasons[plan.reason] = (progress.reasons[plan.reason] || 0) + 1
+          if (progress.error_details.length < ERROR_DETAIL_LIMIT) {
+            progress.error_details.push({ index, reason: plan.reason, text_hash: plan.textHash.slice(0, 12) })
+          }
+          return
+        }
+        if (plan.split) progress.split += 1
+        else progress.kept += 1
+        for (const node of plan.rows) items.push({ node, split: plan.split === true })
+      })
 
-    const payload = JSON.stringify({
-      total: job.total, added: job.added, skipped: job.skipped, errors: job.errors,
-      kept: job.kept, split: job.splitLines, rejected: job.errors,
-      reasons: job.reasons, error_details: job.errorDetails,
-    })
-    const done = job.failed || job.next >= job.total
-    db.prepare('UPDATE jobs SET state=?, payload=?, last_error=?, updated_at=? WHERE id=?')
-      .run(
-        job.failed ? 'failed' : done ? 'done' : 'running',
-        payload,
-        job.failed ? 'fts_misaligned' : job.errors ? 'partial_errors' : null,
-        now(), Number(jobId),
-      )
-    if (done) { this._imports.delete(jobId); return }
-    setImmediate(() => this._runImport(jobId))
+      let failed = false
+      try {
+        db.exec('BEGIN IMMEDIATE')
+        const { added, skipped } = landImportRows(db, items, { insert, exists })
+        if (!ftsAligned(db)) {
+          db.exec('ROLLBACK')
+          failed = true
+          progress.errors += items.length
+          progress.reasons.fts_misaligned = (progress.reasons.fts_misaligned || 0) + 1
+          if (progress.error_details.length < ERROR_DETAIL_LIMIT) {
+            progress.error_details.push({ index: batchStart, reason: 'fts_misaligned', text_hash: '' })
+          }
+        } else {
+          db.exec('COMMIT')
+          progress.added += added
+          progress.skipped += skipped
+        }
+      } catch (err) {
+        try { db.exec('ROLLBACK') } catch { /* noop */ }
+        failed = true
+        progress.errors += batch.length
+        progress.reasons.batch_failed = (progress.reasons.batch_failed || 0) + 1
+        this.log(`[whale-memory] import batch fail: ${err?.message || err}`)
+      }
+
+      if (failed) {
+        // 失败批必须把 cursor 退回批首：keeper 重试从这一批重跑，不能跳着丢数据（审计 A6）。
+        progress.cursor = batchStart
+        saveImportProgress(db, id, progress, 'failed', progress.reasons.fts_misaligned ? 'fts_misaligned' : 'batch_failed')
+        return { ok: false, error: progress.reasons.fts_misaligned ? 'fts_misaligned' : 'batch_failed', jobId: id }
+      }
+      progress.cursor = cursor
+      saveImportProgress(db, id, progress, cursor >= lines.length ? 'done' : 'running',
+        progress.errors ? 'partial_errors' : null)
+      if (cursor < lines.length) await new Promise((resolve) => setImmediate(resolve))
+    }
+      saveImportProgress(db, id, progress, 'done', progress.errors ? 'partial_errors' : null)
+      return { ok: true, state: 'done', jobId: id }
+    } catch (err) {
+      // 意外失败（比如 FTS 表缺失导致 prepare 就抛）：不能把 job 留在 running。
+      // cursor 回退到当前批首，keeper 重试时整批重跑；状态 failed 让退避重试可见。
+      progress.cursor = Math.max(0, Math.min(lastBatchStart, lines.length))
+      try { saveImportProgress(db, id, progress, 'failed', String(err?.message || err).slice(0, 200)) } catch { /* 记录失败不遮蔽原始错误 */ }
+      throw err
+    }
   }
 
   async importStatus(jobId) {
     const db = this._db()
-    const row = db.prepare('SELECT id,kind,state,payload,last_error,created_at,updated_at FROM jobs WHERE id=?').get(Number(jobId))
+    const id = Number(jobId)
+    const row = db.prepare('SELECT id,kind,state,last_error,created_at,updated_at FROM jobs WHERE id=?').get(id)
     if (!row) return { ok: false, error: 'job_not_found' }
-    let payload = {}
-    try { payload = JSON.parse(row.payload || '{}') } catch { payload = {} }
-    return { ok: true, job: { id: row.id, kind: row.kind, state: row.state, ...payload, last_error: row.last_error, updated_at: row.updated_at } }
+    // 进度在 meta（小 JSON）；jobs.payload 里的 jsonl 永不回传。
+    const progress = readImportProgress(db, id)
+    return {
+      ok: true,
+      job: {
+        id: row.id, kind: row.kind, state: row.state, ...progress,
+        last_error: row.last_error, updated_at: row.updated_at,
+      },
+    }
   }
 
   dispose() {

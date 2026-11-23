@@ -57,8 +57,8 @@ function node(db, {
 const jobRow = (db, id) => db.prepare('SELECT * FROM jobs WHERE id = ?').get(id)
 const jobCount = (db, where = '1=1', ...args) => Number(db.prepare(`SELECT count(*) AS n FROM jobs WHERE ${where}`).get(...args).n)
 
-test('契约：JOB_KINDS 六种；backoffSeconds 0/60/300/1800', () => {
-  assert.deepEqual(JOB_KINDS, ['consolidate', 'reflect', 'write', 'vector', 'archive', 'report'])
+test('契约：JOB_KINDS 七种（含 import）；backoffSeconds 0/60/300/1800', () => {
+  assert.deepEqual(JOB_KINDS, ['consolidate', 'reflect', 'write', 'vector', 'archive', 'report', 'import'])
   assert.equal(backoffSeconds(0), 0)
   assert.equal(backoffSeconds(1), 60)
   assert.equal(backoffSeconds(2), 300)
@@ -387,6 +387,8 @@ test('consolidate：共享 ≥2 个 tag → topic conf 0.8', async () => {
 test('consolidate：同身份 text_hash 重复收敛（保 owner，其余 archived + 审计）', async () => {
   const f = fresh()
   try {
+    // 构造旧库现场：v4 唯一索引会阻止新写重复行；consolidate 是给“索引建立前遗留脏库”的收敛器。
+    f.db.exec('DROP INDEX IF EXISTS idx_nodes_active_hash')
     const text = '同文重复：网关端口 3982'
     const web = node(f.db, { text, source: 'web' })
     const owner = node(f.db, { text, source: 'owner' })

@@ -598,3 +598,18 @@ test('R9-07 收尾：记忆详情错误态可重试；设置页有配置层键 N
     assert.ok(String(dicts.zh['settings.rulesConfigLayerNote']).includes(key), `Note 未点名 ${key}`)
   }
 })
+
+test('R10：设置只提交脏叶子；提案 apply/reject 用同步 ref 闸防双击', () => {
+  // 只提交与基线不同的叶子：避免一次保存把全部默认值钉进 profile patch。
+  assert.match(CLIENT, /const serverRef = useRef\(null\)/)
+  assert.match(CLIENT, /const changed = diffConfig\(serverRef\.current, payload\)/)
+  assert.match(CLIENT, /JSON\.stringify\(\{ config: changed \}\)/)
+  assert.match(CLIENT, /Object\.keys\(changed\)\.length === 0/)
+  // 同步闸：busy 是 state，重渲染前连点两次会穿透。
+  assert.match(CLIENT, /const busyRef = useRef\(''\)/)
+  assert.match(CLIENT, /busyRef\.current = 'apply'/)
+  assert.match(CLIENT, /busyRef\.current = 'reject'/)
+  assert.match(CLIENT, /busyRef\.current = ''/)
+  // 详情 PATCH 回传版本，Host 才能做 CAS（否则 node_changed 是死码）。
+  assert.match(CLIENT, /expectedUpdatedAt: loaded\.status === 'ok'/)
+})

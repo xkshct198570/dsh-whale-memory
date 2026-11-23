@@ -183,7 +183,7 @@
   "settings.loadFailed": "读取配置失败",
   "settings.defaultsNote": "配置未回显的分组按默认值展示；保存会整体提交上述场景。",
   "settings.restartNote": "接入与 worker 变更通常需要重载插件后生效。",
-  "settings.allowRemoteWarn": "放开后局域网内其他设备可访问本面板 API。",
+  "settings.allowRemoteWarn": "放开后只额外放行 webServer 绑定地址（读请求）；身份覆盖参数对非回环无效。",
   "settings.readonlyUnavailable": "当前运行环境不支持保存配置（只读）。",
   "settings.invalidValue": "存在超出范围或非数字的取值，请修正后再保存。",
   "import.reading": "正在读取文件…",
@@ -329,7 +329,7 @@
   "settings.panelTab": "默认页签",
   "settings.panelTabDesc": "打开面板时默认选中的页签。",
   "settings.pollMsDesc": "概览页自动刷新间隔。",
-  "settings.allowRemoteDesc": "仅本机回环默认可访问。",
+  "settings.allowRemoteDesc": "仅本机回环默认可访问；打开后只额外放行绑定地址。",
   "settings.traceId": "traceId（链路标记）",
   "settings.traceIdDesc": "写入审计与日志的链路标记。",
   "settings.logLevelDesc": "插件日志级别。",
@@ -825,5 +825,10 @@
   "err.server_error": "服务端处理失败，请稍后重试或查看日志",
   "rules.proposalNumberAdjusted": "编号已顺延：#{from} → #{to}",
   "rules.proposalSemantic": "语义稿",
-  "rules.proposalRefining": "提炼中"
+  "rules.proposalRefining": "提炼中",
+  "err": {
+    "duplicate_active": "已有相同内容的活跃记忆。",
+    "node_changed": "这条记忆刚被其他操作修改，请刷新后重试。",
+    "target_not_active": "目标记忆已失效，不能执行该操作。"
+  }
 }

@@ -7,7 +7,7 @@
  * - readOnly=true 时不建目录、不切 WAL、不写 schema（用于备份/诊断）；调用方自担"库必须已存在"。
  * - 单写者：本模块不提供连接池，同一 dataDir 由上层串行使用（worker 单飞）。
  */
-import { mkdirSync, readdirSync, rmSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { DatabaseSync } from 'node:sqlite'
@@ -73,6 +73,56 @@ function statSyncSafe(path) {
   try { statSync(path); return true } catch { return false }
 }
 
+/** 本进程已通过 quick_check 的库路径：worker 每次 openDb 都跑全库快检太贵，成功一次即记账。 */
+const quickChecked = new Set()
+
+/** 17 位时间戳（与 backupOnMigrate 同口径），用于隔离损坏库文件名。 */
+function quarantineStamp() {
+  return stampNow()
+}
+
+/**
+ * 损坏库隔离：close 后把 memory.db 与 -wal/-shm 改名到 `memory.corrupt-<ts>.db*`，
+ * 保留现场供人工恢复；随后由调用方重开一个新库。绝不物理删除用户数据。
+ * @param {string} dir
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @returns {{ renamed: string[], reason: string } | null}
+ */
+function quarantineCorrupt(db, dir) {
+  try { closeDb(db) } catch { /* 已关闭 */ }
+  const stamp = quarantineStamp()
+  const renamed = []
+  for (const [from, to] of [
+    [join(dir, DB_FILE), join(dir, `memory.corrupt-${stamp}.db`)],
+    [join(dir, `${DB_FILE}-wal`), join(dir, `memory.corrupt-${stamp}.db-wal`)],
+    [join(dir, `${DB_FILE}-shm`), join(dir, `memory.corrupt-${stamp}.db-shm`)],
+  ]) {
+    if (!existsSync(from)) continue
+    try { renameSync(from, to); renamed.push(to.slice(dir.length + 1)) } catch { /* 改名失败保留现场 */ }
+  }
+  return renamed.length ? { renamed, reason: 'quick_check_failed' } : null
+}
+
+/**
+ * 库完整性快检（每进程每库一次）：`PRAGMA quick_check` 不是 'ok' 即视为损坏。
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @returns {{ ok: boolean, detail: string }}
+ */
+export function quickCheck(db) {
+  try {
+    const rows = db.prepare('PRAGMA quick_check').all()
+    const first = String(rows?.[0]?.quick_check ?? '')
+    // 只有 SQLite 明确报出损坏（返回非 ok 行）才允许隔离；抛错不在此列。
+    return first === 'ok'
+      ? { ok: true, detail: 'ok' }
+      : { ok: false, corrupt: true, detail: first || 'unknown' }
+  } catch (err) {
+    const code = Number(err?.errcode ?? err?.errno ?? 0)
+    const busy = code === 5 || code === 6 || /database is (locked|busy)/i.test(String(err?.message || ''))
+    return { ok: false, busy, corrupt: false, detail: String(err?.message || err) }
+  }
+}
+
 /** 只读探测库内 schema 版本；meta 表不存在/读失败按 0（=新库或不可读，不做快照）。 */
 function readSchemaVersion(db) {
   try {
@@ -96,10 +146,30 @@ export function openDb(dataDir, { readOnly = false, backupOnMigrate: doBackup = 
 
   if (!readOnly) mkdirSync(dir, { recursive: true })
 
-  const db = new DatabaseSync(join(dir, DB_FILE), { readOnly })
-  // busy_timeout 对读写都必要：并发写由 SQLite 排队，不抛 SQLITE_BUSY。
+  const pathKey = join(dir, DB_FILE)
+  let db = new DatabaseSync(pathKey, { readOnly })
   db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`)
   if (!readOnly) {
+    // 损坏探测先于任何写/迁移：坏页库若被 ensureSchema 当成新库，会跳过迁移快照并继续跑。
+    if (!quickChecked.has(pathKey)) {
+      const check = quickCheck(db)
+      if (!check.ok) {
+        if (check.busy) {
+          // 忙 ≠ 坏：另一进程持写锁/EXCLUSIVE 时 quick_check 会抛 SQLITE_BUSY。
+          // 这时绝不能改名隔离（会把健康库和新空库分叉），跳过本次快检继续用同一连接。
+          db.quickCheckSkipped = check.detail
+        } else if (check.corrupt) {
+          const quarantine = quarantineCorrupt(db, dir)
+          db = new DatabaseSync(pathKey, { readOnly: false })
+          db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`)
+          db.quarantine = quarantine || { renamed: [], reason: check.detail }
+        } else {
+          // 未知错误（权限/不可读等）：不做破坏性动作，保留现场并记状态。
+          db.quickCheckSkipped = check.detail
+        }
+      }
+      quickChecked.add(pathKey)
+    }
     db.exec('PRAGMA journal_mode = WAL')
     db.exec('PRAGMA synchronous = NORMAL')
     const current = readSchemaVersion(db)
@@ -107,7 +177,7 @@ export function openDb(dataDir, { readOnly = false, backupOnMigrate: doBackup = 
       // 快照结果挂在连接上供诊断（db.js 无 logger；不阻断、不静默：调用方可读）。
       db.migrationBackup = backupOnMigrate(db, dir)
     }
-    ensureSchema(db)
+    db.schemaInfo = ensureSchema(db)
   }
   return db
 }

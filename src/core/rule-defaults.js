@@ -15,7 +15,7 @@
  * 目录可能又空了；若以"空目录"为判据就会把铁律重新灌回来，等于用户永远删不掉。`.seeded.json`
  * 才是判据——播过一次就不再播，剩下的一切以文件现状为准。
  *
- * Why 一次 commit：默认播种是"一次安装动作"，16 个文件各自 commit 会把规则仓的 history 打成噪音，
+ * Why 一次 commit：默认播种是"一次安装动作"，18 个文件各自 commit 会把规则仓的 history 打成噪音，
  * 也没法用一条提交回滚整批默认值。写文件时 `git:false`，最后统一提交一次；仓库不存在时先用
  * `initRuleRepo` 只建仓（不建首 commit），保证首启也只有一个提交点、且该提交包含全部默认规则。
  */
@@ -252,6 +252,7 @@ async function seedLocked({ base, defaults, marker, markerFile, fs, git, log, op
     ensureRuleGitignore(base, { fs })
     const written = writeMarker(markerFile, {
       version: SEED_VERSION,
+      status: 'complete',
       seededAt: new Date().toISOString(),
       source: 'defaults',
       skipped: 'existing_rules',
@@ -271,6 +272,23 @@ async function seedLocked({ base, defaults, marker, markerFile, fs, git, log, op
     return { ...baseResult, ok: true, skipped: 'defaults_empty' }
   }
 
+  // 首播前先 durable 写 "seeding" marker（含 planned key 清单）。
+  // 为什么必须在写文件之前：写一半被杀后，旧逻辑会把"盘上任意规则"当成用户已有规则，
+  // 直接 adopt 全部默认 key 并永不重播（审计 P0：静默漏播 15 条铁律）。
+  const planned = files.map(keyOfDefaultFile)
+  const seedingMarker = writeMarker(markerFile, {
+    version: SEED_VERSION,
+    status: 'seeding',
+    seededAt: new Date().toISOString(),
+    source: 'defaults',
+    planned,
+    keys: [],
+    invalid: [],
+  }, fs)
+  if (!seedingMarker.ok) {
+    return { ...baseResult, ok: false, error: 'marker_write_failed', detail: seedingMarker.error }
+  }
+
   // 规则仓就绪：只建仓不首提交（首启要一个包含全部默认规则的提交点）。
   prepareRepo(base, fs, git, opts, log)
 
@@ -281,6 +299,7 @@ async function seedLocked({ base, defaults, marker, markerFile, fs, git, log, op
     const adopted = files.map(keyOfDefaultFile)
     const written = writeMarker(markerFile, {
       version: SEED_VERSION,
+      status: 'complete',
       seededAt: new Date().toISOString(),
       source: 'defaults',
       skipped: 'tombstoned',
@@ -324,6 +343,7 @@ async function retrySeed({ base, defaults, marker, markerFile, fs, git, log, opt
     const adopted = defaultFilesOf(defaults, fs).map(keyOfDefaultFile)
     const written = writeMarker(markerFile, {
       ...existingMarker,
+      status: 'complete',
       version: SEED_VERSION,
       seededAt: new Date().toISOString(),
       keys: adopted,
@@ -332,9 +352,15 @@ async function retrySeed({ base, defaults, marker, markerFile, fs, git, log, opt
     if (!written.ok) return { ...baseResult, ok: false, error: 'marker_write_failed', detail: written.error }
     return { ...baseResult, ok: true, skipped: 'already_seeded', seeded: 0, keys: adopted }
   }
-  const recorded = new Set(markerKeysOf(existingMarker))
+  const recovering = String(existingMarker.status || '') === 'seeding'
+  // 恢复态：planned 里已在盘上的 key 也要算进 marker.keys（否则恢复后它们被视为"未采纳"）。
+  const recorded = new Set(recovering ? [] : markerKeysOf(existingMarker))
   const invalidKeys = new Set(compactInvalid(existingMarker.invalid).map((item) => item.key).filter(Boolean))
   const onDisk = new Set(listRules(base).rules.map((doc) => String(doc.front.key)))
+  const recoveredKeys = recovering
+    ? (Array.isArray(existingMarker.planned) ? existingMarker.planned : [])
+      .map((key) => String(key)).filter((key) => onDisk.has(key))
+    : []
   const tombstones = new Set(readTombstones(base, { fs }).map((item) => String(item.key)))
   const files = defaultFilesOf(defaults, fs).filter((name) => {
     const key = keyOfDefaultFile(name)
@@ -344,14 +370,16 @@ async function retrySeed({ base, defaults, marker, markerFile, fs, git, log, opt
     return true                              // 升级新增 key 或上轮 invalid 重试项
   })
   const nextVersion = Number(existingMarker.version) === SEED_VERSION
+  const nextKeys = [...new Set([...markerKeysOf(existingMarker), ...recoveredKeys])]
   if (!files.length) {
-    if (!nextVersion) {
+    if (!nextVersion || recovering) {
       const bumped = writeMarker(markerFile, {
-        ...existingMarker, version: SEED_VERSION, seededAt: new Date().toISOString(),
+        ...existingMarker, status: 'complete', version: SEED_VERSION,
+        seededAt: new Date().toISOString(), keys: nextKeys,
       }, fs)
       if (!bumped.ok) return { ...baseResult, ok: false, error: 'marker_write_failed', detail: bumped.error }
     }
-    return { ...baseResult, ok: true, skipped: 'already_seeded', seeded: 0, keys: markerKeysOf(existingMarker) }
+    return { ...baseResult, ok: true, skipped: 'already_seeded', seeded: 0, keys: nextKeys }
   }
   prepareRepo(base, fs, git, opts, log)
   const seeded = await seedEntries({ base, defaults, files, fs, log })
@@ -362,7 +390,8 @@ async function retrySeed({ base, defaults, marker, markerFile, fs, git, log, opt
   return finalizeSeed({
     base, defaults, marker, markerFile, fs, git, log, opts,
     seededKeys: seeded.keys, invalid: seeded.invalid, paths: seeded.paths,
-    tombstoned: seeded.tombstoned, priorKeys: markerKeysOf(existingMarker), priorInvalid: merged,
+    tombstoned: seeded.tombstoned,
+    priorKeys: [...new Set([...markerKeysOf(existingMarker), ...recoveredKeys])], priorInvalid: merged,
   })
 }
 
@@ -468,6 +497,7 @@ function finalizeSeed({
   const keys = [...new Set([...(priorKeys || []), ...seededKeys])]
   const markerWritten = writeMarker(markerFile, {
     version: SEED_VERSION,
+    status: 'complete',
     seededAt: new Date().toISOString(),
     source: 'defaults',
     count: seededKeys.length,
@@ -490,6 +520,85 @@ function finalizeSeed({
     commit,
     manifest: manifest.manifest || null,
     keys,
+  }
+}
+
+/**
+ * 单条默认规则恢复（面板「恢复默认」）：用包内默认正文覆盖当前规则，清掉该 key 的墓碑。
+ *
+ * 语义：这是**显式人工动作**，允许覆盖正文并产生新版本；历史快照由 writeRule 保留。
+ * 清墓碑是恢复的一部分——否则编号仍被视为已作废，manifest/健康检查会和现行规则打架。
+ *
+ * @param {{root?:string, key:string, git?:boolean, exec?:Function, now?:number, log?:Function}} args
+ * @returns {Promise<{ok:boolean, rule?:object, path?:string, error?:string, detail?:any}>}
+ */
+export async function restoreDefaultRule({ root = '', key = '', git = true, exec = null, now = Date.now, log = () => {} } = {}) {
+  const k = String(key ?? '').trim()
+  const name = `${k}.md`
+  const file = join(defaultRulesDir(), name)
+  if (!/^[a-z][a-z0-9_-]{0,31}$/.test(k) || !existsSync(file)) {
+    return { ok: false, error: 'default_not_found' }
+  }
+  const fs = nodeFs
+  const base = String(root ?? '').trim() ? resolve(String(root)) : defaultRuleRoot()
+  const parsed = parseDefault(file, name, new Map(), fs)
+  if (!parsed.ok) return { ok: false, error: 'invalid_default', detail: parsed.errors }
+  const lock = acquireRepoLock(base, { fs, timeoutMs: 2000 })
+  if (!lock.ok) return { ok: false, error: lock.error }
+  try {
+    // 墓碑必须先清再写：writeRule 会按墓碑拒绝“编号复用”（number_retired），
+    // 而恢复默认是显式人工动作、同 key 同编号重新启用是它的语义。
+    const tomb = readTombstones(base, { fs }).find((item) => String(item.key) === k)
+    const tombPath = join(base, 'retired', `${k}.json`)
+    let tombBackup = null
+    if (tomb && existsSync(tombPath)) {
+      try {
+        tombBackup = { path: tombPath, content: fs.readFileSync(tombPath) }
+        fs.unlinkSync(tombPath)
+      } catch (err) {
+        log(`[whale-memory] restore default tombstone remove failed: ${err?.message || err}`)
+        tombBackup = null
+      }
+    }
+    // 墓碑文件删掉还不够：manifest.retired 按“只增不减”保存旧集合，必须显式 shrink
+    // 一次（这是人工恢复动作，语义就是撤销该 key 的墓碑），否则 writeRule 仍判 number_retired。
+    if (tombBackup) {
+      const shrunk = regenerateManifest(base, { fs, allowShrink: true })
+      if (!shrunk.ok) {
+        try { fs.writeFileSync(tombBackup.path, tombBackup.content) } catch { /* best effort */ }
+        return { ok: false, error: 'manifest_failed', detail: shrunk.error }
+      }
+    }
+    const written = writeRule(base, { front: parsed.front, text: parsed.text }, { git: false, fs, lockHeld: true })
+    if (!written.ok) {
+      // 写失败：把墓碑原样放回，别让编号因为一次失败的恢复而变成可复用。
+      if (tombBackup) {
+        try {
+          fs.writeFileSync(tombBackup.path, tombBackup.content)
+          const fd = fs.openSync(tombBackup.path, 'r')
+          try { fs.fsyncSync(fd) } finally { fs.closeSync(fd) }
+        } catch { /* best effort：墓碑还在磁盘上就够，manifest 下一轮自愈 */ }
+        try { regenerateManifest(base, { fs }) } catch { /* 下一轮自愈 */ }
+      }
+      return { ok: false, error: written.error || 'write_failed', detail: written.detail }
+    }
+    const manifest = regenerateManifest(base, { fs })
+    if (!manifest.ok) return { ok: false, error: 'manifest_failed', detail: manifest.error }
+    let commit = null
+    if (git) {
+      commit = commitOnce(base, `rule: restore default ${k}`, {
+        exec, paths: [relativePath(base, written.path), MANIFEST_FILE],
+      })
+      if (commit && !commit.ok) log(`[whale-memory] restore default commit skipped: ${commit.error || 'git_unavailable'}`)
+    }
+    return {
+      ok: true,
+      path: written.path,
+      commit,
+      rule: { ...normalizeRuleDoc(parsed.front, parsed.text), bodyStart: 0, file: written.path },
+    }
+  } finally {
+    lock.release()
   }
 }
 

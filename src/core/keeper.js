@@ -23,7 +23,7 @@ import { METRIC_DEFS, computeMetrics, writeMetricsRows } from './metrics.js'
 import { parseTags, rebuildTagEdges, upsertEdge } from './relations.js'
 
 /** 允许的作业类型（enqueue/register 校验用；与 schema jobs.kind 语义一致）。 */
-export const JOB_KINDS = ['consolidate', 'reflect', 'write', 'vector', 'archive', 'report']
+export const JOB_KINDS = ['consolidate', 'reflect', 'write', 'vector', 'archive', 'report', 'import']
 
 /** 失败重试退避（秒）：§8.1 的 1m→5m→30m；attempts=0 是首跑不等，3 起封顶 30m。 */
 const BACKOFF_SECONDS = [0, 60, 300, 1800]
@@ -198,7 +198,7 @@ export function createKeeper({
       }
 
       try {
-        const result = await handler(safeJson(job.payload), { log, now: nowSec })
+        const result = await handler(safeJson(job.payload), { log, now: nowSec, jobId: Number(job.id) })
         finishDone(job.id)
         lastRun = { id: Number(job.id), kind: job.kind, result }
         return { ran: [job.kind], result, failed: false }

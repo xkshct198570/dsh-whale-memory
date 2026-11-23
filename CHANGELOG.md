@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.2 — 2026-11-24（未发布 · R10 数据不变式与安全收口）
+
+严苛自审后的修复批：把“看起来正常、实际静默失效”的坑逐条收口，并补回归测试。
+- schema v4：`nodes` 活跃同文唯一索引（部分索引，规则镜像 `origin=rule:*` 豁免）；迁移前先收敛旧重复行（保最早，其余 superseded 并指向规范行），迁移前整库快照由 v3→v4 触发。
+- `withTx` 只把“已在事务内”当嵌套；锁冲突/只读/磁盘错误不再被吞成无事务执行（审计 P1-4）。
+- 影子审核：accept 必须带当前身份，候选/目标均校验身份三列与 `status='active'`；跨分区 id 返回 `candidate_not_found`，失效目标 `target_not_active`。
+- 写队列：唯一索引竞态（后到的同文 ADD/MERGE/SUPERSEDE/REVIEW）回落 NOOP/MERGE 语义，不再让 job 永久失败；`enqueue` 增终态扫地机，跨 drain/跨进程抢先处理也会结算 waiter（120s 上限）。
+- 可观测：FTS 查询失败计数进 `/stats health`；`ready` 改为真探测；打开库先 `PRAGMA quick_check`，坏库改名隔离（保留现场）并记录；新增写/召回/作业/边索引。
+- 异步导入落 `jobs.payload`（cursor + 统计），崩溃后由 keeper `import` handler 从断点续跑；状态接口不再回传 4MB jsonl。
+- 规则仓：首播先写 `status:'seeding'` marker，中断后只补 planned 里缺失 key（不再“盘上任意规则=已采纳全部”）；`duplicate_key` 跨根/proposals 进红项，purge 同名旧候选一并删；空规则列表也跑镜像归档孤儿；AGENTS 无管理标记与僵尸锁进 health 黄灯；`restoreDefaultRule` 落地（清墓碑 + allowShrink 重建 manifest）。
+- 配置保存：按叶子合并并保留 cosmokit Volatile Ref 引用身份（宿主后续 volatile 更新不再静默失效）；面板只提交与基线不同的叶子。
+- 召回 context order 100→130（避开宿主 WORKING_DIRECTORY 保留位）；`updateNode` 增 updated_at CAS；邻居注记查询固定排序。
+- 文档：`defaults/README.md` 计数改为 18 文件/17 编号；README 的 allowRemote 口径改为“只放行 webServer 绑定地址”。
+
 ## 0.6.1 — 2026-11-23（未发布 · R9 稳定性修复）
 
 真机链路与写不变式（架构书 v3.9 / 计划 v1.9 的 R9-01/02/03）。

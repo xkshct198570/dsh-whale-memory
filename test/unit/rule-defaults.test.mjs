@@ -308,7 +308,7 @@ test('包内默认目录不存在：skipped=defaults_missing 且不写 marker（
   assert.equal(existsSync(join(rulesRoot, SEED_MARKER)), false)
 })
 
-test('默认文件全部非法：all_invalid + 不写 marker（下次仍会尝试）', async (t) => {
+test('默认文件全部非法：all_invalid + 只留 seeding 标记（下次仍会尝试）', async (t) => {
   const base = freshRoot(t)
   const rulesRoot = join(base, 'rules')
   const defaults = join(base, 'defaults', 'rules')
@@ -320,7 +320,16 @@ test('默认文件全部非法：all_invalid + 不写 marker（下次仍会尝�
   assert.equal(result.error, 'all_invalid')
   assert.equal(result.seeded, 0)
   assert.equal(result.skippedInvalid, 1)
-  assert.equal(existsSync(join(rulesRoot, SEED_MARKER)), false)
+  // 崩溃/全失败只留 status='seeding'（下轮恢复会继续补），绝不写 complete。
+  assert.equal(readSeedMarker(rulesRoot)?.status, 'seeding')
+
+  // 修好坏文件后下一次启动必须补播成功（seeding 标记不阻断重试）。
+  writeDefault(defaults, frontOf({ key: 'iron-rule-1', number: 1 }), '先验证再覆盖。')
+  rmSync(join(defaults, 'broken.md'))
+  const retry = await seedDefaultRules({ root: rulesRoot, defaultsDir: defaults })
+  assert.equal(retry.ok, true)
+  assert.equal(retry.seeded, 1)
+  assert.equal(readSeedMarker(rulesRoot)?.status, 'complete')
 })
 
 test('无编号安全行（number=0）：validateRule 只放行 iron-rule-safety，其余 key 仍拒', async (t) => {
@@ -527,7 +536,12 @@ test('R9-21：manifest 重建失败 → 不写 .seeded.json（下轮重试，hea
   const result = await seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { git: false, fs: fakeFs })
   assert.equal(result.ok, false)
   assert.equal(result.error, 'manifest_failed')
-  assert.equal(existsSync(join(rulesRoot, SEED_MARKER)), false, 'manifest 失败不得写 marker')
+  // 失败时只留 seeding 标记（不能是 complete），下轮启动继续补提交与 marker。
+  assert.equal(readSeedMarker(rulesRoot)?.status, 'seeding')
+
+  const retry = await seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { git: false })
+  assert.equal(retry.ok, true, '下一轮必须能补完')
+  assert.equal(readSeedMarker(rulesRoot)?.status, 'complete')
 })
 
 test('R9-21b：首播逐文件让出事件循环——首个 immediate 时不可能已写完默认目录', async (t) => {

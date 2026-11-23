@@ -184,7 +184,7 @@
   "settings.loadFailed": "Failed to load configuration",
   "settings.defaultsNote": "Groups absent from the config echo are shown with defaults; saving submits all groups above.",
   "settings.restartNote": "Backend and worker changes usually take effect after reloading the plugin.",
-  "settings.allowRemoteWarn": "When enabled, other devices on the LAN can reach this panel API.",
+  "settings.allowRemoteWarn": "When enabled, only the webServer.host bind address is additionally allowed (reads); identity override params are ignored for non-loopback requests.",
   "settings.readonlyUnavailable": "Config saving is unavailable in this runtime (read-only).",
   "settings.invalidValue": "Some values are out of range or not numeric; fix them before saving.",
   "import.reading": "Reading file…",
@@ -329,7 +329,7 @@
   "settings.panelTab": "Default tab",
   "settings.panelTabDesc": "Tab selected when the panel opens.",
   "settings.pollMsDesc": "Auto-refresh interval on the overview tab.",
-  "settings.allowRemoteDesc": "Only loopback access is allowed by default.",
+  "settings.allowRemoteDesc": "Loopback only by default; when enabled, only the bind address is additionally allowed.",
   "settings.traceId": "traceId (trace marker)",
   "settings.traceIdDesc": "Trace marker for write audit and logs.",
   "settings.logLevelDesc": "Plugin log level.",
@@ -825,5 +825,10 @@
   "err.server_error": "Server-side failure; retry shortly or check the logs",
   "rules.proposalNumberAdjusted": "Number adjusted: #{from} → #{to}",
   "rules.proposalSemantic": "semantic draft",
-  "rules.proposalRefining": "refining"
+  "rules.proposalRefining": "refining",
+  "err": {
+    "duplicate_active": "An active memory with the same text already exists.",
+    "node_changed": "This memory was changed by another action; refresh and retry.",
+    "target_not_active": "The target memory is no longer active."
+  }
 }

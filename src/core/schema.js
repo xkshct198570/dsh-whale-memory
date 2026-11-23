@@ -24,7 +24,7 @@
  * 任何写路径都不得绕过触发器直接改 FTS。
  */
 
-export const SCHEMA_VERSION = 3
+export const SCHEMA_VERSION = 4
 
 /**
  * 对既有表的加法列：[表, 列, 类型]。迁移与 DDL 必须保持一致。
@@ -84,6 +84,7 @@ CREATE INDEX IF NOT EXISTS idx_nodes_identity ON nodes(user_id, role_id, workspa
 CREATE INDEX IF NOT EXISTS idx_nodes_hash     ON nodes(text_hash);
 CREATE INDEX IF NOT EXISTS idx_nodes_status   ON nodes(status);
 CREATE INDEX IF NOT EXISTS idx_nodes_hits     ON nodes(last_hit_at);
+CREATE INDEX IF NOT EXISTS idx_nodes_origin   ON nodes(origin);
 
 -- 字面索引一：trigram（≥3 字/标识符）
 CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
@@ -122,6 +123,7 @@ CREATE TABLE IF NOT EXISTS edges (
   UNIQUE(from_id, to_id, etype)
 );
 CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_id);
+CREATE INDEX IF NOT EXISTS idx_edges_to   ON edges(to_id);
 CREATE INDEX IF NOT EXISTS idx_edges_conf ON edges(etype, conf);
 
 CREATE TABLE IF NOT EXISTS recalls (
@@ -140,6 +142,8 @@ CREATE TABLE IF NOT EXISTS recalls (
   source    TEXT NOT NULL DEFAULT 'hook'             -- hook/panel-test/search
 );
 
+CREATE INDEX IF NOT EXISTS idx_recalls_ts ON recalls(ts);
+
 CREATE TABLE IF NOT EXISTS writes (
   id        INTEGER PRIMARY KEY AUTOINCREMENT,
   ts        REAL NOT NULL,
@@ -155,6 +159,8 @@ CREATE TABLE IF NOT EXISTS writes (
   role_id   TEXT NOT NULL DEFAULT '',
   workspace TEXT NOT NULL DEFAULT ''
 );
+CREATE INDEX IF NOT EXISTS idx_writes_ts ON writes(ts);
+CREATE INDEX IF NOT EXISTS idx_writes_identity_ts ON writes(user_id, role_id, workspace, ts);
 
 CREATE TABLE IF NOT EXISTS evolution (
   id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -216,6 +222,81 @@ CREATE TABLE IF NOT EXISTS metrics (
  */
 const PINNED_INDEX_SQL = 'CREATE INDEX IF NOT EXISTS idx_nodes_pinned ON nodes(pinned, status)'
 
+/**
+ * 活跃节点同身份原文唯一（v4）：并发双写不再各插一行，第二行在 DB 层被拒。
+ * 必须用部分索引（WHERE status='active'）：归档/取代的旧行允许同 hash 共存，
+ * 否则“重新写入一条曾归档的事实”会永远失败。
+ */
+const ACTIVE_HASH_UNIQUE_SQL = `CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_active_hash
+  ON nodes(text_hash, user_id, role_id, workspace)
+  WHERE status='active' AND (origin IS NULL OR origin NOT LIKE 'rule:%')`
+// 兜底索引必须换名：同名 `CREATE UNIQUE ... IF NOT EXISTS` 会让已有非唯一索引静默顶替，
+// 之后永远建不出唯一索引，而 health 还报 true（审计 A2）。
+const ACTIVE_HASH_FALLBACK_SQL = `CREATE INDEX IF NOT EXISTS idx_nodes_active_hash_nu
+  ON nodes(text_hash, user_id, role_id, workspace)`
+
+/**
+ * v4 迁移：建唯一索引前先收敛存量重复活跃行（SELECT→INSERT 竞态时代的产物）。
+ *
+ * 口径：同 (text_hash,user_id,role_id,workspace,status='active') 组保留最早一行（created_at,rowid），
+ * 其余置 status='superseded' + superseded_by=保留行，invalid_at=迁移时刻；不物理删，
+ * 数据可追溯、可回滚（迁移前 db.js 已做整库快照）。
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @returns {number} 被收敛的行数
+ */
+/**
+ * 读取活跃同文索引的真实形态（存在与否、是否 UNIQUE）。
+ * 为什么：`CREATE UNIQUE INDEX IF NOT EXISTS` 遇到同名非唯一索引不会报错也不会升级，
+ * 唯一性保护可能永久失效而所有“成功”信号都是假的。
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @returns {{name:string, unique:boolean}|null}
+ */
+export function activeHashIndex(db) {
+  try {
+    const row = db.prepare(`SELECT name, sql FROM sqlite_master
+      WHERE type='index' AND name='idx_nodes_active_hash'`).get()
+    if (!row) return null
+    return { name: String(row.name), unique: /UNIQUE\s+INDEX/i.test(String(row.sql || '')) }
+  } catch { return null }
+}
+
+export function dedupeActiveHashes(db) {
+  const groups = db.prepare(`SELECT text_hash, user_id, role_id, workspace, count(*) AS n
+    FROM nodes WHERE status='active' AND (origin IS NULL OR origin NOT LIKE 'rule:%')
+    GROUP BY text_hash, user_id, role_id, workspace HAVING n > 1`).all()
+  if (groups.length === 0) return 0
+  const keep = db.prepare(`SELECT id FROM nodes
+    WHERE status='active' AND (origin IS NULL OR origin NOT LIKE 'rule:%')
+      AND text_hash=? AND user_id=? AND role_id=? AND workspace=?
+    ORDER BY created_at ASC, rowid ASC LIMIT 1`)
+  const retire = db.prepare(`UPDATE nodes SET status='superseded', superseded_by=?, invalid_at=?,
+    updated_at=? WHERE id=?`)
+  const ts = Date.now() / 1000
+  let deduped = 0
+  try {
+    db.exec('BEGIN IMMEDIATE')
+    for (const group of groups) {
+      const canonical = keep.get(group.text_hash, group.user_id, group.role_id, group.workspace)
+      if (!canonical) continue
+      const rows = db.prepare(`SELECT id FROM nodes
+        WHERE status='active' AND (origin IS NULL OR origin NOT LIKE 'rule:%')
+          AND text_hash=? AND user_id=? AND role_id=? AND workspace=? AND id<>?
+        ORDER BY created_at ASC, rowid ASC`).all(
+        group.text_hash, group.user_id, group.role_id, group.workspace, canonical.id)
+      for (const row of rows) {
+        retire.run(canonical.id, ts, ts, row.id)
+        deduped += 1
+      }
+    }
+    db.exec('COMMIT')
+  } catch (err) {
+    try { db.exec('ROLLBACK') } catch { /* 回滚失败不遮蔽原始错误 */ }
+    throw err
+  }
+  return deduped
+}
+
 const UPSERT_META = 'INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
 
 /**
@@ -250,6 +331,22 @@ export function ensureSchema(db) {
   }
   migrateAdditiveColumns(db)
   db.exec(PINNED_INDEX_SQL)
+  // v4：先收敛重复活跃行，再建唯一索引；索引建不起来时退化为普通索引（旧脏库不阻断启动），
+  // 由 backend 把 deduped/unique 挂到 health 观测。
+  const deduped = dedupeActiveHashes(db)
+  // 同名非唯一索引会让 CREATE UNIQUE ... IF NOT EXISTS 静默 no-op：先拆掉再建。
+  let existing = activeHashIndex(db)
+  if (existing && !existing.unique) {
+    try { db.exec('DROP INDEX IF EXISTS idx_nodes_active_hash') } catch { /* 并发 DDL 让别人处理 */ }
+  }
+  try {
+    db.exec(ACTIVE_HASH_UNIQUE_SQL)
+  } catch {
+    // 并发 DDL 可能被别人抢先建好：以 sqlite_master 实读为准，不靠“没抛错”猜。
+    try { db.exec(ACTIVE_HASH_FALLBACK_SQL) } catch { /* 兜底索引失败也不阻断 */ }
+  }
+  existing = activeHashIndex(db)
+  const uniqueIndex = Boolean(existing && existing.unique)
   db.prepare(UPSERT_META).run('schema_version', String(SCHEMA_VERSION))
-  return { version: SCHEMA_VERSION }
+  return { version: SCHEMA_VERSION, deduped, uniqueIndex }
 }

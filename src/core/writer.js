@@ -499,8 +499,10 @@ function decideByRules(db, event, opts = {}) {
 
   // 5. 同身份原文命中：来源更可信 → 升级 source；否则 NOOP（记一次命中，不新增事实）
   const hash = contentHash(text)
+  // 规则镜像是实现行（origin=rule:*），不是用户事实：同文也不得把用户写入判成重复。
   const dup = db.prepare(
-    "SELECT id,text,source FROM nodes WHERE text_hash=? AND user_id=? AND role_id=? AND workspace=? AND status='active' LIMIT 1",
+    `SELECT id,text,source FROM nodes WHERE text_hash=? AND user_id=? AND role_id=? AND workspace=?
+      AND status='active' AND (origin IS NULL OR origin NOT LIKE 'rule:%') LIMIT 1`,
   ).get(hash, ident.userId, ident.roleId, ident.workspace)
   if (dup) {
     const incoming = mapSource(event?.source)
@@ -759,13 +761,29 @@ export function recordEvolution(db, row = {}) {
   return Number(info.lastInsertRowid) || 0
 }
 
-/** 事务包装：调用方已开事务时不重复 BEGIN（BEGIN 失败即视为嵌套，直接执行）。 */
+/** SQLite 的“已在事务里”错误文案（不同版本措辞一致，仅大小写/前缀差异）。 */
+const NESTED_TX_RE = /cannot start a transaction within a transaction/i
+/** 唯一索引冲突（v4 活跃同文唯一；也覆盖主键/边唯一）。 */
+const UNIQUE_VIOLATION_RE = /UNIQUE constraint failed/i
+
+/** v4 唯一索引冲突判定：只在“活跃同文”这一路当作重复，不吞别的约束错误。 */
+export function isActiveHashConflict(err) {
+  const message = String(err?.message || err)
+  return UNIQUE_VIOLATION_RE.test(message) && /nodes\.text_hash|idx_nodes_active_hash/i.test(message)
+}
+
+/**
+ * 事务包装：调用方已开事务时不重复 BEGIN；**只有**“已在事务里”这一种失败算嵌套。
+ * 其它 BEGIN 失败（锁冲突/只读库/磁盘错误）必须原样抛出——过去一律当嵌套，
+ * 会让半写随外层 COMMIT、或退化成无事务多语句（审计 P1-4）。
+ */
 export function withTx(db, fn) {
   let begun = false
   try {
     db.exec('BEGIN IMMEDIATE')
     begun = true
-  } catch {
+  } catch (err) {
+    if (!NESTED_TX_RE.test(String(err?.message || err))) throw err
     begun = false
   }
   try {
@@ -903,9 +921,20 @@ export function processEvent(db, event, config = {}) {
   const options = resolveConfig(config)
   const decision = decideWrite(db, event, options)
   const ts = now()
-  const action = String(decision.action || 'REJECT')
   const text = normalize(String(decision.afterText ?? event?.text ?? ''))
+  const ident = normalizeIdentity(event?.identity)
+  const hash = contentHash(text)
+  /** v4 唯一索引竞态时找"已经落地的同文活跃行"：找到就按重复处理，绝不让队列永久重试。 */
+  const findDup = () => db.prepare(
+    "SELECT id,text,source FROM nodes WHERE text_hash=? AND user_id=? AND role_id=? AND workspace=? AND status='active' LIMIT 1",
+  ).get(hash, ident.userId, ident.roleId, ident.workspace)
+  const touchDup = (id) => {
+    db.prepare('UPDATE nodes SET hits=hits+1, last_hit_at=? WHERE id=?').run(ts, id)
+  }
+  let action = String(decision.action || 'REJECT')
   let nodeId = null
+  /** 竞态下“取代目标==已落地同文行”：必须归 NOOP，不能谎报 SUPERSEDE（审计 A5）。 */
+  let selfDuplicate = false
 
   if (action === 'REJECT') {
     recordWrite(db, event, { ...decision, nodeId: null })
@@ -931,31 +960,32 @@ export function processEvent(db, event, config = {}) {
     } else {
       // 同 origin/相似 MERGE：更新正文；事件带 TTL 时同时续期（搜索反哺每天刷新同一查询的摘要）。
       const expiredAt = validExpiredAt(event?.expired_at)
-      withTx(db, () => {
-        if (expiredAt !== null) {
-          db.prepare('UPDATE nodes SET text=?, text_hash=?, text_bigrams=?, expired_at=?, updated_at=? WHERE id=?')
-            .run(text, contentHash(text), bigrams(text), expiredAt, ts, targetId)
-        } else {
-          db.prepare('UPDATE nodes SET text=?, text_hash=?, text_bigrams=?, updated_at=? WHERE id=?')
-            .run(text, contentHash(text), bigrams(text), ts, targetId)
-        }
-      })
+      try {
+        withTx(db, () => {
+          if (expiredAt !== null) {
+            db.prepare('UPDATE nodes SET text=?, text_hash=?, text_bigrams=?, expired_at=?, updated_at=? WHERE id=?')
+              .run(text, contentHash(text), bigrams(text), expiredAt, ts, targetId)
+          } else {
+            db.prepare('UPDATE nodes SET text=?, text_hash=?, text_bigrams=?, updated_at=? WHERE id=?')
+              .run(text, contentHash(text), bigrams(text), ts, targetId)
+          }
+        })
+      } catch (err) {
+        // 竞态：合并后的正文已被另一活跃行占用 → 退回 NOOP（目标不动，记一次命中）。
+        if (!isActiveHashConflict(err)) throw err
+        const dup = findDup()
+        if (!dup) throw err
+        touchDup(dup.id)
+        action = 'NOOP'
+        nodeId = String(dup.id)
+        recordWrite(db, event, { ...decision, action, nodeId })
+        return { ok: true, id: nodeId, action, reason: 'duplicate' }
+      }
     }
     nodeId = targetId
   } else if (action === 'ADD') {
-    nodeId = withTx(db, () => insertNodeRow(db, event, text, {
-      ts,
-      validAt: validAtOf(event, ts),
-      source: mapSource(event?.source),
-      origin: String(event?.origin ?? ''),
-      level: validLevel(event?.level),
-      memoryType: validMemoryType(event?.memory_type),
-      expiredAt: validExpiredAt(event?.expired_at),
-    }))
-  } else if (action === 'SUPERSEDE' || action === 'REVIEW') {
-    if (!targetId) throw new Error(`${action.toLowerCase()}_target_missing`)
-    nodeId = withTx(db, () => {
-      const newId = insertNodeRow(db, event, text, {
+    try {
+      nodeId = withTx(db, () => insertNodeRow(db, event, text, {
         ts,
         validAt: validAtOf(event, ts),
         source: mapSource(event?.source),
@@ -963,13 +993,45 @@ export function processEvent(db, event, config = {}) {
         level: validLevel(event?.level),
         memoryType: validMemoryType(event?.memory_type),
         expiredAt: validExpiredAt(event?.expired_at),
-      })
-      if (action === 'SUPERSEDE') {
+      }))
+    } catch (err) {
+      if (!isActiveHashConflict(err)) throw err
+      const dup = findDup()
+      if (!dup) throw err
+      touchDup(dup.id)
+      action = 'NOOP'
+      nodeId = String(dup.id)
+      recordWrite(db, event, { ...decision, action, nodeId })
+      return { ok: true, id: nodeId, action, reason: 'duplicate' }
+    }
+  } else if (action === 'SUPERSEDE' || action === 'REVIEW') {
+    if (!targetId) throw new Error(`${action.toLowerCase()}_target_missing`)
+    const requested = action
+    nodeId = withTx(db, () => {
+      let newId
+      try {
+        newId = insertNodeRow(db, event, text, {
+          ts,
+          validAt: validAtOf(event, ts),
+          source: mapSource(event?.source),
+          origin: String(event?.origin ?? ''),
+          level: validLevel(event?.level),
+          memoryType: validMemoryType(event?.memory_type),
+          expiredAt: validExpiredAt(event?.expired_at),
+        })
+      } catch (err) {
+        // 竞态：同文已活跃 → 不插重复行；SUPERSEDE 仍要把旧目标指向既有行，REVIEW 仍建互斥边。
+        if (!isActiveHashConflict(err)) throw err
+        const dup = findDup()
+        if (!dup) throw err
+        newId = String(dup.id)
+      }
+      if (requested === 'SUPERSEDE' && newId !== targetId) {
         // 旧值必须在 UPDATE 之前读：evolution 的 old_value 是"改之前"，不能拿新行反推。
         const before = db.prepare('SELECT status, text FROM nodes WHERE id=?').get(targetId) || {}
         // v3：规则退役必须同时取消置顶——superseded 的规则若 pinned 还留着，注入层会继续带它。
         db.prepare(`UPDATE nodes SET status='superseded', pinned=0, invalid_at=?, expired_at=?, superseded_by=?, updated_at=?
-          WHERE id=?`).run(ts, ts, newId, ts, targetId)
+          WHERE id=? AND status='active'`).run(ts, ts, newId, ts, targetId)
         linkSupersede(db, targetId, newId)
         // 所有改动留痕（§7.2）：状态迁移一条；正文被新事实替换时再补一条 text。
         recordEvolution(db, {
@@ -982,9 +1044,10 @@ export function processEvent(db, event, config = {}) {
             oldValue: before.text ?? '', newValue: text, traceId: event?.traceId,
           })
         }
-      } else {
+      } else if (requested === 'REVIEW' && newId !== targetId) {
         linkMutex(db, targetId, newId)
       }
+      if (requested === 'SUPERSEDE' && newId === targetId) selfDuplicate = true
       return newId
     })
   } else if (action === 'CANDIDATE') {
@@ -993,13 +1056,15 @@ export function processEvent(db, event, config = {}) {
   } else {
     throw new Error(`unknown_action:${action}`)
   }
-
-  recordWrite(db, event, { ...decision, nodeId })
+  if (selfDuplicate) action = 'NOOP'
+  const finalReason = selfDuplicate ? 'duplicate' : decision.reason
+  recordWrite(db, event, { ...decision, action, reason: finalReason, nodeId })
   return {
     ok: true,
+    ...(selfDuplicate ? { duplicate: true } : {}),
     id: nodeId ?? undefined,
     action,
-    reason: String(decision.reason ?? ''),
+    reason: String(finalReason ?? ''),
     ...(decision.judge ? { judge: decision.judge } : {}),
   }
 }
@@ -1037,20 +1102,38 @@ function acceptCandidate(db, row, text, payload, shadowOf, writeId) {
     expiredAt: validExpiredAt(payload?.expired_at),
   })
 
+  const identOf = () => ({
+    userId: String(row.user_id ?? ''), roleId: String(row.role_id ?? ''), workspace: String(row.workspace ?? ''),
+  })
+  const findActiveDuplicate = () => {
+    const id = identOf()
+    return db.prepare(`SELECT id FROM nodes WHERE text_hash=? AND user_id=? AND role_id=? AND workspace=?
+      AND status='active' LIMIT 1`).get(contentHash(text), id.userId, id.roleId, id.workspace) || null
+  }
+
   if (shadowOf === 'MERGE') {
-    const target = targetId ? db.prepare('SELECT id,source,level,memory_type,text FROM nodes WHERE id=?').get(targetId) : null
-    if (!target) return { ok: false, error: 'target_not_found' }
+    const ident = identOf()
+    // 身份三列 + status='active'：审核只能改“本分区仍然有效”的目标，跨分区/已失效一律拒绝。
+    const target = targetId ? db.prepare(`SELECT id,source,level,memory_type,text FROM nodes
+      WHERE id=? AND user_id=? AND role_id=? AND workspace=? AND status='active'`).get(
+      targetId, ident.userId, ident.roleId, ident.workspace) : null
+    if (!target) return { ok: false, error: 'target_not_active' }
     // 决策时目标不受保护、审核时已被标记保护：accept 必须拒绝，不能绕过保护面。
     if (isProtectedTarget(target, { protect: true })) return { ok: false, error: 'protected_target' }
     const incoming = mapSource(payload?.source)
     const source = sourceRank(incoming) > sourceRank(target.source) ? incoming : target.source
     const expiredAt = validExpiredAt(payload?.expired_at)
-    if (expiredAt !== null) {
-      db.prepare('UPDATE nodes SET text=?, text_hash=?, text_bigrams=?, source=?, expired_at=?, updated_at=? WHERE id=?')
-        .run(text, contentHash(text), bigrams(text), source, expiredAt, ts, targetId)
-    } else {
-      db.prepare('UPDATE nodes SET text=?, text_hash=?, text_bigrams=?, source=?, updated_at=? WHERE id=?')
-        .run(text, contentHash(text), bigrams(text), source, ts, targetId)
+    try {
+      if (expiredAt !== null) {
+        db.prepare(`UPDATE nodes SET text=?, text_hash=?, text_bigrams=?, source=?, expired_at=?, updated_at=?
+          WHERE id=? AND status='active'`).run(text, contentHash(text), bigrams(text), source, expiredAt, ts, targetId)
+      } else {
+        db.prepare(`UPDATE nodes SET text=?, text_hash=?, text_bigrams=?, source=?, updated_at=?
+          WHERE id=? AND status='active'`).run(text, contentHash(text), bigrams(text), source, ts, targetId)
+      }
+    } catch (err) {
+      if (isActiveHashConflict(err)) return { ok: false, error: 'duplicate_active' }
+      throw err
     }
     // 审核通过也是"一次改动"：正文被影子候选替换要留痕（§7.2），否则 accept 成了审计盲区。
     if (String(target.text ?? '') !== text) {
@@ -1064,36 +1147,63 @@ function acceptCandidate(db, row, text, payload, shadowOf, writeId) {
   }
 
   if (shadowOf === 'SUPERSEDE') {
-    const target = targetId ? db.prepare('SELECT id,status,text FROM nodes WHERE id=?').get(targetId) : null
-    if (!target) return { ok: false, error: 'target_not_found' }
-    const newId = insert()
-    // 影子候选 accept 后的取代同样要让旧规则退顶（与 auto 路径一致）。
-    db.prepare(`UPDATE nodes SET status='superseded', pinned=0, invalid_at=?, expired_at=?, superseded_by=?, updated_at=?
-      WHERE id=?`).run(ts, ts, newId, ts, targetId)
-    linkSupersede(db, targetId, newId)
-    // 影子候选 accept 后的取代与 auto 模式同构：状态迁移 + 正文替换都要留痕。
-    recordEvolution(db, {
-      ts, fromId: targetId, toId: newId, field: 'status',
-      oldValue: target.status ?? 'active', newValue: 'superseded', traceId: row.trace_id,
-    })
-    if (String(target.text ?? '') !== text) {
-      recordEvolution(db, {
-        ts, fromId: targetId, toId: newId, field: 'text',
-        oldValue: target.text ?? '', newValue: text, traceId: row.trace_id,
-      })
+    const ident = identOf()
+    const target = targetId ? db.prepare(`SELECT id,status,text FROM nodes
+      WHERE id=? AND user_id=? AND role_id=? AND workspace=? AND status='active'`).get(
+      targetId, ident.userId, ident.roleId, ident.workspace) : null
+    if (!target) return { ok: false, error: 'target_not_active' }
+    let newId
+    try {
+      newId = insert()
+    } catch (err) {
+      if (!isActiveHashConflict(err)) throw err
+      const dup = findActiveDuplicate()
+      if (!dup) throw err
+      newId = String(dup.id)
     }
-    db.prepare("UPDATE writes SET action='SUPERSEDE', node_id=? WHERE id=?").run(newId, writeId)
-    return { ok: true, id: newId }
+    // 影子候选 accept 后的取代同样要让旧规则退顶（与 auto 路径一致）；同文竞态不自我取代。
+    if (newId !== targetId) {
+      db.prepare(`UPDATE nodes SET status='superseded', pinned=0, invalid_at=?, expired_at=?, superseded_by=?, updated_at=?
+        WHERE id=? AND status='active'`).run(ts, ts, newId, ts, targetId)
+    }
+    if (newId !== targetId) {
+      linkSupersede(db, targetId, newId)
+      // 影子候选 accept 后的取代与 auto 模式同构：状态迁移 + 正文替换都要留痕。
+      recordEvolution(db, {
+        ts, fromId: targetId, toId: newId, field: 'status',
+        oldValue: target.status ?? 'active', newValue: 'superseded', traceId: row.trace_id,
+      })
+      if (String(target.text ?? '') !== text) {
+        recordEvolution(db, {
+          ts, fromId: targetId, toId: newId, field: 'text',
+          oldValue: target.text ?? '', newValue: text, traceId: row.trace_id,
+        })
+      }
+    }
+    const landedSupersede = newId === targetId ? 'NOOP' : 'SUPERSEDE'
+    db.prepare('UPDATE writes SET action=?, node_id=? WHERE id=?').run(landedSupersede, newId, writeId)
+    return { ok: true, id: newId, ...(newId === targetId ? { duplicate: true } : {}) }
   }
 
   // ADD / REVIEW（旧候选 payload 缺失也走这里：等价 ADD）
-  const newId = insert()
-  if (shadowOf === 'REVIEW' && targetId && db.prepare('SELECT 1 FROM nodes WHERE id=?').get(targetId)) {
+  let newId
+  let duplicate = false
+  try {
+    newId = insert()
+  } catch (err) {
+    if (!isActiveHashConflict(err)) throw err
+    const dup = findActiveDuplicate()
+    if (!dup) throw err
+    newId = String(dup.id)
+    duplicate = true
+  }
+  if (shadowOf === 'REVIEW' && targetId && newId !== targetId
+    && db.prepare('SELECT 1 FROM nodes WHERE id=?').get(targetId)) {
     linkMutex(db, targetId, newId)
   }
-  const landed = shadowOf === 'REVIEW' ? 'REVIEW' : 'ADD'
+  const landed = duplicate ? 'NOOP' : shadowOf === 'REVIEW' ? 'REVIEW' : 'ADD'
   db.prepare('UPDATE writes SET action=?, node_id=? WHERE id=?').run(landed, newId, writeId)
-  return { ok: true, id: newId }
+  return { ok: true, id: newId, ...(duplicate ? { duplicate: true } : {}) }
 }
 
 /**
@@ -1188,8 +1298,59 @@ export function createWriteQueue({ store, config, log = () => {}, getLlm = null,
 
   /** @type {Map<number, (result: any) => void>} */
   const waiters = new Map()
+  /** waiter 入队时刻：跨 drain/跨进程兜底超时用（秒）。 */
+  const waitSince = new Map()
   let draining = null
   let closed = false
+  let waitSweeper = null
+  /** 单条等待上限：超过即结算 TIMEOUT（面板写入不能无限悬挂）。 */
+  const WAIT_TIMEOUT_MS = 120_000
+
+  /** 把一条 job 的终态翻译成 enqueue 的返回形状。 */
+  function settleFromRow(jobId, row) {
+    const fail = { ok: false, action: 'FAILED', reason: String(row?.last_error || 'job_failed') }
+    if (!row) return { ok: false, action: 'LOST', reason: 'job_row_missing' }
+    if (row.state === 'failed') return fail
+    let parsed = {}
+    try { parsed = JSON.parse(String(row.payload || '{}')) || {} } catch { parsed = {} }
+    const inner = parsed.result && typeof parsed.result === 'object' ? parsed.result : {}
+    return { ...inner, ok: inner.ok === undefined ? row.state === 'done' : Boolean(inner.ok), action: String(inner.action || 'DONE') }
+  }
+
+  /**
+   * 终态扫地机：本进程没处理到的 job（另一 drain/另一进程抢先）也必须结算 waiter。
+   * 只在有 waiter 时开一个 interval，清空后自停；定时器 unref，不拖住宿主退出。
+   */
+  function ensureWaitSweep() {
+    if (waitSweeper || closed) return
+    waitSweeper = setInterval(() => {
+      if (waiters.size === 0) {
+        clearInterval(waitSweeper)
+        waitSweeper = null
+        return
+      }
+      for (const [jobId, resolve] of [...waiters]) {
+        try {
+          const row = onDb((db) => db.prepare('SELECT state,payload,last_error FROM jobs WHERE id=?').get(jobId))
+          if (row && (row.state === 'done' || row.state === 'failed')) {
+            waiters.delete(jobId)
+            waitSince.delete(jobId)
+            resolve(settleFromRow(jobId, row))
+            continue
+          }
+          const started = waitSince.get(jobId) || 0
+          if (started && Date.now() - started > WAIT_TIMEOUT_MS) {
+            waiters.delete(jobId)
+            waitSince.delete(jobId)
+            resolve({ ok: false, action: 'TIMEOUT', reason: 'queue_wait_timeout' })
+          }
+        } catch {
+          // 读库失败（锁/关闭）下一轮继续，不在这里把 waiter 判死。
+        }
+      }
+    }, 1000)
+    if (typeof waitSweeper.unref === 'function') waitSweeper.unref()
+  }
 
   /** judge=llm 开关（兼容 Ref 与扁平 config；读不到一律按 rules）。 */
   const judgeEnabled = (live) => {
@@ -1291,6 +1452,7 @@ export function createWriteQueue({ store, config, log = () => {}, getLlm = null,
         const resolver = waiters.get(jobId)
         if (resolver) {
           waiters.delete(jobId)
+          waitSince.delete(jobId)
           // 调用方要知道"这是重复消息"（面板/对话侧可据此静默）
           const out = result.action === 'NOOP' && result.reason === 'duplicate'
             ? { ...result, duplicate: true }
@@ -1325,7 +1487,11 @@ export function createWriteQueue({ store, config, log = () => {}, getLlm = null,
     } catch (err) {
       return Promise.resolve({ ok: false, action: 'REJECT', reason: `queue_insert_failed:${err?.message || err}` })
     }
-    const promise = new Promise((resolve) => waiters.set(jobId, resolve))
+    const promise = new Promise((resolve) => {
+      waiters.set(jobId, resolve)
+      waitSince.set(jobId, Date.now())
+    })
+    ensureWaitSweep()
     setImmediate(() => { drain().catch((err) => log(`[whale-memory] write queue drain failed: ${err?.message || err}`)) })
     return promise
   }
@@ -1340,18 +1506,23 @@ export function createWriteQueue({ store, config, log = () => {}, getLlm = null,
    * @param {number|string} id writes 行 id
    * @param {'accept'|'reject'} decision
    * @param {string} [reason] 驳回理由（≤200 由路由截断）
+   * @param {{ identity?: { userId?: string, roleId?: string, workspace?: string } }} [opts]
+   *   identity：审核人所在分区；给出时只允许审核同分区候选（跨分区 id 直给 404）。
    * @returns {{ ok: boolean, id?: string, error?: string }}
    */
-  function review(id, decision, reason) {
+  function review(id, decision, reason, opts = {}) {
     const action = String(decision ?? '')
     if (action !== 'accept' && action !== 'reject') return { ok: false, error: 'invalid_decision' }
     const writeId = Number(id)
     if (!Number.isInteger(writeId)) return { ok: false, error: 'candidate_not_found' }
+    const ident = normalizeIdentity(opts?.identity)
+    const scoped = Boolean(opts?.identity)
     try {
       return onDb((db) => {
         const row = db.prepare(
-          "SELECT id,trace_id,action,reason,after_text,mode,payload,user_id,role_id,workspace FROM writes WHERE id=? AND action='CANDIDATE'",
-        ).get(writeId)
+          `SELECT id,trace_id,action,reason,after_text,mode,payload,user_id,role_id,workspace FROM writes
+           WHERE id=? AND action='CANDIDATE'${scoped ? ' AND user_id=? AND role_id=? AND workspace=?' : ''}`,
+        ).get(writeId, ...(scoped ? [ident.userId, ident.roleId, ident.workspace] : []))
         if (!row) return { ok: false, error: 'candidate_not_found' }
 
         if (action === 'reject') {
@@ -1388,8 +1559,10 @@ export function createWriteQueue({ store, config, log = () => {}, getLlm = null,
   /** 释放内存态（不动库：未完成的 job 留给下次启动继续）。 */
   function dispose() {
     closed = true
+    if (waitSweeper) { clearInterval(waitSweeper); waitSweeper = null }
     for (const resolve of waiters.values()) resolve({ ok: false, action: 'REJECT', reason: 'queue_disposed' })
     waiters.clear()
+    waitSince.clear()
   }
 
   return { enqueue, drain, review, pending, dispose }

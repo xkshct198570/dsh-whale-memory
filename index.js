@@ -192,10 +192,13 @@ export async function runRulesSelfHeal({ config, backend, log = () => {}, store 
   } catch (err) {
     log(`[whale-memory] rules list fail-open: ${err?.message || err}`)
   }
-  if (!listed?.ok || !Array.isArray(listed.rules) || listed.rules.length === 0) return result
+  // list 失败 ≠ 空仓：失败时不能把“读不到”当“没有规则”去归档镜像（会误归档全部）。
+  if (!listed?.ok || !Array.isArray(listed.rules)) return result
   result.rules = listed.rules.length
 
-  // 3) 镜像自愈：只看 rules.mirrorAuto。
+  // 3) 镜像自愈：只看 rules.mirrorAuto。空列表也要跑——purge/删光规则后镜像必须归档孤儿，
+  //    否则 DB 里会留下“文件已不存在但还能被统计/召回”的幽灵规则。
+  //    注意：以上分流靠 list.ok；list 失败已在上一行 return。
   if (bool(config?.rules?.mirrorAuto, true)) {
     try {
       result.mirror = mirrorRules({ backend, rules: listed.rules, log })
@@ -210,7 +213,7 @@ export async function runRulesSelfHeal({ config, backend, log = () => {}, store 
   // 4) AGENTS 摘要自愈：只看 rules.renderAgents（无标记时 render 返回 no_markers，静默跳过）。
   // 干净安装：宿主还没有 AGENTS.md 时创建最小管理块（否则默认铁律在 AGENTS 里完全不可见）。
   // 开关 `rules.createAgentsIfMissing`（默认开）：只在启动自愈里生效，面板手动渲染不创建。
-  if (bool(config?.rules?.renderAgents, true)) {
+  if (bool(config?.rules?.renderAgents, true) && listed.rules.length > 0) {
     try {
       result.agents = renderAgentsDigest({
         rules: listed.rules,
@@ -291,6 +294,14 @@ export function apply(ctx, config) {
   keeper.register('write', async () => {
     if (typeof backendProxy.drainWrites !== 'function') return { skipped: 'writer_unavailable' }
     return await backendProxy.drainWrites()
+  })
+  // 大导入的崩溃续跑：jobs 里 cursor 已 durable，恢复器把 running 复位 queued 后由这里接着跑。
+  keeper.register('import', async (payload, api) => {
+    if (typeof backendProxy.resumeImportJob !== 'function') return { skipped: 'import_unavailable' }
+    const out = await backendProxy.resumeImportJob(api?.jobId)
+    // ok:false 必须抛出，让 keeper 走退避重试（cursor 已回退到失败批首），不能当成功标 done。
+    if (out && out.ok === false) throw new Error(String(out.error || 'import_failed'))
+    return out
   })
 
   const reflect = installReflectScheduler(ctx, {

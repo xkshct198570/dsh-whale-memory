@@ -22,12 +22,43 @@ import { join } from 'node:path'
 
 /** 默认等待上限：250ms。超过即返回 repo_locked，让面板重试。 */
 export const REPO_LOCK_WAIT_MS = 250
+/**
+ * 锁龄阈值（默认 120s）：只用于 health 黄灯判定“疑似僵尸锁”，不自动抢锁。
+ * 真源在本模块；rule-store 只做旧导出名转出（调用方无需改 import）。
+ */
+export const REPO_LOCK_STALE_MS = 120_000
 /** owner 不可读时，目录 mtime 超过该值才允许接管（只兜“刚 mkdir 就崩”的窗口）。 */
 export const UNREADABLE_LOCK_STALE_MS = 10_000
 /** reaping 互斥的 stale：reaping 只持毫秒级；超过 5s 视为崩溃遗留。 */
 export const REAPING_STALE_MS = 5_000
 /** 等待退避步长（同步）。 */
 const POLL_MS = 15
+
+/**
+ * 锁状态只读视图（health 用）：held=目录存在；stale=owner 活着但锁龄超过阈值。
+ *
+ * 为什么只报告不自动抢：临界区是毫秒级同步写，活 pid + 超龄锁的两种成因（pid 复用、
+ * 进程卡死）无法从锁文件区分；贸然接管会双写规则仓。这里把它变成可观测红灯/黄灯，
+ * 由面板或人工处置（审计 P1：过去 staleMs 是死参数、僵尸锁永不解且全绿）。
+ *
+ * @param {string} root
+ * @param {{fs?: typeof nodeFs, now?: () => number, staleMs?: number}} [opts]
+ * @returns {{held: boolean, stale: boolean, ageMs: number, owner: object|null}}
+ */
+export function lockState(root, opts = {}) {
+  const fs = opts.fs || nodeFs
+  const now = typeof opts.now === 'function' ? opts.now : () => Date.now()
+  const staleMs = Number.isFinite(opts.staleMs) ? Number(opts.staleMs) : REPO_LOCK_STALE_MS
+  const base = baseDir(root)
+  const lock = join(base, '.locks', 'repo.lock')
+  const ownerFile = join(lock, 'owner.json')
+  const owner = readOwner(ownerFile, fs)
+  const held = (() => { try { return fs.existsSync(lock) } catch { return false } })()
+  const heldAt = Number.isFinite(Number(owner?.ts)) ? Number(owner.ts) : dirMtimeMs(lock, fs)
+  const ageMs = held ? Math.max(0, now() - heldAt) : 0
+  const alive = owner?.pid !== undefined ? isProcessAlive(Number(owner.pid)) : null
+  return { held, stale: held && (alive === true || alive === null) && ageMs > staleMs, ageMs, owner }
+}
 
 /** @param {string} root @returns {string} */
 function baseDir(root) {
@@ -179,6 +210,8 @@ export function acquireRepoLock(root, opts = {}) {
   const lock = join(lockRoot, 'repo.lock')
   const ownerFile = join(lock, 'owner.json')
   const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : REPO_LOCK_WAIT_MS
+  // staleMs 只影响"owner 不可读"的接管阈值（可读且 pid 活着的锁绝不抢）；默认沿用 10s。
+  const unreadableStaleMs = Number.isFinite(opts.staleMs) ? Number(opts.staleMs) : UNREADABLE_LOCK_STALE_MS
   const now = typeof opts.now === 'function' ? opts.now : () => Date.now()
   const isPidAlive = typeof opts.isPidAlive === 'function' ? opts.isPidAlive : isProcessAlive
   const log = typeof opts.log === 'function' ? opts.log : () => {}
@@ -224,7 +257,7 @@ export function acquireRepoLock(root, opts = {}) {
         sleepSync(POLL_MS)
         continue
       }
-      const staleUnreadable = alive === null && now() - dirMtimeMs(lock, fs) > UNREADABLE_LOCK_STALE_MS
+      const staleUnreadable = alive === null && now() - dirMtimeMs(lock, fs) > unreadableStaleMs
       if (alive === false || staleUnreadable) {
         const result = reapStaleLock({ lock, lockRoot, fs, now, isPidAlive, observed, log })
         if (result === 'taken') continue

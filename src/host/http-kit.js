@@ -60,6 +60,34 @@ export function isLocalHostName(host) {
   return LOCAL_HOSTNAMES.has(hostnameOf(raw))
 }
 
+/** 绑定地址字面量归一（IPv6 去括号/小写），用于 allowRemote 的 Host 白名单等值比较。 */
+function normalizeBindHost(value) {
+  const raw = String(value ?? '').trim().toLowerCase()
+  if (!raw) return ''
+  if (raw.startsWith('[') && raw.endsWith(']')) return raw.slice(1, -1)
+  return raw
+}
+
+/**
+ * Host 白名单判定：本机名恒放行；allowRemote 时额外放行 webServer 实际绑定地址
+ * （`ctx.webServer.host` 只可能是某个具体本地接口字面量）。
+ *
+ * 为什么不是"allowRemote 就放行任意 Host"：那等于把 DNS rebinding 面重新打开；
+ * 绑定地址是已知事实，等值比较既支持同网段访问，也不接受伪造域名。
+ *
+ * @param {unknown} host Host 头原值
+ * @param {string[]} [boundHosts] 额外允许的绑定地址字面量（allowRemote 时传入）
+ * @returns {boolean}
+ */
+export function isAllowedHostName(host, boundHosts = []) {
+  const raw = String(host ?? '').trim()
+  if (!raw) return true
+  const name = hostnameOf(raw)
+  if (!name) return false
+  if (LOCAL_HOSTNAMES.has(name)) return true
+  return boundHosts.map(normalizeBindHost).filter(Boolean).includes(name)
+}
+
 /**
  * 本机 GUI Origin：只认 `http(s)://127.0.0.1|localhost|::1[:port]`，带 userinfo/别的 scheme 一律拒绝。
  * 空 Origin（本机 curl / 非浏览器客户端）放行；字面量 `null`（file://）拒绝。

@@ -21,6 +21,9 @@ import { normalize } from './tokenize.js'
 import { now } from './db.js'
 import { HOP_FACTOR, clamp01, expandOneHop } from './relations.js'
 
+/** FTS 失败观测：检索层 fail-open，但不能"零命中还全绿"——计数进 /stats health。 */
+export const ftsStats = { errors: 0, last_error: '', last_at: 0 }
+
 const FTS_LIMIT = 50
 const MAX_CANDIDATES = 150
 const MIN_REL_DEFAULT = 0.34
@@ -103,8 +106,12 @@ function collectFts(db, table, match, filter, candidates, path = 'L1') {
   let rows
   try {
     rows = db.prepare(sql).all(match, ...filter.params)
-  } catch {
-    return // FTS 语法/库结构异常一律 fail-open（检索不能拖垮对话）
+  } catch (err) {
+    // FTS 语法/库结构异常一律 fail-open（检索不能拖垮对话），但必须留观测证据。
+    ftsStats.errors += 1
+    ftsStats.last_error = String(err?.message || err).slice(0, 200)
+    ftsStats.last_at = Date.now() / 1000
+    return
   }
   for (const row of rows) {
     if (candidates.size >= MAX_CANDIDATES) return

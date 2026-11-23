@@ -38,7 +38,7 @@ test('hook：pre-step 写缓存，context 本轮可读到；dispose 后清空', 
     messages: [{ source: { kind: 'user' }, content: [{ type: 'text', text: '问' }] }],
   }, async () => decision)
   assert.equal(ret, decision)
-  assert.equal(state.context.order, 100)
+  assert.equal(state.context.order, 130)
   assert.match(state.context.text({ scope: { session: { id: 's1' } } }), /旧事/)
   hook.dispose()
   assert.equal(state.context.text({ scope: { session: { id: 's1' } } }), '')

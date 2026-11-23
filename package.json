@@ -1,6 +1,6 @@
 {
   "name": "dsh-whale-memory",
-  "version": "0.6.0",
+  "version": "0.6.2",
   "description": "本地长期记忆中枢：记忆节点、召回注入、写入审计；默认本地 SQLite，可选外部记忆服务。",
   "type": "module",
   "license": "MIT",
@@ -76,5 +76,6 @@
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.1.0",
     "@deepseek-ai/cordis-plugin-timer": "^1.2.0"
-  }
+  },
+  "author": "大肥鱼"
 }

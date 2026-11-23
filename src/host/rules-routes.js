@@ -48,7 +48,8 @@ import { chainIssues, resolveChain } from '../core/rule-reconcile.js'
 import {
   applyProposal, createProposal, listProposals, readProposal, rejectProposal, setSessionPending,
 } from '../core/rule-proposal.js'
-import { agentsBlockStale, agentsPathOf, renderAgentsDigest, rulesDigestContent, titleOfRule } from '../core/rule-render.js'
+import { agentsBlockStale, agentsPathOf, fileHasMarkers, renderAgentsDigest, rulesDigestContent, titleOfRule } from '../core/rule-render.js'
+import { lockState } from '../core/rule-lock.js'
 import { lastInjection } from './inject-stats.js'
 
 /** 与 routes.js 同一个前缀；写死字面量避免 routes ↔ rules-routes 循环 import。 */
@@ -423,14 +424,36 @@ export function rulesHealthPayload({ root = '', config = {}, detect = detectGit 
     }
   } catch { /* 注入统计缺失=没有事实 */ }
   try {
-    if (agentsBlockStale({ agentsPath: agentsPathOf(dir), rulesDir: dir })) {
+    const agentsPath = agentsPathOf(dir)
+    if (agentsBlockStale({ agentsPath, rulesDir: dir })) {
       warnings.push({
         code: 'agents_block_stale',
-        file: agentsPathOf(dir),
+        file: agentsPath,
         detail: 'AGENTS 管理块旧于规则文件（renderAgents=false 或渲染失败）：hook 已降级注入 global',
       })
     }
+    // 已有 AGENTS.md 但没有任何管理标记：摘要永远不会写入，规则对新会话"隐身"。
+    // 不自动插块（会改宿主资产），但必须黄灯+启动日志，让人知道开关没生效。
+    if (existsSync(agentsPath) && !fileHasMarkers(agentsPath)) {
+      warnings.push({
+        code: 'agents_markers_missing',
+        file: agentsPath,
+        detail: 'AGENTS.md 已存在但没有管理块标记：规则摘要不会写入（可手动加 <!-- whale-memory:rules:begin --> 标记，或删掉文件让插件重建）',
+      })
+    }
   } catch { /* mtime 读不到不算黄灯事实 */ }
+  try {
+    // 阈值用 rule-lock 的单一真源常量；不再读 schema 里不存在的 rules.lockStaleMs（死旋钮）。
+    const lock = lockState(dir)
+    if (lock.held && lock.stale) {
+      warnings.push({
+        code: 'zombie_lock',
+        owner: lock.owner,
+        ageMs: lock.ageMs,
+        detail: `仓库锁已持有 ${Math.round(lock.ageMs / 1000)}s（owner pid=${lock.owner?.pid ?? '?'}）：疑似 pid 复用/进程卡死，写操作会持续 repo_locked`,
+      })
+    }
+  } catch { /* 锁状态读不到不算健康事实 */ }
 
   return {
     ok: failures.length === 0,

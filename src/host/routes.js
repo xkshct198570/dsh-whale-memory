@@ -7,10 +7,10 @@
  * 本层不 import core：存储能力全部经注入的 backend 接口调用。
  */
 import { Buffer } from 'node:buffer'
-import { clamp, isLocalHostName, isLoopback, readJson, sendJson, isWriteMethod, writeRequestProblem } from './http-kit.js'
+import { clamp, isAllowedHostName, isLoopback, readJson, sendJson, isWriteMethod, writeRequestProblem } from './http-kit.js'
 import { statusOf } from '../shared/error-table.mjs'
 import { resolveIdentity } from './identity.js'
-import { bool, value } from './config-values.js'
+import { bool, mergePreservingVolatile, value } from './config-values.js'
 import { Config } from './config.js'
 import { HttpSyncTransport, pullFromGateway, pushToGateway } from '../core/sync.js'
 import { WHALE_PROTOCOL } from '../core/backend.js'
@@ -112,8 +112,8 @@ function syncRuntimeConfig(config, saved) {
   if (!config || typeof config !== 'object' || !saved || typeof saved !== 'object') return
   for (const key of CONFIG_GROUPS) {
     if (!(key in saved)) continue
-    const current = resolveTree(config[key] ?? {})
-    config[key] = deepMergeLeaf(current && typeof current === 'object' && !Array.isArray(current) ? current : {}, saved[key])
+    // 保留 Ref 引用身份：整组替换会让宿主后续 volatile 更新静默失效（审计 P1-15）。
+    config[key] = mergePreservingVolatile(config[key] ?? {}, saved[key])
   }
   if (typeof saved.dataDir === 'string') config.dataDir = saved.dataDir
 }
@@ -181,12 +181,25 @@ export function createRoutes({
     }
   }
 
+  /**
+   * allowRemote 时的额外 Host 白名单：只认 webServer 实际绑定地址（具体接口字面量）。
+   * 读不到绑定地址就退化为只认回环——宁可比配置更严，也不放开 rebinding 面。
+   */
+  const boundHosts = () => {
+    if (!bool(config?.panel?.allowRemote, false)) return []
+    try {
+      const host = ctx?.webServer?.host
+      return typeof host === 'string' && host.trim() ? [host.trim()] : []
+    } catch { return [] }
+  }
+
   /** 主分发（内部）：抛错由下面的 handle 统一兜底成 502 JSON。 */
   const dispatch = async (req, res) => {
     // Host 闸覆盖所有方法（含 GET）：DNS rebinding 页面可带畸形/外部 Host 同源 GET
     // 走规则全文、整库导出与详情正文，必须在任何路由/身份解析之前拒绝。
-    // 空 Host 仍放行（curl 与本机客户端历史行为），见 isLocalHostName 的严格形态判定。
-    if (!isLocalHostName(req.headers?.host)) {
+    // allowRemote 时额外放行 webServer 绑定地址（审计 P1-13：旧实现 Host 闸先于
+    // allowRemote 且白名单仅回环，导致开关是死的）。
+    if (!isAllowedHostName(req.headers?.host, boundHosts())) {
       return sendJson(res, 403, { ok: false, error: 'cross_origin_denied' })
     }
 
@@ -270,12 +283,16 @@ export function createRoutes({
       return got.ok ? { ok: true, identity: got.identity } : { ok: false, error: got.error }
     }
 
-    /** GET 查询串里的身份覆盖参数（不带的键为 undefined ⇒ 不覆盖）。 */
-    const identityParams = (params) => ({
+    /**
+     * GET 查询串里的身份覆盖参数（不带的键为 undefined ⇒ 不覆盖）。
+     * 非回环请求一律不允许覆盖身份：allowRemote 只暴露“当前身份视图”，
+     * 否则同网段任何客户端都能按 userId/workspace 翻别人的分区。
+     */
+    const identityParams = (params) => (isLoopback(addr) ? {
       userId: params.get('userId') ?? undefined,
       roleId: params.get('roleId') ?? undefined,
       workspace: params.get('workspace') ?? undefined,
-    })
+    } : { userId: undefined, roleId: undefined, workspace: undefined })
 
     /** 后端状态视图（/stats 与 /version 同源）：local 恒 match，http/hybrid 读 protocolStatus。 */
     const backendView = () => {
@@ -548,11 +565,11 @@ export function createRoutes({
       if (!dryRun && body.value?.confirm !== true) return sendJson(res, statusOf('confirm_required'), { ok: false, error: 'confirm_required' })
       const transport = new HttpSyncTransport({ baseUrl: value(config?.sync?.bridgeUrl, ''), log })
       if (!transport.baseUrl) return sendJson(res, 501, { ok: false, error: 'sync_bridge_unset' })
-      const ident = resolveIdentity(getIdentityCfg())
-      if (!ident.ok) return sendJson(res, 400, { ok: false, error: ident.error })
+      // 身份必须与 dispatch 顶部同一口径（含宿主 userId）：旧实现没传宿主身份，
+      // auto 模式 + Config userId 为空时会落到 'local'，同步错分区。
       const out = {}
-      if (direction === 'pull' || direction === 'both') out.pull = await pullFromGateway({ backend, transport, identity: ident.identity, dryRun, traceId })
-      if (direction === 'push' || direction === 'both') out.push = await pushToGateway({ backend, transport, identity: ident.identity, dryRun, traceId })
+      if (direction === 'pull' || direction === 'both') out.pull = await pullFromGateway({ backend, transport, identity, dryRun, traceId })
+      if (direction === 'push' || direction === 'both') out.push = await pushToGateway({ backend, transport, identity, dryRun, traceId })
       return sendJson(res, 200, { ok: true, dryRun, trace_id: traceId, ...out })
     }
 
@@ -600,9 +617,10 @@ export function createRoutes({
         const got = await backend.updateNode(
           id,
           body.value?.patch || body.value || {},
-          { identity: idn.identity, traceId },
+          { identity: idn.identity, traceId, expectedUpdatedAt: body.value?.expectedUpdatedAt },
         )
-        return sendJson(res, got?.ok === false ? 400 : 200, got)
+        // 错误码 → 状态由单一真源表决定（node_changed=409，不再一律 400）。
+        return sendJson(res, got?.ok === false ? statusOf(got.error, 400) : 200, got)
       }
       return sendMethodNotAllowed(res, 'GET, PATCH')
     }
@@ -668,8 +686,8 @@ export function createRoutes({
         return sendJson(res, 400, { ok: false, error: 'invalid_review' })
       }
       if (typeof backend.reviewWrite !== 'function') return sendJson(res, 502, { ok: false, error: 'backend_unavailable' })
-      const got = await backend.reviewWrite(id, decision, String(body.value?.reason || '').slice(0, 200))
-      if (!got?.ok) return sendJson(res, got?.error === 'candidate_not_found' ? 404 : 400, got)
+      const got = await backend.reviewWrite(id, decision, String(body.value?.reason || '').slice(0, 200), { identity })
+      if (!got?.ok) return sendJson(res, statusOf(got.error, 400), got)
       return sendJson(res, 200, got)
     }
 

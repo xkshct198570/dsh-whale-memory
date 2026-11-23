@@ -184,7 +184,7 @@
   "settings.loadFailed": "設定の読み込みに失敗しました",
   "settings.defaultsNote": "設定の返却に含まれないグループは既定値で表示されます。保存すると上のすべてのグループを送信します。",
   "settings.restartNote": "バックエンドとワーカーの変更は、通常プラグインを再読み込みすると反映されます。",
-  "settings.allowRemoteWarn": "有効にすると、LAN 上の他の端末からこのパネルの API に到達できます。",
+  "settings.allowRemoteWarn": "有効にすると webServer.host のバインドアドレスのみ追加許可されます（読み取り）。非ループバックでは身份上書き引数は無視されます。",
   "settings.readonlyUnavailable": "この実行環境では設定を保存できません（読み取り専用）。",
   "settings.invalidValue": "範囲外または数値でない値があります。修正してから保存してください。",
   "import.reading": "ファイルを読み込み中…",
@@ -329,7 +329,7 @@
   "settings.panelTab": "既定のタブ",
   "settings.panelTabDesc": "パネルを開いたときに選択されるタブです。",
   "settings.pollMsDesc": "概要タブの自動更新間隔です。",
-  "settings.allowRemoteDesc": "既定ではループバックからのアクセスのみ許可します。",
+  "settings.allowRemoteDesc": "既定ではループバックのみ。有効化するとバインドアドレスのみ追加許可。",
   "settings.traceId": "traceId（トレース識別子）",
   "settings.traceIdDesc": "書き込み監査とログに付けるトレース識別子です。",
   "settings.logLevelDesc": "プラグインのログレベルです。",
@@ -825,5 +825,10 @@
   "err.server_error": "サーバー側の処理に失敗しました。後で再試行するかログを確認してください",
   "rules.proposalNumberAdjusted": "番号を繰り下げました：#{from} → #{to}",
   "rules.proposalSemantic": "意味の草案",
-  "rules.proposalRefining": "整理しています"
+  "rules.proposalRefining": "整理しています",
+  "err": {
+    "duplicate_active": "同じ内容の有効な記憶が既にあります。",
+    "node_changed": "この記憶は別の操作で変更されました。再読み込みして再試行してください。",
+    "target_not_active": "対象の記憶は既に無効です。"
+  }
 }

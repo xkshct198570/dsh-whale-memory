@@ -23,10 +23,10 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import * as nodeFs from 'node:fs'
 import { createHash, randomBytes } from 'node:crypto'
-import { acquireRepoLock, withRepoLock } from './rule-lock.js'
+import { REPO_LOCK_STALE_MS, acquireRepoLock, withRepoLock } from './rule-lock.js'
 
 /** 锁协议实现已抽到 rule-lock.js；这里保持旧导出名，调用方无需改动。 */
-export { acquireRepoLock, withRepoLock }
+export { REPO_LOCK_STALE_MS, acquireRepoLock, withRepoLock }
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { detectSignals, normalizeRuleText, ruleKeyOf } from './rules.js'
@@ -92,8 +92,6 @@ export const TXN_DIR = '.txn'
 export const LOCK_DIR = '.locks'
 /** 仓库级锁名：manifest/commit/编号都是全仓资源，一把锁避免假并发。 */
 export const REPO_LOCK = 'repo.lock'
-/** 锁失效阈值（不续租）：覆盖最长 git 操作；接口冻结为 120s。 */
-export const REPO_LOCK_STALE_MS = 120000
 /** 规则仓 `.gitignore` 必须包含的条目（候选/快照/事务/锁/播种 marker 都是本机生成物）。 */
 export const GITIGNORE_LINES = Object.freeze([
   '*.tmp-*', '.locks/', '.txn/', '.seeded.json', 'proposals/', 'history/',
@@ -802,6 +800,7 @@ export function listRules(root) {
     files.push(...names.sort().map((name) => ({ dir, name })))
   }
   const numbers = new Map()
+  const seenKeys = new Map()
   for (const { dir, name } of files) {
     const file = join(dir, name)
     if (name.toUpperCase() === 'README.MD') continue
@@ -816,6 +815,14 @@ export function listRules(root) {
       errors.push({ file, error: 'key_mismatch', detail: { key: fileKey, frontKey: normalized.front.key } })
       continue
     }
+    // key 唯一（跨根目录与 proposals/）：同名两份会让列表/摘要重复、purge 只删一份。
+    // 根目录先列（files 顺序）→ 根优先；第二份记 duplicate_key 红项，不参与列表。
+    const priorFile = seenKeys.get(normalized.front.key)
+    if (priorFile) {
+      errors.push({ file, error: 'duplicate_key', detail: { key: normalized.front.key, first: priorFile } })
+      continue
+    }
+    seenKeys.set(normalized.front.key, file)
     const check = validateRule(normalized.front, normalized.text, { numbers })
     if (!check.ok) { errors.push({ file, error: 'invalid_rule', detail: check.errors }); continue }
     // 只有 iron-rule 的正整数编号占号；普通规则/候选 number=null，永不参与撞号。
@@ -1370,6 +1377,14 @@ export function purgeRule({ root = '', key, identity = {}, traceId = '', now = D
     const old = readRuleSource(doc.file, { fs })
     if (!old.ok) return { ok: false, error: old.error }
     const oldText = old.text
+    // 同名旧候选（proposals/<key>.md）必须与正式规则一起删：只删一份会让 purge 后
+    // 列表仍命中同名文件（duplicate_key 红项/幽灵规则）。
+    const extras = []
+    const legacyPath = join(base, 'proposals', `${key}.md`)
+    if (legacyPath !== doc.file && existsSync(legacyPath)) {
+      const legacy = readRuleSource(legacyPath, { fs })
+      if (legacy.ok) extras.push({ path: legacyPath, text: legacy.text })
+    }
     const snap = writeHistorySnapshot(base, key, oldText, { fs })
     if (!snap.ok) return { ok: false, error: 'snapshot_failed', detail: snap.error }
 
@@ -1390,7 +1405,10 @@ export function purgeRule({ root = '', key, identity = {}, traceId = '', now = D
       op: 'purge',
       proposalId: `rule: purge ${key} (#${number})`,
       createdAt: at,
-      files: [{ key: String(doc.front.key), path: doc.file, oldText }],
+      files: [
+        { key: String(doc.front.key), path: doc.file, oldText },
+        ...extras.map((item) => ({ key: String(doc.front.key), path: item.path, oldText: item.text })),
+      ],
       ...(tomb ? { tombstone: tomb.path } : {}),
     }, { fs })
     const clearTxnIfAny = () => {
@@ -1403,8 +1421,11 @@ export function purgeRule({ root = '', key, identity = {}, traceId = '', now = D
     }
 
     const restoreFile = () => {
-      const restored = durableWriteFile(doc.file, oldText, { fs })
-      return restored.ok ? null : `restore:${restored.error}`
+      for (const target of [{ path: doc.file, text: oldText }, ...extras]) {
+        const restored = durableWriteFile(target.path, target.text, { fs })
+        if (!restored.ok) return `restore:${restored.error}`
+      }
+      return null
     }
     const dropTombstone = () => {
       if (!tomb) return null
@@ -1413,15 +1434,24 @@ export function purgeRule({ root = '', key, identity = {}, traceId = '', now = D
       }
     }
 
-    const removed = removeRuleFile(base, doc.file, { ...opts, fs })
+    const removedFiles = []
+    let removed = { ok: true }
+    for (const target of [doc.file, ...extras.map((item) => item.path)]) {
+      const one = removeRuleFile(base, target, { ...opts, fs })
+      if (!one.ok) { removed = one; break }
+      removedFiles.push(target)
+    }
     if (!removed.ok) {
-      const failures = [dropTombstone()].filter(Boolean)
+      // 删到一半失败：把已删文件还原，避免“正文没了、墓碑/txn 还在”的半态固化。
+      const restored = restoreFile()
+      const failures = [restored, dropTombstone()].filter(Boolean)
       clearTxnIfAny()
       return { ...removed, rolledBack: failures.length === 0, rollbackFailures: failures }
     }
 
     // 显式路径：被删文件（git rm 已暂存，git add 也能记录删除）+ manifest + 墓碑。
-    const paths = [relative(base, doc.file), MANIFEST_FILE, ...(tomb ? [relative(base, tomb.path)] : [])]
+    const paths = [...removedFiles.map((file) => relative(base, file)), MANIFEST_FILE,
+      ...(tomb ? [relative(base, tomb.path)] : [])]
     const manifest = regenerateManifest(base, { fs })
     if (!manifest.ok) {
       const failures = [restoreFile(), dropTombstone()].filter(Boolean)

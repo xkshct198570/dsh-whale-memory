@@ -37,7 +37,9 @@ import {
 } from '../core/rule-proposal.js'
 
 export const CONTEXT_NAME = 'whale-memory:recall'
-export const CONTEXT_ORDER = 100
+// 宿主把 context order=100 保留给 WORKING_DIRECTORY（dsh-system-prompt CONTEXT_ORDERS），
+// 插件必须避开保留位；130 落在 cwd/sandbox/approval 之后、subagent 政策（120）之后。
+export const CONTEXT_ORDER = 130
 const CACHE_TTL_MS = 120_000
 const MAX_QUERY_CHARS = 2000
 /** 单步回复累积上限：只用于采纳判定，超出部分不影响回复本身。 */
@@ -228,7 +230,7 @@ export function buildRulesPrefix({
     const length = chars(line)
     const extra = lines.length ? 1 : 0
     if (limit > 0 && used + length + extra > limit) {
-      // 放不下的规则整条跳过（不截半条规则：半句规则比没有规则更危险）。
+      // 放不下的规则整条跳过（半句规则比没有规则更危险）；唯一例外见下方“单条就超预算”。
       skipped.push({ key, chars: length })
       continue
     }
