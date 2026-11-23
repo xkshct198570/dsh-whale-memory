@@ -165,6 +165,19 @@ function compactInvalid(invalid) {
 }
 
 /**
+ * 让出事件循环一次（R9-21b）：首启 16 条默认规则不得在同一个 tick 里同步写完。
+ *
+ * 为什么用 setImmediate：它排在 I/O 之后的 check 阶段，先把「启动路径」让出去；
+ * `setTimeout(0)` 要多等一个 timers 阶段，且启动自愈本身就跑在 setTimeout 里（别自己饿死自己）。
+ * 锁跨 tick 由「活 pid 不接管」保证（架构书 §2.7）。
+ *
+ * @returns {Promise<void>}
+ */
+function yieldToEventLoop() {
+  return new Promise((resolve) => setImmediate(resolve))
+}
+
+/**
  * 首次播种默认规则（幂等 + 版本化 + 坏文件重试）。
  *
  * 判据顺序：
@@ -176,15 +189,18 @@ function compactInvalid(invalid) {
  * 4. `SEED_VERSION` 参与：marker.version 落后时升级写回，即使本次没有新文件；
  * 5. 播种在调用方持有的仓库锁内完成（本函数自己拿锁；锁内写规则传 lockHeld:true），
  *    一次 git commit（显式路径）；`git:false` 只写文件。
+ * 6. async：逐文件 `setImmediate` 让出事件循环（R9-21b），首启 16 条不在同一 tick 跑完；
+ *    锁跨 tick 由「活 pid 不接管」保证安全（架构书 §2.7）。
  *
  * @param {{root?:string, defaultsDir?:string, marker?:string, log?:Function}} [args]
- * @param {{fs?:typeof nodeFs, git?:boolean, exec?:Function, timeoutMs?:number, staleMs?:number}} [opts]
- * @returns {{ok:boolean, root:string, defaultsDir:string, marker:string,
+ * @param {{fs?:typeof nodeFs, git?:boolean, exec?:Function, timeoutMs?:number, staleMs?:number,
+ *   gitRequired?:boolean}} [opts]
+ * @returns {Promise<{ok:boolean, root:string, defaultsDir:string, marker:string,
  *   seeded?:number, count:number, skipped?:string, skippedInvalid?:number,
  *   invalid?:Array<{file:string,key?:string,errors:Array<object>}>, commit?:object|null,
- *   manifest?:object|null, keys?:string[], error?:string, detail?:any}}
+ *   manifest?:object|null, keys?:string[], error?:string, detail?:any}>}
  */
-export function seedDefaultRules({
+export async function seedDefaultRules({
   root = '', defaultsDir = defaultRulesDir(), marker = SEED_MARKER, log = () => {},
 } = {}, opts = {}) {
   const fs = opts.fs || nodeFs
@@ -208,14 +224,14 @@ export function seedDefaultRules({
     }
   }
   try {
-    return seedLocked({ base, defaults, marker, markerFile, fs, git, log, opts })
+    return await seedLocked({ base, defaults, marker, markerFile, fs, git, log, opts })
   } finally {
     lock.release()
   }
 }
 
-/** `seedDefaultRules` 的锁内实现。 */
-function seedLocked({ base, defaults, marker, markerFile, fs, git, log, opts }) {
+/** `seedDefaultRules` 的锁内实现（async：逐文件让出事件循环，锁跨 tick 持有）。 */
+async function seedLocked({ base, defaults, marker, markerFile, fs, git, log, opts }) {
   const baseResult = { root: base, defaultsDir: defaults, marker: markerFile, count: 0 }
   const existingMarker = readMarker(markerFile, fs)
 
@@ -258,7 +274,7 @@ function seedLocked({ base, defaults, marker, markerFile, fs, git, log, opts }) 
   // 规则仓就绪：只建仓不首提交（首启要一个包含全部默认规则的提交点）。
   prepareRepo(base, fs, git, opts, log)
 
-  const seeded = seedEntries({ base, defaults, files, fs, log })
+  const seeded = await seedEntries({ base, defaults, files, fs, log })
   if (seeded.count === 0 && seeded.tombstoned > 0 && seeded.invalid.length === 0) {
     // 默认铁律已全部被用户彻底删除：写 marker（keys=默认 key 清单=已采纳），以后不再重播/重试。
     ensureRuleGitignore(base, { fs })
@@ -297,7 +313,7 @@ function seedLocked({ base, defaults, marker, markerFile, fs, git, log, opts }) 
 /**
  * 有 marker 的分支：只补「invalid 重试 + 升级新增默认 key」；不覆盖盘上正文、不复活墓碑 key。
  */
-function retrySeed({ base, defaults, marker, markerFile, fs, git, log, opts, existingMarker }) {
+async function retrySeed({ base, defaults, marker, markerFile, fs, git, log, opts, existingMarker }) {
   const baseResult = { root: base, defaultsDir: defaults, marker: markerFile, count: 0 }
   if (!defaults || !existsSync(defaults)) {
     return { ...baseResult, ok: true, skipped: 'already_seeded', seeded: 0, keys: markerKeysOf(existingMarker) }
@@ -338,7 +354,7 @@ function retrySeed({ base, defaults, marker, markerFile, fs, git, log, opts, exi
     return { ...baseResult, ok: true, skipped: 'already_seeded', seeded: 0, keys: markerKeysOf(existingMarker) }
   }
   prepareRepo(base, fs, git, opts, log)
-  const seeded = seedEntries({ base, defaults, files, fs, log })
+  const seeded = await seedEntries({ base, defaults, files, fs, log })
   // 本次仍失败的 invalid 保留（下轮重试）；成功的从旧 invalid 里剔除。
   const retriedOk = new Set(seeded.keys)
   const carried = compactInvalid(existingMarker.invalid).filter((item) => item.key && !retriedOk.has(item.key))
@@ -374,7 +390,7 @@ function prepareRepo(base, fs, git, opts, log) {
  * 不得把已作废的 key/编号复活。命中墓碑的文件跳过并计入 `tombstoned`。
  * @returns {{count:number, keys:string[], invalid:Array<object>, paths:string[], tombstoned:number}}
  */
-function seedEntries({ base, defaults, files, fs, log }) {
+async function seedEntries({ base, defaults, files, fs, log }) {
   const numbers = new Map()
   const invalid = []
   const keys = []
@@ -382,6 +398,8 @@ function seedEntries({ base, defaults, files, fs, log }) {
   const tombstonedKeys = new Set(readTombstones(base, { fs }).map((item) => String(item.key)))
   let tombstoned = 0
   for (const name of files) {
+    // 一次 setImmediate 写一条（R9-21b）：首启 16 条默认规则不得在同一个 tick 里跑完。
+    await yieldToEventLoop()
     const file = join(defaults, name)
     if (tombstonedKeys.has(keyOfDefaultFile(name))) {
       tombstoned += 1

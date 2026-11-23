@@ -134,10 +134,11 @@ export function createWhaleMemoryService({ ctx, backendRef, getHook = () => null
  * @param {{config:any, backend:any, log?:Function, store?:any}} [deps]
  *   store 默认真实 rule-store；测试注入 fake 以断言 recoverPendingTxn 接线。
  *   `rules.createAgentsIfMissing`（默认 true）控制「宿主无 AGENTS.md 时创建最小管理块」。
- * @returns {{skipped?:string, dir:string, rules:number, recovered?:object|null,
- *   seeded?:object|null, mirror?:object|null, agents?:object|null}}
+ * @returns {Promise<{skipped?:string, dir:string, rules:number, recovered?:object|null,
+ *   seeded?:object|null, mirror?:object|null, agents?:object|null}>}
+ *   async 原因：播种逐文件让出事件循环（R9-21b），调用方必须接住 Promise（启动处已 catch）。
  */
-export function runRulesSelfHeal({ config, backend, log = () => {}, store = ruleStore } = {}) {
+export async function runRulesSelfHeal({ config, backend, log = () => {}, store = ruleStore } = {}) {
   const dir = String(config?.rules?.dir || '').trim() || defaultRuleRoot()
   const result = { dir, rules: 0, recovered: null, seeded: null, mirror: null, agents: null }
   if (bool(config?.rules?.enabled, true) === false) return { ...result, skipped: 'rules_disabled' }
@@ -171,7 +172,7 @@ export function runRulesSelfHeal({ config, backend, log = () => {}, store = rule
 
   // 1) 默认铁律播种（后台；播种本身不阻塞 init）。
   try {
-    result.seeded = seedDefaultRules({ root: dir, log }, {
+    result.seeded = await seedDefaultRules({ root: dir, log }, {
       // 播种与面板/提案同口径（R9-05）：requireGit=true 且缺 git 时不播、不写 marker。
       gitRequired: Boolean(config?.rules?.requireGit),
     })
@@ -335,7 +336,11 @@ export function apply(ctx, config) {
     if (bool(config?.rules?.enabled, true) === false) return () => {}
     const timer = setTimeout(() => {
       try {
-        runRulesSelfHeal({ config, backend: backendProxy, log })
+        // 自愈本身 async（播种逐文件让出事件循环）：拒绝必须显式接住，不能留 unhandledRejection。
+        const task = runRulesSelfHeal({ config, backend: backendProxy, log })
+        if (task && typeof task.then === 'function') {
+          task.catch((err) => log(`[whale-memory] rules self-heal fail-open: ${err?.message || err}`))
+        }
       } catch (err) {
         log(`[whale-memory] rules self-heal fail-open: ${err?.message || err}`)
       }

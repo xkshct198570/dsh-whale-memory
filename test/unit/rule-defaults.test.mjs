@@ -120,14 +120,14 @@ test('defaultRulesDir：指向包根 defaults/rules，且与 defaultRulesAvailab
   assert.equal(defaultRulesAvailable(join(expected, 'no-such-dir')), false)
 })
 
-test('首播 3 个默认文件：写文件 + manifest + marker + 返回形状', (t) => {
+test('首播 3 个默认文件：写文件 + manifest + marker + 返回形状', async (t) => {
   const base = freshRoot(t)
   const rulesRoot = join(base, 'rules')
   const defaults = join(base, 'defaults', 'rules')
   mkdirSync(defaults, { recursive: true })
   threeDefaults(defaults)
 
-  const result = seedDefaultRules({ root: rulesRoot, defaultsDir: defaults, log: () => {} })
+  const result = await seedDefaultRules({ root: rulesRoot, defaultsDir: defaults, log: () => {} })
   assert.equal(result.ok, true)
   assert.equal(result.seeded, 3)
   assert.equal(result.count, 3)
@@ -153,23 +153,23 @@ test('首播 3 个默认文件：写文件 + manifest + marker + 返回形状', 
   assert.deepEqual(readSeedMarker(rulesRoot), marker)
 })
 
-test('幂等：第二次播种返回 already_seeded 且不改文件', (t) => {
+test('幂等：第二次播种返回 already_seeded 且不改文件', async (t) => {
   const base = freshRoot(t)
   const rulesRoot = join(base, 'rules')
   const defaults = join(base, 'defaults', 'rules')
   mkdirSync(defaults, { recursive: true })
   threeDefaults(defaults)
 
-  assert.equal(seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }).seeded, 3)
+  assert.equal((await seedDefaultRules({ root: rulesRoot, defaultsDir: defaults })).seeded, 3)
   const before = readFileSync(join(rulesRoot, SEED_MARKER), 'utf8')
-  const second = seedDefaultRules({ root: rulesRoot, defaultsDir: defaults })
+  const second = await seedDefaultRules({ root: rulesRoot, defaultsDir: defaults })
   assert.equal(second.ok, true)
   assert.equal(second.skipped, 'already_seeded')
   assert.equal(second.count, 0)
   assert.equal(readFileSync(join(rulesRoot, SEED_MARKER), 'utf8'), before)
 })
 
-test('已有规则：不覆盖、不新增默认文件，marker 记 existing_rules', (t) => {
+test('已有规则：不覆盖、不新增默认文件，marker 记 existing_rules', async (t) => {
   const base = freshRoot(t)
   const rulesRoot = join(base, 'rules')
   const defaults = join(base, 'defaults', 'rules')
@@ -179,7 +179,7 @@ test('已有规则：不覆盖、不新增默认文件，marker 记 existing_rul
   // 用户自己的规则：与默认同一编号，内容不同。
   writeDefault(rulesRoot, frontOf({ key: 'iron-rule-1', number: 1, origin: 'manual:u1' }), '必须只做用户自己那条。')
 
-  const result = seedDefaultRules({ root: rulesRoot, defaultsDir: defaults })
+  const result = await seedDefaultRules({ root: rulesRoot, defaultsDir: defaults })
   assert.equal(result.ok, true)
   assert.equal(result.skipped, 'existing_rules')
   assert.equal(result.count, 0)
@@ -190,26 +190,26 @@ test('已有规则：不覆盖、不新增默认文件，marker 记 existing_rul
   assert.match(String(marker.at), /^\d{4}-\d{2}-\d{2}T/)
 })
 
-test('用户删光默认规则后重启：marker 是判据，不重新播种', (t) => {
+test('用户删光默认规则后重启：marker 是判据，不重新播种', async (t) => {
   const base = freshRoot(t)
   const rulesRoot = join(base, 'rules')
   const defaults = join(base, 'defaults', 'rules')
   mkdirSync(defaults, { recursive: true })
   threeDefaults(defaults)
 
-  assert.equal(seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }).seeded, 3)
+  assert.equal((await seedDefaultRules({ root: rulesRoot, defaultsDir: defaults })).seeded, 3)
   for (const name of readdirSync(rulesRoot).filter((item) => item.endsWith('.md'))) {
     rmSync(join(rulesRoot, name))
   }
   assert.equal(listRules(rulesRoot).rules.length, 0, '删光后目录确实为空（否则这条用例测不到判据）')
 
-  const restart = seedDefaultRules({ root: rulesRoot, defaultsDir: defaults })
+  const restart = await seedDefaultRules({ root: rulesRoot, defaultsDir: defaults })
   assert.equal(restart.ok, true)
   assert.equal(restart.skipped, 'already_seeded')
   assert.equal(listRules(rulesRoot).rules.length, 0, '重启不得把用户删掉的默认铁律灌回来')
 })
 
-test('坏文件跳过不阻断：缺 front matter 的进 invalid，其余照播', (t) => {
+test('坏文件跳过不阻断：缺 front matter 的进 invalid，其余照播', async (t) => {
   const base = freshRoot(t)
   const rulesRoot = join(base, 'rules')
   const defaults = join(base, 'defaults', 'rules')
@@ -217,7 +217,7 @@ test('坏文件跳过不阻断：缺 front matter 的进 invalid，其余照播'
   threeDefaults(defaults)
   writeFileSync(join(defaults, 'broken.md'), '没有 front matter 的正文，应当被跳过。\n', 'utf8')
 
-  const result = seedDefaultRules({ root: rulesRoot, defaultsDir: defaults })
+  const result = await seedDefaultRules({ root: rulesRoot, defaultsDir: defaults })
   assert.equal(result.ok, true)
   assert.equal(result.seeded, 3)
   assert.equal(result.skippedInvalid, 1)
@@ -227,7 +227,7 @@ test('坏文件跳过不阻断：缺 front matter 的进 invalid，其余照播'
   assert.equal(existsSync(join(rulesRoot, 'broken.md')), false)
 })
 
-test('校验不过的默认文件跳过：保留空号 6 被拒，其余编号照播', (t) => {
+test('校验不过的默认文件跳过：保留空号 6 被拒，其余编号照播', async (t) => {
   const base = freshRoot(t)
   const rulesRoot = join(base, 'rules')
   const defaults = join(base, 'defaults', 'rules')
@@ -235,14 +235,14 @@ test('校验不过的默认文件跳过：保留空号 6 被拒，其余编号�
   writeDefault(defaults, frontOf({ key: 'iron-rule-6', number: 6, origin: 'default:iron-rule-6' }), '禁止占用保留空号。')
   writeDefault(defaults, frontOf({ key: 'iron-rule-7', number: 7, origin: 'default:iron-rule-7' }), '必须留出空号。')
 
-  const result = seedDefaultRules({ root: rulesRoot, defaultsDir: defaults })
+  const result = await seedDefaultRules({ root: rulesRoot, defaultsDir: defaults })
   assert.equal(result.seeded, 1)
   assert.equal(result.skippedInvalid, 1)
   assert.deepEqual(result.invalid[0].errors.map((item) => item.code), ['number_reserved'])
   assert.deepEqual(listRules(rulesRoot).rules.map((doc) => doc.front.number), [7])
 })
 
-test('默认文件之间撞号：后来的跳过（duplicate_number），不写半成品', (t) => {
+test('默认文件之间撞号：后来的跳过（duplicate_number），不写半成品', async (t) => {
   const base = freshRoot(t)
   const rulesRoot = join(base, 'rules')
   const defaults = join(base, 'defaults', 'rules')
@@ -251,14 +251,14 @@ test('默认文件之间撞号：后来的跳过（duplicate_number），不写�
   writeDefault(defaults, frontOf({ key: 'iron-rule-a', number: 3, origin: 'default:a' }), '必须先验证再覆盖正式库。')
   writeDefault(defaults, frontOf({ key: 'iron-rule-b', number: 3, origin: 'default:b' }), '必须保留审计日志。')
 
-  const result = seedDefaultRules({ root: rulesRoot, defaultsDir: defaults })
+  const result = await seedDefaultRules({ root: rulesRoot, defaultsDir: defaults })
   assert.equal(result.seeded, 1)
   assert.equal(result.skippedInvalid, 1)
   assert.deepEqual(result.invalid[0].errors.map((item) => item.code), ['duplicate_number'])
   assert.deepEqual(listRules(rulesRoot).rules.map((doc) => doc.front.key), ['iron-rule-a'])
 })
 
-test('git 可用：整批只提交一次，消息带数量（注入 exec）', (t) => {
+test('git 可用：整批只提交一次，消息带数量（注入 exec）', async (t) => {
   const base = freshRoot(t)
   const rulesRoot = join(base, 'rules')
   const defaults = join(base, 'defaults', 'rules')
@@ -266,7 +266,7 @@ test('git 可用：整批只提交一次，消息带数量（注入 exec）', (t
   threeDefaults(defaults)
   const git = gitStub()
 
-  const result = seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { exec: git.exec })
+  const result = await seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { exec: git.exec })
   assert.equal(result.ok, true)
   assert.equal(result.seeded, 3)
   assert.equal(result.commit.ok, true)
@@ -277,7 +277,7 @@ test('git 可用：整批只提交一次，消息带数量（注入 exec）', (t
   assert.match(commits[0], /rules: seed defaults \(3\)/)
 })
 
-test('git 不可用：文件照写、commit 降级跳过（fail-open）', (t) => {
+test('git 不可用：文件照写、commit 降级跳过（fail-open）', async (t) => {
   const base = freshRoot(t)
   const rulesRoot = join(base, 'rules')
   const defaults = join(base, 'defaults', 'rules')
@@ -289,7 +289,7 @@ test('git 不可用：文件照写、commit 降级跳过（fail-open）', (t) =>
     throw err
   }
 
-  const result = seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { exec })
+  const result = await seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { exec })
   assert.equal(result.ok, true)
   assert.equal(result.seeded, 3)
   assert.equal(result.commit.ok, false)
@@ -298,24 +298,24 @@ test('git 不可用：文件照写、commit 降级跳过（fail-open）', (t) =>
   assert.equal(existsSync(join(rulesRoot, SEED_MARKER)), true)
 })
 
-test('包内默认目录不存在：skipped=defaults_missing 且不写 marker（将来能播就播）', (t) => {
+test('包内默认目录不存在：skipped=defaults_missing 且不写 marker（将来能播就播）', async (t) => {
   const base = freshRoot(t)
   const rulesRoot = join(base, 'rules')
-  const result = seedDefaultRules({ root: rulesRoot, defaultsDir: join(base, 'nope') })
+  const result = await seedDefaultRules({ root: rulesRoot, defaultsDir: join(base, 'nope') })
   assert.equal(result.ok, true)
   assert.equal(result.skipped, 'defaults_missing')
   assert.equal(result.count, 0)
   assert.equal(existsSync(join(rulesRoot, SEED_MARKER)), false)
 })
 
-test('默认文件全部非法：all_invalid + 不写 marker（下次仍会尝试）', (t) => {
+test('默认文件全部非法：all_invalid + 不写 marker（下次仍会尝试）', async (t) => {
   const base = freshRoot(t)
   const rulesRoot = join(base, 'rules')
   const defaults = join(base, 'defaults', 'rules')
   mkdirSync(defaults, { recursive: true })
   writeFileSync(join(defaults, 'broken.md'), '还是没有 front matter。\n', 'utf8')
 
-  const result = seedDefaultRules({ root: rulesRoot, defaultsDir: defaults })
+  const result = await seedDefaultRules({ root: rulesRoot, defaultsDir: defaults })
   assert.equal(result.ok, false)
   assert.equal(result.error, 'all_invalid')
   assert.equal(result.seeded, 0)
@@ -323,7 +323,7 @@ test('默认文件全部非法：all_invalid + 不写 marker（下次仍会尝�
   assert.equal(existsSync(join(rulesRoot, SEED_MARKER)), false)
 })
 
-test('无编号安全行（number=0）：validateRule 只放行 iron-rule-safety，其余 key 仍拒', (t) => {
+test('无编号安全行（number=0）：validateRule 只放行 iron-rule-safety，其余 key 仍拒', async (t) => {
   const safetyFront = frontOf({
     key: 'iron-rule-safety', number: 0, modality: 'only', action: '存放', object: '认证凭据',
     origin: 'default:iron-rule-safety',
@@ -339,7 +339,7 @@ test('无编号安全行（number=0）：validateRule 只放行 iron-rule-safety
   assert.deepEqual(alsoWrong.errors.map((item) => item.code), ['invalid_number'])
 })
 
-test('number=0 不占号：nextRuleNumber/computeManifest 不受影响，manifest 记 unnumbered', (t) => {
+test('number=0 不占号：nextRuleNumber/computeManifest 不受影响，manifest 记 unnumbered', async (t) => {
   assert.equal(nextRuleNumber([0, 17]), 18)
   assert.equal(nextRuleNumber([0]), 1)
 
@@ -358,7 +358,7 @@ test('number=0 不占号：nextRuleNumber/computeManifest 不受影响，manifes
   assert.equal(manifest.unnumbered, 1)
 })
 
-test('播种真实默认目录：整批无非法、safety 无编号、本地专用 13 不播', (t) => {
+test('播种真实默认目录：整批无非法、safety 无编号、本地专用 13 不播', async (t) => {
   const base = freshRoot(t, 'whale-seed-real-')
   const rulesRoot = join(base, 'rules')
   const defaults = defaultRulesDir()
@@ -366,7 +366,7 @@ test('播种真实默认目录：整批无非法、safety 无编号、本地专�
   assert.ok(files.length >= 10, `默认目录应当有成批规则，实际 ${files.length}`)
 
   // git:false：这条用例验内容口径，不依赖本机 git。
-  const result = seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { git: false })
+  const result = await seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { git: false })
   assert.equal(result.ok, true)
   assert.equal(result.seeded, files.length)
   assert.equal(result.skippedInvalid, 0, `默认文件不该有非法项：${JSON.stringify(result.invalid)}`)
@@ -385,7 +385,7 @@ test('播种真实默认目录：整批无非法、safety 无编号、本地专�
   assert.equal(existsSync(join(rulesRoot, 'iron-rule-13.md')), false)
 })
 
-test('git 仓库不存在：先 init（不提交）再单次提交，首启只有一个 commit', (t) => {
+test('git 仓库不存在：先 init（不提交）再单次提交，首启只有一个 commit', async (t) => {
   const base = freshRoot(t)
   const rulesRoot = join(base, 'rules')
   const defaults = join(base, 'defaults', 'rules')
@@ -393,7 +393,7 @@ test('git 仓库不存在：先 init（不提交）再单次提交，首启只�
   threeDefaults(defaults)
   const git = gitStub({ repo: false })
 
-  const result = seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { exec: git.exec })
+  const result = await seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { exec: git.exec })
   assert.equal(result.ok, true, JSON.stringify(result.invalid))
   assert.equal(result.seeded, 3)
   assert.equal(result.commit.ok, true)
@@ -413,7 +413,7 @@ test('git 仓库不存在：先 init（不提交）再单次提交，首启只�
 // R8-10：播种版本化 + invalid 重试 + 升级补播
 // ---------------------------------------------------------------------------
 
-test('坏默认文件下轮重试：invalid 进 marker，修好后只补播缺失 key', (t) => {
+test('坏默认文件下轮重试：invalid 进 marker，修好后只补播缺失 key', async (t) => {
   const base = freshRoot(t)
   const rulesRoot = join(base, 'rules')
   const defaults = join(base, 'defaults', 'rules')
@@ -421,7 +421,7 @@ test('坏默认文件下轮重试：invalid 进 marker，修好后只补播缺�
   threeDefaults(defaults)
   writeFileSync(join(defaults, 'iron-rule-9.md'), '没有 front matter 的坏文件。\n', 'utf8')
 
-  const first = seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { git: false })
+  const first = await seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { git: false })
   assert.equal(first.ok, true, first.error)
   assert.equal(first.seeded, 3)
   assert.equal(first.skippedInvalid, 1)
@@ -432,7 +432,7 @@ test('坏默认文件下轮重试：invalid 进 marker，修好后只补播缺�
 
   // 修好坏文件：下轮只补这条，已播的不重播。
   writeDefault(defaults, frontOf({ key: 'iron-rule-9', number: 9, origin: 'default:iron-rule-9' }), '必须保留审计日志。')
-  const second = seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { git: false })
+  const second = await seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { git: false })
   assert.equal(second.ok, true, second.error)
   assert.equal(second.seeded, 1, '只补上轮 invalid 的那一条')
   assert.equal(second.skippedInvalid, 0)
@@ -441,47 +441,47 @@ test('坏默认文件下轮重试：invalid 进 marker，修好后只补播缺�
   assert.deepEqual(listRules(rulesRoot).rules.map((doc) => doc.front.key).sort(), ['iron-rule-1', 'iron-rule-2', 'iron-rule-3', 'iron-rule-9'])
 })
 
-test('升级新增默认 key：只补新增项，不覆盖已有正文', (t) => {
+test('升级新增默认 key：只补新增项，不覆盖已有正文', async (t) => {
   const base = freshRoot(t)
   const rulesRoot = join(base, 'rules')
   const defaults = join(base, 'defaults', 'rules')
   mkdirSync(defaults, { recursive: true })
   threeDefaults(defaults)
-  assert.equal(seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { git: false }).seeded, 3)
+  assert.equal((await seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { git: false })).seeded, 3)
 
   // 用户手改第一条正文：升级补播不得覆盖它。
   const edited = join(rulesRoot, 'iron-rule-1.md')
   writeFileSync(edited, readFileSync(edited, 'utf8').replace('必须先验证再覆盖正式库。', '必须只做用户自己那条。'), 'utf8')
   // 包升级新增一条默认规则。
   writeDefault(defaults, frontOf({ key: 'iron-rule-4', number: 4, origin: 'default:iron-rule-4' }), '必须保留审计日志。')
-  const upgraded = seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { git: false })
+  const upgraded = await seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { git: false })
   assert.equal(upgraded.ok, true, upgraded.error)
   assert.equal(upgraded.seeded, 1, '升级只补新增 key，不重播旧 key')
   assert.equal(readRule(rulesRoot, 'iron-rule-1').rule.text.trim(), '必须只做用户自己那条。')
   assert.equal(listRules(rulesRoot).rules.length, 4)
 })
 
-test('SEED_VERSION 参与判据：marker 版本落后 → 即使无新文件也升级写回', (t) => {
+test('SEED_VERSION 参与判据：marker 版本落后 → 即使无新文件也升级写回', async (t) => {
   const base = freshRoot(t)
   const rulesRoot = join(base, 'rules')
   const defaults = join(base, 'defaults', 'rules')
   mkdirSync(defaults, { recursive: true })
   threeDefaults(defaults)
-  assert.equal(seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { git: false }).seeded, 3)
+  assert.equal((await seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { git: false })).seeded, 3)
 
   const markerFile = join(rulesRoot, SEED_MARKER)
   const marker = JSON.parse(readFileSync(markerFile, 'utf8'))
   marker.version = SEED_VERSION - 1
   writeFileSync(markerFile, `${JSON.stringify(marker, null, 2)}\n`, 'utf8')
 
-  const again = seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { git: false })
+  const again = await seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { git: false })
   assert.equal(again.ok, true, again.error)
   assert.equal(again.skipped, 'already_seeded')
   assert.equal(again.seeded, 0)
   assert.equal(readSeedMarker(rulesRoot).version, SEED_VERSION, '落后的 marker 必须被升级，版本号不能只写不读')
 })
 
-test('首播不复活墓碑：purge #17 后（无 marker）重播跳过 17，编号不回退', (t) => {
+test('首播不复活墓碑：purge #17 后（无 marker）重播跳过 17，编号不回退', async (t) => {
   const base = freshRoot(t)
   const rulesRoot = join(base, 'rules')
   const defaults = join(base, 'defaults', 'rules')
@@ -494,7 +494,7 @@ test('首播不复活墓碑：purge #17 后（无 marker）重播跳过 17，编
   assert.equal(purgeRule({ root: rulesRoot, key: 'iron-rule-17' }, { git: false }).ok, true)
   assert.equal(existsSync(join(rulesRoot, SEED_MARKER)), false)
 
-  const result = seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { git: false })
+  const result = await seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { git: false })
   assert.equal(result.ok, true, result.error)
   assert.equal(result.seeded, 1, '墓碑 key 必须跳过')
   assert.equal(result.tombstoned, 1)
@@ -507,7 +507,7 @@ test('首播不复活墓碑：purge #17 后（无 marker）重播跳过 17，编
 })
 
 
-test('R9-21：manifest 重建失败 → 不写 .seeded.json（下轮重试，health 红）', (t) => {
+test('R9-21：manifest 重建失败 → 不写 .seeded.json（下轮重试，health 红）', async (t) => {
   const rulesRoot = mkdtempSync(join(tmpdir(), 'whale-seed-mf-'))
   t.after(() => rmSync(rulesRoot, { recursive: true, force: true }))
   const defaults = join(rulesRoot, '__defaults__')
@@ -523,8 +523,33 @@ test('R9-21：manifest 重建失败 → 不写 .seeded.json（下轮重试，hea
     }
     return nodeFs.renameSync(from, to)
   }
-  const result = seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { git: false, fs: fakeFs })
+  const result = await seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { git: false, fs: fakeFs })
   assert.equal(result.ok, false)
   assert.equal(result.error, 'manifest_failed')
   assert.equal(existsSync(join(rulesRoot, SEED_MARKER)), false, 'manifest 失败不得写 marker')
+})
+
+test('R9-21b：首播逐文件让出事件循环——首个 immediate 时不可能已写完默认目录', async (t) => {
+  const base = freshRoot(t, 'whale-seed-yield-')
+  const rulesRoot = join(base, 'rules')
+  const defaults = defaultRulesDir()
+  const total = readdirSync(defaults).filter((name) => name.endsWith('.md') && name.toUpperCase() !== 'README.MD').length
+  assert.ok(total >= 10, `默认目录应当有成批规则，实际 ${total}`)
+
+  // 播种前先排一个 immediate：它若在"全部文件写完"之后才跑到，说明播种根本没让出事件循环。
+  let filesAtFirstImmediate = -1
+  const probe = new Promise((done) => {
+    setImmediate(() => {
+      filesAtFirstImmediate = listRules(rulesRoot).rules.length
+      done()
+    })
+  })
+  const task = seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { git: false })
+  await probe
+  assert.notEqual(filesAtFirstImmediate, -1)
+  assert.ok(filesAtFirstImmediate < total, `首个 immediate 时已写 ${filesAtFirstImmediate}/${total} 条：播种在同一个 tick 里跑完了`)
+
+  const result = await task
+  assert.equal(result.ok, true)
+  assert.equal(result.seeded, total, '让出事件循环不能漏播')
 })

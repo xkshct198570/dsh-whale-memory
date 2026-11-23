@@ -425,10 +425,10 @@ test('R9-05：无写入（patch 未改变内容）commitState=null，不谎报 c
   assert.equal(same.commitState, null)
 })
 
-test('R9-05：播种是写入口——requireGit 缺 git 时不播规则、不写 marker', (t) => {
+test('R9-05：播种是写入口——requireGit 缺 git 时不播规则、不写 marker', async (t) => {
   const root = freshRoot(t)
   const defaultsDir = fileURLToPath(new URL('../../defaults/rules', import.meta.url))
-  const seeded = seedDefaultRules(
+  const seeded = await seedDefaultRules(
     { root, defaultsDir },
     { gitRequired: true, git: true, exec: missingGitExec },
   )

@@ -87,13 +87,13 @@ function cfgOf(rulesDir, rules = {}) {
   return { rules: { enabled: true, dir: rulesDir, ...rules } }
 }
 
-test('runRulesSelfHeal：mirrorAuto/renderAgents 都为真 → 镜像行 + AGENTS 摘要都更新', (t) => {
+test('runRulesSelfHeal：mirrorAuto/renderAgents 都为真 → 镜像行 + AGENTS 摘要都更新', async (t) => {
   const { home, rulesDir, db, backend } = fresh(t)
   writeRuleFile(rulesDir)
   const { path } = agentsFile(home)
   const before = nodeFs.readFileSync(path, 'utf8')
 
-  const result = runRulesSelfHeal({ config: cfgOf(rulesDir), backend })
+  const result = await runRulesSelfHeal({ config: cfgOf(rulesDir), backend })
   assert.equal(result.rules, 1)
   assert.equal(result.mirror?.ok, true, result.mirror?.error)
   assert.equal(result.agents?.ok, true, result.agents?.code)
@@ -103,55 +103,55 @@ test('runRulesSelfHeal：mirrorAuto/renderAgents 都为真 → 镜像行 + AGENT
   assert.match(after, /- 铁律1 · 保留审计日志/)
 })
 
-test('runRulesSelfHeal：mirrorAuto=false 只跳过镜像，摘要照常（不互相绑死）', (t) => {
+test('runRulesSelfHeal：mirrorAuto=false 只跳过镜像，摘要照常（不互相绑死）', async (t) => {
   const { home, rulesDir, db, backend } = fresh(t)
   writeRuleFile(rulesDir)
   const { path } = agentsFile(home)
   const before = nodeFs.readFileSync(path, 'utf8')
 
-  const result = runRulesSelfHeal({ config: cfgOf(rulesDir, { mirrorAuto: false, renderAgents: true }), backend })
+  const result = await runRulesSelfHeal({ config: cfgOf(rulesDir, { mirrorAuto: false, renderAgents: true }), backend })
   assert.equal(result.mirror, null, '关镜像时不得调用 mirrorRules')
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM nodes WHERE origin LIKE 'rule:%'").get().n, 0)
   assert.equal(result.agents?.ok, true)
   assert.notEqual(nodeFs.readFileSync(path, 'utf8'), before)
 })
 
-test('runRulesSelfHeal：renderAgents=false 只跳过摘要，镜像照常', (t) => {
+test('runRulesSelfHeal：renderAgents=false 只跳过摘要，镜像照常', async (t) => {
   const { home, rulesDir, db, backend } = fresh(t)
   writeRuleFile(rulesDir)
   const { path, content } = agentsFile(home)
 
-  const result = runRulesSelfHeal({ config: cfgOf(rulesDir, { mirrorAuto: true, renderAgents: false }), backend })
+  const result = await runRulesSelfHeal({ config: cfgOf(rulesDir, { mirrorAuto: true, renderAgents: false }), backend })
   assert.equal(result.agents, null, '关摘要时不得调用 renderAgentsDigest')
   assert.equal(nodeFs.readFileSync(path, 'utf8'), content, '关摘要时必须一个字节都不动')
   assert.equal(result.mirror?.ok, true)
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM nodes WHERE origin='rule:iron-rule-1'").get().n, 1)
 })
 
-test('runRulesSelfHeal：两个开关都关 → 不动镜像也不动摘要', (t) => {
+test('runRulesSelfHeal：两个开关都关 → 不动镜像也不动摘要', async (t) => {
   const { home, rulesDir, db, backend } = fresh(t)
   writeRuleFile(rulesDir)
   const { path, content } = agentsFile(home)
-  const result = runRulesSelfHeal({ config: cfgOf(rulesDir, { mirrorAuto: false, renderAgents: false }), backend })
+  const result = await runRulesSelfHeal({ config: cfgOf(rulesDir, { mirrorAuto: false, renderAgents: false }), backend })
   assert.equal(result.mirror, null)
   assert.equal(result.agents, null)
   assert.equal(nodeFs.readFileSync(path, 'utf8'), content)
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM nodes WHERE origin LIKE 'rule:%'").get().n, 0)
 })
 
-test('runRulesSelfHeal：rules.enabled=false → 整段跳过（不起恢复/播种/镜像/摘要）', (t) => {
+test('runRulesSelfHeal：rules.enabled=false → 整段跳过（不起恢复/播种/镜像/摘要）', async (t) => {
   const { home, rulesDir, backend } = fresh(t)
   writeRuleFile(rulesDir)
   const { path, content } = agentsFile(home)
   let recovered = 0
   const store = { ...ruleStore, recoverPendingTxn: () => { recovered += 1 } }
-  const result = runRulesSelfHeal({ config: cfgOf(rulesDir, { enabled: false }), backend, store })
+  const result = await runRulesSelfHeal({ config: cfgOf(rulesDir, { enabled: false }), backend, store })
   assert.equal(result.skipped, 'rules_disabled')
   assert.equal(recovered, 0)
   assert.equal(nodeFs.readFileSync(path, 'utf8'), content)
 })
 
-test('runRulesSelfHeal：recoverPendingTxn 接线（store 落地后被调用，失败 fail-open）', (t) => {
+test('runRulesSelfHeal：recoverPendingTxn 接线（store 落地后被调用，失败 fail-open）', async (t) => {
   const { rulesDir, backend } = fresh(t)
   writeRuleFile(rulesDir)
   const calls = []
@@ -162,7 +162,7 @@ test('runRulesSelfHeal：recoverPendingTxn 接线（store 落地后被调用，�
       return { recovered: true, id: 'txn-1' }
     },
   }
-  const result = runRulesSelfHeal({ config: cfgOf(rulesDir), backend, store })
+  const result = await runRulesSelfHeal({ config: cfgOf(rulesDir), backend, store })
   assert.deepEqual(calls, [[rulesDir, 'function']])
   assert.equal(result.recovered?.recovered, true)
 
@@ -171,16 +171,16 @@ test('runRulesSelfHeal：recoverPendingTxn 接线（store 落地后被调用，�
     ...ruleStore,
     recoverPendingTxn: () => { threw += 1; throw new Error('boom') },
   }
-  const second = runRulesSelfHeal({ config: cfgOf(rulesDir), backend, store: broken })
+  const second = await runRulesSelfHeal({ config: cfgOf(rulesDir), backend, store: broken })
   assert.equal(threw, 1)
   assert.equal(second.mirror?.ok, true, '恢复失败不得阻断镜像自愈')
 })
 
-test('runRulesSelfHeal：播种在自愈内后台执行（有 marker 时判已播，不重写规则）', (t) => {
+test('runRulesSelfHeal：播种在自愈内后台执行（有 marker 时判已播，不重写规则）', async (t) => {
   const { rulesDir, backend } = fresh(t)
   writeRuleFile(rulesDir, { key: 'iron-rule-1', number: 1, text: '必须保留审计日志。' })
   const before = nodeFs.readFileSync(join(rulesDir, 'iron-rule-1.md'), 'utf8')
-  const result = runRulesSelfHeal({ config: cfgOf(rulesDir, { mirrorAuto: false, renderAgents: false }), backend })
+  const result = await runRulesSelfHeal({ config: cfgOf(rulesDir, { mirrorAuto: false, renderAgents: false }), backend })
   assert.equal(result.seeded?.skipped, 'already_seeded')
   assert.equal(nodeFs.readFileSync(join(rulesDir, 'iron-rule-1.md'), 'utf8'), before)
   assert.equal(existsSync(agentsPathOf(rulesDir)), false, '自愈不得创建宿主 AGENTS 资产')
@@ -190,13 +190,13 @@ test('runRulesSelfHeal：播种在自愈内后台执行（有 marker 时判已�
 // 干净安装 P1：宿主没有 AGENTS.md 时，启动自愈创建最小管理块
 // ---------------------------------------------------------------------------
 
-test('runRulesSelfHeal：空机（无 AGENTS.md）→ 创建最小管理块，默认铁律可见', (t) => {
+test('runRulesSelfHeal：空机（无 AGENTS.md）→ 创建最小管理块，默认铁律可见', async (t) => {
   const { home, rulesDir, backend } = fresh(t)
   writeRuleFile(rulesDir, { key: 'iron-rule-1', number: 1, text: '必须保留审计日志。' })
   const agentsPath = join(home, 'AGENTS.md')
   assert.equal(existsSync(agentsPath), false)
 
-  const result = runRulesSelfHeal({ config: cfgOf(rulesDir), backend })
+  const result = await runRulesSelfHeal({ config: cfgOf(rulesDir), backend })
   assert.equal(result.agents?.ok, true, result.agents?.code)
   assert.equal(result.agents?.created, true)
   assert.equal(existsSync(agentsPath), true, '干净安装必须创建 AGENTS.md')
@@ -206,12 +206,12 @@ test('runRulesSelfHeal：空机（无 AGENTS.md）→ 创建最小管理块，�
   assert.match(content, /- 铁律1 · 保留审计日志/)
 })
 
-test('runRulesSelfHeal：rules.createAgentsIfMissing=false → 空机不创建；true 默认开', (t) => {
+test('runRulesSelfHeal：rules.createAgentsIfMissing=false → 空机不创建；true 默认开', async (t) => {
   const { home, rulesDir, backend } = fresh(t)
   writeRuleFile(rulesDir, { key: 'iron-rule-1', number: 1 })
   const agentsPath = join(home, 'AGENTS.md')
 
-  const off = runRulesSelfHeal({
+  const off = await runRulesSelfHeal({
     config: cfgOf(rulesDir, { createAgentsIfMissing: false }), backend,
   })
   assert.equal(off.agents?.ok, false)
@@ -219,24 +219,24 @@ test('runRulesSelfHeal：rules.createAgentsIfMissing=false → 空机不创建�
   assert.equal(existsSync(agentsPath), false, '开关关闭时不得创建')
 
   // 默认（未配该键）必须开：干净安装的验收口径。
-  const on = runRulesSelfHeal({ config: cfgOf(rulesDir), backend })
+  const on = await runRulesSelfHeal({ config: cfgOf(rulesDir), backend })
   assert.equal(on.agents?.created, true)
   assert.equal(existsSync(agentsPath), true)
 })
 
-test('runRulesSelfHeal：规则目录为空时不自愈出空壳 AGENTS', (t) => {
+test('runRulesSelfHeal：规则目录为空时不自愈出空壳 AGENTS', async (t) => {
   const { home, rulesDir, backend } = fresh(t)
   const agentsPath = join(home, 'AGENTS.md')
-  const result = runRulesSelfHeal({ config: cfgOf(rulesDir), backend })
+  const result = await runRulesSelfHeal({ config: cfgOf(rulesDir), backend })
   assert.equal(result.rules, 0)
   assert.equal(result.agents, null)
   assert.equal(existsSync(agentsPath), false)
 })
 
-test('干净安装 E2E：无 marker 空仓 → 播种 16 条默认铁律 → AGENTS 自动创建且全部可见', (t) => {
+test('干净安装 E2E：无 marker 空仓 → 播种 16 条默认铁律 → AGENTS 自动创建且全部可见', async (t) => {
   const { home, rulesDir, backend } = fresh(t, { seeded: false })
   const agentsPath = join(home, 'AGENTS.md')
-  const result = runRulesSelfHeal({ config: cfgOf(rulesDir), backend })
+  const result = await runRulesSelfHeal({ config: cfgOf(rulesDir), backend })
   assert.equal(result.seeded?.seeded, 16, '空仓应播种 16 条默认铁律')
   assert.equal(result.rules, 16)
   assert.equal(result.agents?.created, true, result.agents?.code)
