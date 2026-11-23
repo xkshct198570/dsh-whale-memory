@@ -3,9 +3,19 @@
  * i18n 校验/生成：locale/{zh,en,ja}.json 是唯一真源，lib/client.js 只保留由它生成的常量块。
  *
  * 用法：
- *   node scripts/i18n-check.mjs          # 默认 --check：三语键集/占位符一致 + 标记块与 JSON 一致
+ *   node scripts/i18n-check.mjs          # 默认 --check：三语键集/占位符一致 + ja 质量门禁 + 标记块与 JSON 一致
  *   node scripts/i18n-check.mjs --check  # 同上
  *   node scripts/i18n-check.mjs --write  # 从 JSON 重生成 client 标记块
+ *
+ * 校验顺序（任一项失败即 exit 1；③–⑤ 逐条打印可定位的键名，最多 12 个 + 总数）：
+ *   ① 三语键集完全一致；
+ *   ② 同一键的 {name} 占位符集合三语一致；
+ *   ③ ja 不许照抄 en：人类文案值中 ja≡en 的比例 < 5%；
+ *   ④ ja 必须真的写成日语：人类文案值中含假名的比例 > 90%；
+ *   ⑤ 三语 meta.detail 都是仓库内存在的本语言相对路径（docs/DETAIL.<lang>.md）；
+ *   ⑥ client 标记块与 locale JSON 逐字一致（`--write` 重生成）。
+ * 「人类文案值」的口径、阈值、排除项都写成本文件的常量与注释（见 isHumanCopy 处），
+ * 不在报告或文档里写会漂移的过程数字。
  *
  * 零依赖、零网络；只用 node 原生模块。
  */
@@ -83,11 +93,101 @@ for (const key of sharedKeys) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 「人类文案值」口径（ja 质量门禁的唯一集合定义，必须可复现）
+// ---------------------------------------------------------------------------
+/**
+ * 一个键的值算「人类文案值」当且仅当全部满足：
+ *   1. 是字符串（数字 / null / 对象一律不算）；
+ *   2. trim 后非空；
+ *   3. 含至少一个文字字符——拉丁字母、假名或汉字（`TEXT_RE`），纯数字 / 纯符号如 "—" 不算；
+ *   4. 不形如 URL / 仓库内相对路径 / 绝对路径（`NON_COPY_RE`），例如 "docs/DETAIL.en.md"、"/stats"；
+ *   5. 不是纯占位符（`PLACEHOLDER_ONLY_RE`），例如 "{total}"；
+ *   6. 键名不在 `EXCLUDED_KEYS`——文件路径型值（meta.detail）即使换成看不出路径的形状也一律排除。
+ *
+ * 集合以 en 为基准（en 是母版文案的来源），对三语同一键使用同一判定。新增键若确实是
+ * 品牌 / 命令 / 纯技术 token，只要在 en 里也属于上述 1–6 之外的形状，就不会进集合；
+ * 反之进了集合就必须是「人话」，ja 侧要靠翻译而不是照抄来满足门禁。
+ */
+const TEXT_RE = /[A-Za-z\u3041-\u3096\u30A1-\u30F6\u30FC\u4E00-\u9FFF]/
+const KANA_RE = /[\u3041-\u3096\u30A1-\u30F6\u30FC]/
+const NON_COPY_RE = [
+  /^https?:\/\//i, // URL
+  /^(?:[\w.-]+\/)+[\w.-]+\.\w{1,8}$/, // 相对路径：docs/DETAIL.en.md
+  /^\/[\w./-]*$/, // 绝对路径 / API 路径：/stats、/rules/health
+]
+const PLACEHOLDER_ONLY_RE = /^(?:\{[A-Za-z0-9_]+\}\s*)+$/
+const EXCLUDED_KEYS = new Set(['meta.detail'])
+
+/** 见上方口径注释：判定一个键值是否属于「人类文案值」。 */
+function isHumanCopy(key, value) {
+  if (EXCLUDED_KEYS.has(key)) return false
+  if (typeof value !== 'string') return false
+  const text = value.trim()
+  if (text === '') return false
+  if (!TEXT_RE.test(text)) return false
+  if (PLACEHOLDER_ONLY_RE.test(text)) return false
+  if (NON_COPY_RE.some((re) => re.test(text))) return false
+  return true
+}
+
+/** 门禁阈值：固定常量，不放过程数字。ja≡en 必须严格小于上限，假名覆盖必须严格高于下限。 */
+const JA_EN_IDENTICAL_MAX_RATE = 0.05
+const JA_KANA_MIN_COVERAGE = 0.9
+/** 失败时每个指标最多列出的键名数量（其余只报总数）。 */
+const PROBLEM_KEY_LIMIT = 12
+
+const humanKeys = Object.keys(dicts.en).filter((key) => isHumanCopy(key, dicts.en[key]))
+const jaIdentical = humanKeys.filter((key) => dicts.ja[key] === dicts.en[key])
+const jaNoKana = humanKeys.filter((key) => !KANA_RE.test(String(dicts.ja[key])))
+const identicalRate = jaIdentical.length / humanKeys.length
+const kanaCoverage = (humanKeys.length - jaNoKana.length) / humanKeys.length
+const pct = (value) => `${(value * 100).toFixed(2)}%`
+const keyList = (keys) => `${keys.slice(0, PROBLEM_KEY_LIMIT).join(', ')}${keys.length > PROBLEM_KEY_LIMIT ? ' …' : ''}`
+
+// ③ ja 不许照抄 en：人类文案值里 ja 与 en 完全相同的比例必须 < 5%。
+if (identicalRate >= JA_EN_IDENTICAL_MAX_RATE) {
+  problems.push(
+    `ja 与 en 完全相同的文案 ${jaIdentical.length}/${humanKeys.length}（${pct(identicalRate)}），阈值 <${pct(JA_EN_IDENTICAL_MAX_RATE)}；` +
+      `应为日语：${keyList(jaIdentical)}`,
+  )
+}
+
+// ④ ja 必须真的写成日语：人类文案值里含至少一个假名的比例必须 > 90%。
+if (kanaCoverage <= JA_KANA_MIN_COVERAGE) {
+  problems.push(
+    `ja 含假名的文案 ${humanKeys.length - jaNoKana.length}/${humanKeys.length}（${pct(kanaCoverage)}），阈值 >${pct(JA_KANA_MIN_COVERAGE)}；` +
+      `不含假名：${keyList(jaNoKana)}`,
+  )
+}
+
+// ⑤ meta.detail 必须是仓库内真实存在的相对路径，且文件名对应本语言（防止 ja 指到英文页）。
+for (const lang of LANGS) {
+  const key = 'meta.detail'
+  const target = dicts[lang][key]
+  if (typeof target !== 'string' || target.trim() === '') {
+    problems.push(`${key}（${lang}）必须是仓库内的相对路径，实际为 ${JSON.stringify(target)}`)
+    continue
+  }
+  const detailRe = new RegExp(`(^|/)DETAIL\\.${lang}\\.md$`)
+  if (path.isAbsolute(target) || target.includes('..') || !detailRe.test(target)) {
+    problems.push(`${key}（${lang}）必须指向本语言的 docs/DETAIL.${lang}.md 相对路径，实际为 ${target}`)
+    continue
+  }
+  if (!fs.existsSync(path.join(ROOT, target)) || !fs.statSync(path.join(ROOT, target)).isFile()) {
+    problems.push(`${key}（${lang}）指向的文件不存在：${target}`)
+  }
+}
+
 if (problems.length > 0) {
   console.error('[i18n] 校验失败：')
   for (const line of problems) console.error(`  - ${line}`)
   process.exit(1)
 }
+console.log(
+  `[i18n] ja 质量：ja≡en ${jaIdentical.length}/${humanKeys.length}（${pct(identicalRate)} < ${pct(JA_EN_IDENTICAL_MAX_RATE)}），` +
+    `假名覆盖 ${humanKeys.length - jaNoKana.length}/${humanKeys.length}（${pct(kanaCoverage)} > ${pct(JA_KANA_MIN_COVERAGE)}）。`,
+)
 
 /** 客户端标记块期望内容（与 --write 生成结果逐字一致）。 */
 function expectedBlock() {
