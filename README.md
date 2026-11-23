@@ -1,82 +1,82 @@
-# Whale Memory · 小鲸鱼记忆中枢
+# Whale Memory
 
-[English](README.md) | **中文**
+[**中文**](README.zh.md) | English
 
-给 DeepSeek Harness 会话加一层**可查、可审、可迁移的本地长期记忆**：对话前自动召回相关记忆并注入上下文，平时在面板里查看、编辑、导入导出；规则（铁律）以本地 git Markdown 仓为真源，数据库只做镜像。
+Local-first long-term memory for DeepSeek Harness sessions: recall relevant memories before each turn, review and edit them in a six-tab panel, and keep rules in a local git Markdown repository where the database is only a search mirror.
 
-> 当前版本 **0.6.0**（未发布）：本地 SQLite 记忆库、对话自动召回、六页签面板、写入审计与采纳信号、双轨同步与 outbox、观测指标与日报、旧库迁移审计；规则真源在 `~/.dsh/rules`（提案制、plan/apply、墓碑编号、健康检查）。
-> 运行要求：DSH `>=0.2.2-rc.5 <0.3.0`、Node `>=22.5`（内置 SQLite）。
+> Current version **0.6.0** (unreleased): local SQLite memory store, automatic recall, six-tab panel, write auditing and adoption signals, optional two-way sync/outbox, metrics and daily reports, and legacy migration auditing. Rule source of truth: `~/.dsh/rules` (proposals, plan/apply, tombstone numbering, health check).
+> Requirements: DSH `>=0.2.2-rc.5 <0.3.0`, Node `>=22.5` (built-in SQLite).
 
-## 安装
+## Install
 
-- **插件市场**：在 DSH 的插件市场里添加本项目的索引地址（format 1 索引），搜索 `dsh-whale-memory` 安装（上架后）。
-- **GitHub Release**：`dsh plugin --profile <profile> add <release-tarball.tgz>`，或插件页 Add plugin 选 tarball。
-- **本机开发（link）**：在 DSH 插件管理里用 `link:<本仓绝对目录>` 安装（源码/开发版 DSH 提供；先 `pnpm install` 并构建，改代码后需重建并重启）。`link:` 只用于开发，市场索引要求发布版本。
-- 装好即用：默认本地库、自动召回、面板六页签；不需要另装服务，也不需要填密钥。
+- **Market**: add this project's index source (format 1) in the DSH plugin market and search `dsh-whale-memory` (once listed).
+- **GitHub Release**: `dsh plugin --profile <profile> add <release-tarball.tgz>`, or choose the tarball on the Plugins page.
+- **Local development**: install with `link:<repository-directory>` from the plugin manager. Run `pnpm install` first; rebuild and restart after code changes. `link:` is for development; market indexes use published packages.
+- Works out of the box: local store, automatic recall, six-tab panel; no extra service and no API key.
 
-## 用
+## Use
 
-### 对话自动召回
+### Automatic recall
 
-- 每轮对话前，取最后一条用户消息检索本地记忆，把过相关度门槛（默认 `minRel=0.34`）的命中注入到上下文；没命中就不注入，不硬凑。
-- 2 秒内没返回就跳过本轮（不阻断对话）；结果只作用于当前会话，120 秒后失效；子会话不注入。
-- 按意图分配预算：闲聊 3 条 / 排障 5 条 / 回忆 4 条 / 画图、创作链路 0 条。
-- 身份维度：`userId` / `roleId` / 会话 cwd 派生的 `workspace`；人设插件切换角色时只发 `roleId` 提示，workspace 始终由会话决定。
+- Before each turn, search local memories with the last user message and inject hits above the relevance threshold (`minRel=0.34` by default). No hits means no injection.
+- A 2-second timeout skips recall for that turn instead of blocking the reply; results are session-scoped and expire after 120 seconds; subagents are skipped.
+- Intent budgets: chat 3 / troubleshooting 5 / recall 4 / image-and-creation 0.
+- Identity dimensions: `userId`, `roleId`, and `workspace` derived from the session cwd. A persona plugin only sends `roleId`; workspace always stays with the session.
 
-### 面板六页签
+### Six-tab panel
 
-概览 / 记忆库 / **规则** / 召回 / 写入与关系 / 设置：
+Overview / Memories / **Rules** / Recall / Writes & relations / Settings.
 
-- 记忆库：搜索、编辑、归档、导入导出、节点关系；
-- 规则：规则文件列表、新建、编辑、停用/启用、彻底删除、待确认候选、历史 diff/回滚、git 三态、`/rules/health`；
-- 召回：命中与注入参数；写入与关系：候选/审计/采纳；设置：后端、规则、面板等分组配置。
+- Memories: search, edit, archive, import/export, node relations.
+- Rules: rule files, create, edit, retire/reactivate, purge, pending proposals, history diff/rollback, git status, `/rules/health`.
+- Recall and writes: injection parameters, candidates, audit and adoption; Settings groups backend, rules and panel options.
 
-### 规则（铁律）提案与版本化
+### Rules (iron rules)
 
-- 规则真源是 `~/.dsh/rules/` 的一规则一 Markdown，git 纯本地；`nodes` 表里 `origin=rule:<key>` 只是面板检索/审计镜像，**不参与召回**。
-- 一条口语规则先成为候选，不会自动生效；确认方式：面板「待确认」按钮，或聊天里回复 `收录 <p...>`（每会话一条、30 分钟）。
-- 应用前会生成 plan（逐文件守卫/oldHash/planHash），确认后单次事务落盘 + 单次 commit；失败回滚，不产生半写状态。
-- 彻底删除会把编号写入 `retired/<key>.json` 墓碑，编号永不复用；`/rules/health` 检查文件/manifest/墓碑/链/镜像一致性。
-- 全局规则渲染进 `AGENTS.md` 管理块；空机首次自愈会创建最小管理块（`rules.createAgentsIfMissing=true`），已有无标记文件不追加。
-- 作用域规则只在对的 `role:`/`workspace:` 会话注入，预算 `injectChars`（0=关闭）。
+- The source of truth is one Markdown file per rule under `~/.dsh/rules/`, versioned by a purely local git repository. Rows in `nodes` with `origin=rule:<key>` are a panel/audit mirror only and are excluded from recall.
+- A spoken rule becomes a candidate; it never applies automatically. Confirm from the Rules tab or reply `收录 <p...>` in chat (one pending proposal per session, 30 minutes).
+- Apply builds a plan (per-file guards, old hashes, plan hash), then writes in one transaction and one commit; failures roll back without half-written state.
+- Purge writes a tombstone under `retired/<key>.json`; the number is never reused. `/rules/health` checks files, manifest, tombstones, chains and mirror consistency.
+- Global rules render into the managed block in `AGENTS.md`. A clean install creates a minimal block (`rules.createAgentsIfMissing=true`); an existing file without markers is never appended to.
+- Scoped rules (`role:` / `workspace:`) inject only in matching sessions, under `injectChars` (0 = off).
 
-## 配置
+## Configuration
 
-规则组（面板可见 9 项，另 3 项在配置层）：
+Rules group (9 visible in the panel, 3 config-only):
 
-| 键 | 默认 | 说明 |
+| Key | Default | Meaning |
 |---|---|---|
-| `rules.enabled` | `true` | 提案/注入/自愈总开关 |
-| `rules.dir` | `''` | 规则仓目录；空=`$DSH_HOME/rules` |
-| `rules.requireGit` | `false` | true=git 非绿时写规则硬拦 |
-| `rules.askMode` | `panel+chat` | 主动问渠道；`panel`/`off` 不自动起草 |
-| `rules.llm` | `false` | 合并/冲突时允许模型改措辞 |
-| `rules.maxProposals` | `20` | 待确认上限 |
-| `rules.guardStrict` | `true` | 严格守卫 |
-| `rules.mirrorAuto` | `true` | 自动镜像 |
-| `rules.askCooldownDays` | `30` | 拒绝冷却 |
-| `rules.renderAgents` | `true` | 重渲染 AGENTS（配置层） |
-| `rules.injectChars` | `600` | 作用域规则每轮预算（配置层；0=关闭） |
-| `rules.createAgentsIfMissing` | `true` | 空机创建最小 AGENTS 管理块（配置层） |
+| `rules.enabled` | `true` | Master switch for proposals, injection and self-heal |
+| `rules.dir` | `''` | Rules repository; empty = `$DSH_HOME/rules` |
+| `rules.requireGit` | `false` | `true` = refuse rule writes when git is unavailable |
+| `rules.askMode` | `panel+chat` | Where to offer proposals; `panel`/`off` never draft automatically |
+| `rules.llm` | `false` | Allow the model to reword merge/conflict candidates |
+| `rules.maxProposals` | `20` | Pending proposal limit |
+| `rules.guardStrict` | `true` | Strict guards |
+| `rules.mirrorAuto` | `true` | Automatic DB mirror |
+| `rules.askCooldownDays` | `30` | Rejection cooldown |
+| `rules.renderAgents` | `true` | Re-render the AGENTS block (config-only) |
+| `rules.injectChars` | `600` | Per-turn scoped-rule budget (config-only; 0 = off) |
+| `rules.createAgentsIfMissing` | `true` | Create a minimal AGENTS block on a clean install (config-only) |
 
-后端默认 `local`（`$DSH_HOME/whale-memory/memory.db`）；可选 `http`/`hybrid` 指向外部记忆服务，失败会回退本地或显示未连接。
+The backend defaults to `local` (`$DSH_HOME/whale-memory/memory.db`). `http`/`hybrid` can point at an external memory service; failures fall back locally or show "not connected".
 
-## 数据、隐私与安全
+## Data, privacy and security
 
-- 默认**不发任何外部请求**；只有把 `backend.mode` 切到 `http`/`hybrid` 时才向配置的 URL 发 `/stats /recent /search /recall /write`。
-- 记忆库与规则都在本机；规则 git 不 push、不联网。
-- 面板/接口默认只允许回环访问；写接口强制 JSON + 同源校验，拒绝跨站简单请求。
-- 日志只记 key/编号/commit/trace，不记规则正文或凭据。
+- No outbound requests by default. Only when `backend.mode` is set to `http`/`hybrid` does the plugin send `/stats /recent /search /recall /write` to the configured URL.
+- Memories and rules stay on this machine; the rules repository never pushes and never fetches.
+- The panel/API is loopback-only by default; write endpoints require JSON and same-origin, rejecting cross-site simple requests.
+- Logs record keys, numbers, commits and traces, not rule bodies or credentials.
 
-## 限制
+## Limits
 
-- 只提供 DSH Web 客户端面板；没有独立移动端。
-- 召回超时/失败 fail-open，不会阻塞对话，但该轮没有记忆注入。
-- 全局规则依赖 `AGENTS.md` 摘要；已有文件但没有管理块时不会追加（避免改用户资产）。
-- `rules.llm=false` 时，合并/冲突候选需要面板改写；模型只改措辞，不直接落盘。
-- Node 内置 SQLite 仍是实验特性；数据库与规则仓都建议纳入灾备。
+- Web panel only; no separate mobile client.
+- Recall fails open: a timeout or error never blocks chat, but that turn has no memory injection.
+- Global rules depend on the `AGENTS.md` digest; an existing file without markers is not modified.
+- With `rules.llm=false`, merge/conflict candidates need a manual rewrite in the panel. The model only rewords; it never writes directly.
+- Node's built-in SQLite is still experimental; include the database and rules repository in backups.
 
-## 开发与测试
+## Development and tests
 
 ```bash
 cd dsh-whale-memory
@@ -85,13 +85,17 @@ node scripts/check.mjs      # contract gate
 node scripts/i18n-check.mjs # zh/en/ja locale keys
 ```
 
-干净 DSH 安装验收：`node ~/ops/dsh-plugin-clean-install-test.mjs`（临时 `DSH_HOME`，whale/persona/both）。
+Clean DSH install proof: `node ~/ops/dsh-plugin-clean-install-test.mjs` (temporary `DSH_HOME`, whale/persona/both).
 
-## 迁移与故障
+## Migration and failure handling
 
-- 旧库迁移、回滚：见 `docs/MIGRATION.md` 与 `docs/DETAIL.md`。
-- 规则仓损坏：文件仍是真源；`.git` 只 `mv` 到 `.git.broken-<ts>` 后重 init，规则/manifest 由文件重建。
-- 面板显示 git 黄/红时，规则读写仍可用；历史/diff 走本地快照。
+- Legacy migration and rollback: see `docs/MIGRATION.md` and `docs/DETAIL.en.md`.
+- Broken rules repository: files remain the source of truth; move `.git` to `.git.broken-<ts>` and re-init, then rebuild the manifest from files.
+- With a yellow/red git status, rule reads/writes still work; history and diff use local snapshots.
+
+## Repository
+
+<https://github.com/xkshct198570/dsh-whale-memory> · Issues and releases: GitHub Releases.
 
 ## License
 

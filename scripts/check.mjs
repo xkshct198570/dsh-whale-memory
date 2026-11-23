@@ -273,21 +273,20 @@ gate('E8', () => {
 // ---------------------------------------------------------------------------
 // E9 docs/DETAIL.md + preview.svg
 // ---------------------------------------------------------------------------
-gate('E9', () => {
+/** 单份详情文档：首行特性图 + 包内 SVG 安全/尺寸检查；返回问题列表。 */
+function detailProblems(detail) {
   const r = []
-  const detail = 'docs/DETAIL.md'
   if (!isFile(detail)) return [`${detail} 不存在（详情页必需）`]
   const md = read(detail)
   const imgs = [...md.matchAll(/!\[[^\]]*\]\(([^)\s]+)[^)]*\)/g)]
   if (imgs.length !== 1) r.push(`${detail} 必须恰好一行图，实际 ${imgs.length} 处图片引用`)
   const target = imgs[0]?.[1]
   if (!target) return r
-  if (/^(https?:)?\/\//i.test(target) || target.startsWith('/')) r.push(`详情图必须是包内相对路径，实际 ${target}`)
+  if (/^(https?:)?\/\//i.test(target) || target.startsWith('/')) r.push(`${detail} 图片必须是包内相对路径，实际 ${target}`)
   const svgPath = join('docs', target)
   if (!target.startsWith('docs/') && !isFile(svgPath)) return [...r, `${svgPath} 不存在`]
   const svgRel = target.startsWith('docs/') ? target : svgPath
   if (!isFile(svgRel)) return [...r, `${svgRel} 不存在`]
-
   const svg = read(svgRel)
   const vb = svg.match(/\bviewBox\s*=\s*['"]([^'"]+)['"]/)
   const width = svg.match(/\bwidth\s*=\s*['"]([\d.]+)(?:px)?['"]/)
@@ -305,6 +304,25 @@ gate('E9', () => {
   if (/<(?:animate|animateTransform|animateMotion|set)[\s>]/.test(svg)) r.push(`${svgRel} 含动画元素（详情图禁动画）`)
   const noNs = svg.replace(/xmlns(?::\w+)?\s*=\s*['"][^'"]+['"]/g, '')
   if (/(?:href|src)\s*=\s*['"](?:https?:)?\/\//i.test(noNs)) r.push(`${svgRel} 含外链资源`)
+  return r
+}
+
+gate('E9', () => {
+  const r = []
+  const files = pkg.files || []
+  for (const detail of ['docs/DETAIL.en.md', 'docs/DETAIL.zh.md']) r.push(...detailProblems(detail))
+  for (const need of REQUIRED_FILES) if (!files.includes(need)) r.push(`files 必含 ${need}`)
+  for (const banned of BANNED_FILES) if (files.includes(banned)) r.push(`files 不得含 ${banned}`)
+  for (const entry of files) {
+    if (entry.startsWith('/') || entry.includes('..')) r.push(`files 条目必须是包内相对路径：${entry}`)
+    else if (!entryNonEmpty(entry)) r.push(`files 条目缺失/空：${entry}`)
+  }
+  if (!isFile('lib/client.js') || statSync(join(root, 'lib/client.js')).size === 0) {
+    r.push('lib/client.js（构建产物）必须入库且非空')
+  }
+  if (isDir('docs') && readdirSync(join(root, 'docs')).filter((x) => x !== '.gitkeep').length === 0) {
+    r.push('docs 目录为空（DETAIL + preview.svg 是上架硬门）')
+  }
   return r
 })
 

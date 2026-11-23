@@ -2,7 +2,7 @@
   "meta": {
     "title": "鲸忆记忆中枢",
     "description": "本地长期记忆中枢：把重要事实/规则存进本机 SQLite，对话前按身份召回并注入；面板可查、改、审核写入。默认不发任何外部请求；只有把后端切到 http/hybrid 时，才向配置的 URL 发 /stats /recent /search /recall /write /version。关掉插件＝不再召回/写入，库留在 ~/.dsh/whale-memory。；规则（铁律）以 ~/.dsh/rules 的 Markdown 为真源，git 版本化，提案经你确认后写入，数据库只做检索镜像。",
-    "detail": "docs/DETAIL.md"
+    "detail": "docs/DETAIL.zh.md"
   },
   "tab.overview": "概览",
   "tab.memory": "记忆库",
