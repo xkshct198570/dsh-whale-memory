@@ -821,5 +821,7 @@
   "err.tombstone_failed": "墓碑写入失败，彻底删除未执行（规则文件仍在）",
   "err.unprocessable": "请求无法处理（参数或状态不合法）",
   "err.server_error": "服务端处理失败，请稍后重试或查看日志",
-  "rules.proposalNumberAdjusted": "编号已顺延：#{from} → #{to}"
+  "rules.proposalNumberAdjusted": "编号已顺延：#{from} → #{to}",
+  "rules.proposalSemantic": "语义稿",
+  "rules.proposalRefining": "提炼中"
 }

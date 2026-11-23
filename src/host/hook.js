@@ -25,6 +25,7 @@ import { judgeReply } from '../core/adoption.js'
 import { listRules } from '../core/rule-store.js'
 import { isRuleStatement } from '../core/rules.js'
 import { agentsPathOf, fileHasMarkers } from '../core/rule-render.js'
+import { refineProposal } from '../core/rule-refine.js'
 import {
   buildProposalAskLine,
   confirmPendingForSession,
@@ -503,6 +504,24 @@ export function installHook(ctx, {
         if (entry && Date.now() < entry.exp) entry.text = `${entry.text}\n${line}`
         else cache.set(sid, { text: line, exp: Date.now() + CACHE_TTL_MS })
         log(`[whale-memory] rules proposal id=${created.proposal.id} relation=${created.proposal.relation?.relation}`)
+        // 语义提炼（R9-22）：rules.llm=true 时后台润色一次；不阻塞本轮、失败保留规则稿。
+        if (bool(config?.rules?.llm, false)) {
+          setImmediate(() => {
+            if (disposed) return
+            refineProposal({
+              id: created.proposal.id,
+              rulesDir: resolveRuleRoot('', config),
+              config,
+              getLlm: () => (typeof ctx?.get === 'function' ? ctx.get('llm') : null),
+              getSelection: () => (typeof ctx?.get === 'function' ? ctx.get('agentDefaultModel')?.currentSelection?.() : null),
+              log,
+            }).then((out) => {
+              if (out && out.state === 'failed') log(`[whale-memory] rules proposal refine skipped id=${created.proposal.id} code=${out.code || '-'}`)
+            }).catch((err) => {
+              log(`[whale-memory] rules proposal refine fail-open: ${err?.name || err?.message || err}`)
+            })
+          })
+        }
       } catch (err) {
         log(`[whale-memory] rules proposal fail-open: ${err?.name || err?.message || err}`)
       }

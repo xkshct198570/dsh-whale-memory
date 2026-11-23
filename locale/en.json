@@ -821,5 +821,7 @@
   "err.tombstone_failed": "tombstone write failed; permanent delete did not run (the rule file is still there)",
   "err.unprocessable": "The request cannot be processed (invalid parameters or state)",
   "err.server_error": "Server-side failure; retry shortly or check the logs",
-  "rules.proposalNumberAdjusted": "Number adjusted: #{from} → #{to}"
+  "rules.proposalNumberAdjusted": "Number adjusted: #{from} → #{to}",
+  "rules.proposalSemantic": "semantic draft",
+  "rules.proposalRefining": "refining"
 }

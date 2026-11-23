@@ -774,13 +774,13 @@ export function compileStructured(text, signals = {}, opts = {}) {
 
   const built = buildBody(raw, exceptions, modality)
   if (!built.ok) return built
-  const scopeDisplay = !scope || scope === 'global' ? '共享' : scope
-  const compiledText = `【规则·${domain}】${built.body}${built.exceptionPart}；作用域：${scopeDisplay}。`
-  if (chars(compiledText) > RULE_BODY_MAX) {
-    return { ok: false, error: 'too_long', detail: { chars: chars(compiledText) } }
+  // 规则正文只放可执行语义：不加「【规则·域】」前缀、不写「作用域：…」后缀（scope 在 front/注入前缀里）。
+  // 旧模板会把候选正文变成“带户口本的散文”，既难读也让守卫/摘要多一层噪声。
+  const ruleText = `${built.body}${built.exceptionPart}`.trim()
+  if (chars(ruleText) > RULE_BODY_MAX) {
+    return { ok: false, error: 'too_long', detail: { chars: chars(ruleText) } }
   }
   if (isIron && VAGUE_RE.test(built.body)) return { ok: false, error: 'vague_word', detail: { body: built.body } }
-  // 指令形态只看正文：模板头「【规则·域】」会破坏句首祈使判定（把「别…」挤到非句首）。
   const bodySignals = detectSignals(built.body)
   if (bodySignals.rejectReason === 'privacy') return { ok: false, error: 'privacy' }
   if (!bodySignals.imperative) {
@@ -788,7 +788,7 @@ export function compileStructured(text, signals = {}, opts = {}) {
   }
 
   const slots = { action: analysis.action, object: analysis.object }
-  const intact = mainClauseIntact(slots, compiledText)
+  const intact = mainClauseIntact(slots, ruleText)
   if (!intact.ok) {
     return {
       ok: false,
@@ -848,8 +848,8 @@ export function compileStructured(text, signals = {}, opts = {}) {
     title: titleOfRuleDraft(slots.action, slots.object, built.body),
     conditions,
     exceptions,
-    text: compiledText,
-    chars: chars(compiledText),
+    text: ruleText,
+    chars: chars(ruleText),
     // 域不是 front matter 字段，但关系判定/面板需要它；放在草案上仅作运行时视图。
     domain,
   }

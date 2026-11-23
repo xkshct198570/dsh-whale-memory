@@ -403,6 +403,12 @@ export function createProposal({
     needsRewrite: REWRITE_RELATIONS.includes(relation.relation),
     cooling,
     summary: summaryOf(draft, relation.relation),
+    // 语义提炼状态：默认规则路径已在编译期完成；rules.llm=true 时候选创建后后台再润色一次。
+    refine: {
+      state: cfgBool(config?.rules?.llm, false) ? 'pending' : 'rule',
+      by: 'rule',
+      at: isoNow(now),
+    },
     applied: null,
     needsManual: null,
   }
@@ -740,7 +746,7 @@ function rollbackPlan(base, plan, historyBefore, { exec = null, gitAvailable = f
 
 
 /** 取 LLM 合并回包文本；兼容 chat 与 stream 两种宿主接口。 */
-async function callLlmMerge({ llm, prompt, selection = null, log = () => {} }) {
+export async function callLlmMerge({ llm, prompt, selection = null, log = () => {} }) {
   const messages = [
     { role: 'system', content: [{ type: 'text', text: prompt.system }] },
     { role: 'user', content: [{ type: 'text', text: prompt.user }] },

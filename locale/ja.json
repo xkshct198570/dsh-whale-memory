@@ -821,5 +821,7 @@
   "err.tombstone_failed": "墓碑の書き込みに失敗したため、完全削除は実行されていません（ルールファイルは残っています）",
   "err.unprocessable": "リクエストを処理できません（パラメータまたは状態が不正）",
   "err.server_error": "サーバー側の処理に失敗しました。後で再試行するかログを確認してください",
-  "rules.proposalNumberAdjusted": "番号を繰り下げました：#{from} → #{to}"
+  "rules.proposalNumberAdjusted": "番号を繰り下げました：#{from} → #{to}",
+  "rules.proposalSemantic": "意味稿",
+  "rules.proposalRefining": "整理中"
 }
