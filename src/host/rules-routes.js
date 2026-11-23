@@ -30,14 +30,18 @@
  * Why 单独成文件：路由文件已 35K，再塞规则读写会继续膨胀；把 payload 纯函数独立出来
  * 还能脱 HTTP 做契约测试（不起真服务器）。
  */
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, unlinkSync } from 'node:fs'
+import { join, relative as pathRelative } from 'node:path'
 import { readJson, sendJson, isWriteMethod, writeRequestProblem } from './http-kit.js'
+import { statusOf } from '../shared/error-table.mjs'
 import { value } from './config-values.js'
 import { detectGit, gitRequired, refreshGit } from './git-detector.js'
 import {
-  DIFF_LINE_LIMIT, computeManifest, createRule, defaultRuleRoot, diffLines, ensureRuleRepo, fileRuleNumbers, gitLog,
-  isValidRuleKey, listRules, purgeRule, reactivateRule, readHistory, readManifest, readRule,
-  readTombstones, resolveRevision, retireRule, revertRule, updateRule,
+  DIFF_LINE_LIMIT, MANIFEST_FILE, TXN_DIR, computeManifest, createRule,
+  defaultRuleRoot, diffLines, durableWriteFile, ensureRuleRepo, fileRuleNumbers, gitLog,
+  isValidRuleKey, listRules, normalizeRuleDoc, parseRuleDocument, purgeRule, reactivateRule,
+  readHistory, readManifest, readRule, readRuleSource, readTombstones, regenerateManifest,
+  resetGitIndex, resolveRevision, retireRule, revertRule, updateRule, writeHistorySnapshot, writeTombstone,
 } from '../core/rule-store.js'
 import { importLegacyRule, mirrorRules, mirrorStatus } from '../core/rule-mirror.js'
 import { chainIssues, resolveChain } from '../core/rule-reconcile.js'
@@ -85,7 +89,8 @@ export function rulesListPayload({ root = '', config = {}, detect = detectGit, f
   const dir = root || resolveRulesRoot(config)
   const list = listRules(dir)
   // 墓碑必须参与列表的 nextNumber：purge 过的编号不复用，列表页的"下一个编号"不能回落。
-  const manifest = computeManifest(list.rules, readManifest(dir)?.retired, fileRuleNumbers(dir))
+  // R9-20：墓碑以 retired/*.json 为真源；manifest 丢失/陈旧不得让 nextNumber 回落。
+  const manifest = computeManifest(list.rules, readTombstones(dir), fileRuleNumbers(dir))
   const rules = list.rules.map((doc) => ({
     key: textOf(doc.front.key),
     type: textOf(doc.front.type),
@@ -357,10 +362,39 @@ export function rulesHealthPayload({ root = '', config = {}, detect = detectGit 
     }
   }
 
+  // ⑤ 未完成/恢复失败的事务：`.txn` 非空即红（恢复器失败会保留锚点并写 failures）。
+  //    成功恢复的记录在 `.txn/.recovered.jsonl`，只作证据展示，不算失败。
+  const txnDir = join(dir, TXN_DIR)
+  const pendingTxns = []
+  try {
+    for (const name of readdirSync(txnDir)) {
+      if (!name.endsWith('.json')) continue
+      const id = name.slice(0, -'.json'.length)
+      try {
+        const parsed = JSON.parse(readFileSync(join(txnDir, name), 'utf8'))
+        push('txn_pending', {
+          id, op: textOf(parsed?.op || 'apply'),
+          failures: Array.isArray(parsed?.failures) ? parsed.failures : [],
+        })
+        pendingTxns.push(id)
+      } catch {
+        push('txn_unreadable', { id })
+        pendingTxns.push(id)
+      }
+    }
+  } catch { /* `.txn` 不存在=没有待恢复项 */ }
+  let lastRecovery = null
+  try {
+    const lines = String(readFileSync(join(txnDir, '.recovered.jsonl'), 'utf8')).split('\n').filter(Boolean)
+    const last = lines[lines.length - 1]
+    if (last) lastRecovery = JSON.parse(last)
+  } catch { /* 没有恢复记录 */ }
+
   return {
     ok: failures.length === 0,
     dir,
     failures,
+    txns: { pending: pendingTxns, lastRecovery },
     counts: {
       rules: list.rules.length,
       errors: list.errors.length,
@@ -1065,7 +1099,14 @@ export function deletePayload({
   if (!allowedModes.includes(mode)) {
     return { ok: false, error: 'invalid_mode', detail: { mode, allowed: allowedModes } }
   }
-  const before = readRule(dir, key)
+  // purge 是「删除」而不是写：缺/错 confirmKey 必须在任何落盘动作（建仓/墓碑/删文件）之前拒绝。
+  // 只认整句 key（body.confirmKey === key），面板的 DangerButton 也按同一口径判。
+  if (mode === 'purge' && textOf(body?.confirmKey) !== key) {
+    return { ok: false, error: 'confirm_required', detail: { mode, key } }
+  }
+  // purge 只做 readRuleSource + 解析/快照，不跑写入守卫：手改写坏的规则（正文非指令形态、
+  // 超长、带 HTML 注释标记）仍必须能删，否则脏文件永远删不掉。停用/恢复仍走全量校验。
+  const before = mode === 'purge' ? readRuleForPurge(dir, key) : readRule(dir, key)
   if (!before.ok) return { ok: false, error: before.error, detail: before.detail }
   // 与 update 同口径：首次写前建好规则仓/首个 commit（新目录否则提交不上）。
   const ensured = ensureRuleRepo({ root: dir, git: git !== false, ...(exec ? { exec } : {}) })
@@ -1119,6 +1160,44 @@ export function deletePayload({
 }
 
 /**
+ * 规则文件落点（purge 前宽松读取用）：正式规则在根目录，候选在 proposals/。
+ * @param {string} dir @param {string} key
+ * @returns {string} 文件路径；不存在返回 ''
+ */
+function ruleFileFor(dir, key) {
+  for (const file of [join(dir, `${key}.md`), join(dir, 'proposals', `${key}.md`)]) {
+    if (existsSync(file)) return file
+  }
+  return ''
+}
+
+/**
+ * purge 前的宽松读取：`readRuleSource` + 解析 + key 对齐，不做正文/写入守卫校验。
+ *
+ * Why 与 `readRule` 分开：删除动作面对的是"已经被手改写坏、正需要删掉"的文件；
+ * 用写路径的校验当读取闸，会让坏文件永久占号且删不掉（架构书 §7.1 实测 invalid_rule 422）。
+ *
+ * @param {string} dir @param {string} key
+ * @returns {{ok:boolean,rule?:object,error?:string,detail?:any}}
+ */
+function readRuleForPurge(dir, key) {
+  const file = ruleFileFor(dir, key)
+  if (!file) return { ok: false, error: 'rule_not_found' }
+  const source = readRuleSource(file)
+  if (!source.ok) return { ok: false, error: source.error }
+  const parsed = parseRuleDocument(source.text)
+  if (!parsed.ok) return { ok: false, error: 'invalid_rule', detail: { parse: parsed.error } }
+  const normalized = normalizeRuleDoc(parsed.front, parsed.text)
+  if (normalized.front.key !== String(key)) {
+    return { ok: false, error: 'key_mismatch', detail: { key: String(key), frontKey: normalized.front.key, file } }
+  }
+  return {
+    ok: true,
+    rule: { front: normalized.front, text: normalized.text, bodyStart: parsed.bodyStart, file },
+  }
+}
+
+/**
  * purge 分支（deletePayload 内部）：彻底删除 + 镜像/AGENTS/审计。
  *
  * Why 后处理照旧走 `applyPostSteps`：文件没了，`mirrorRules` 会把孤儿镜像行归档为
@@ -1131,9 +1210,10 @@ export function deletePayload({
 function purgePayload({
   dir, key, config, backend, before, body, mirror, renderAgents, git, exec, log, now,
 }) {
-  const purged = purgeRule({
+  // purge 是删除不是写入：不跑正文守卫（手改写坏的规则也必须删得掉），只做宽松解析。
+  let purged = purgeRule({
     root: dir, key, identity: identityOf(body), traceId: textOf(body?.traceId), now,
-  }, { git, exec })
+  }, { git, exec, skipValidation: true })
   if (!purged.ok) return { ok: false, error: purged.error, detail: purged.detail }
   const post = applyPostSteps({ dir, config, backend, mirror, renderAgents, log })
   const manifest = readManifest(dir) || {}
@@ -1294,31 +1374,16 @@ function statusQuery(req) {
 }
 
 /**
- * 错误码 → HTTP 状态（面板按 status/error 决定文案；语义化而不是一律 500）。
+ * 错误码 → HTTP 状态：单一真源在 `src/shared/error-table.mjs`。
+ *
+ * 为什么去掉本地 if 链：状态码曾在路由与 client 各存一份，422/500 被折叠成
+ * unknown_error、payload_too_large 落 400。查表 + 未登记码回退 400（原码仍透出）。
+ *
  * @param {string} code
  * @returns {number}
  */
 function statusForError(code) {
-  if (code === 'proposal_not_found' || code === 'rule_not_found' || code === 'rev_not_found') return 404
-  if (code === 'rules_disabled' || code === 'render_disabled' || code === 'git_required'
-    || code === 'cross_origin_denied') return 403
-  if (code === 'plan_unavailable' || code === 'restore_unavailable') return 501
-  if (code === 'proposal_not_pending' || code === 'rule_locked') return 409
-  // 计划 CAS/墓碑/目标冲突都是并发语义：面板重试前必须先重新 plan。
-  if (code === 'plan_hash_mismatch' || code === 'plan_stale' || code === 'number_retired'
-    || code === 'target_conflict' || code === 'target_missing' || code === 'affected_missing') return 409
-  if (code === 'lock_failed') return 503
-  if (code === 'number_exhausted' || code === 'txn_failed') return 422
-  // 幂等动作的"没动"是冲突语义：已停用再停用 / 未停用却恢复 / 同 key 重建，都不该按 400 报。
-  if (code === 'already_retired' || code === 'not_retired' || code === 'duplicate_rule') return 409
-  if (code === 'diff_too_large') return 413
-  if (code === 'unsupported_media_type') return 415
-  if (code === 'rule_guard_failed' || code === 'needs_manual' || code === 'llm_unavailable'
-    || code === 'llm_unparseable' || code === 'llm_error' || code === 'commit_failed'
-    || code === 'write_failed' || code === 'affected_write_failed' || code === 'invalid_rule'
-    || code === 'invalid_draft') return 422
-  if (code === 'invalid_json' || code === 'payload_too_large') return 400
-  return 400
+  return statusOf(code)
 }
 
 /**
@@ -1541,7 +1606,8 @@ export async function handleRules({
 
   if (p === renderPath) {
     if (req.method !== 'POST') { sendMethodNotAllowed(res, 'POST'); return true }
-    await readJson(req)
+    const body = await readJson(req, 64 * 1024, { allowEmpty: true })
+    if (!body.ok) { sendJson(res, body.status, { ok: false, error: body.error }); return true }
     const payload = afterWrite(renderAgentsPayload({ config, log }))
     // no_markers/duplicate_markers 是幂等「没动」，200 带 ok:false；闸门类错误才按 403。
     sendJson(res, payload.error ? statusForError(textOf(payload.error)) : 200, payload)
@@ -1550,8 +1616,9 @@ export async function handleRules({
 
   if (p === rebuildPath) {
     if (req.method !== 'POST') { sendMethodNotAllowed(res, 'POST'); return true }
-    // 无载荷动作：仍要排空 body，避免 keep-alive 连接残留请求体；空 body 不算错误。
-    await readJson(req)
+    // 无载荷动作：空 body 合法（allowEmpty），但 413/坏 JSON 必须当场拒绝，不能静默继续。
+    const body = await readJson(req, 64 * 1024, { allowEmpty: true })
+    if (!body.ok) { sendJson(res, body.status, { ok: false, error: body.error }); return true }
     const payload = rebuildMirrorPayload({ config, backend, detect, log })
     sendJson(res, payload.ok ? 200 : statusForError(textOf(payload.error)), payload)
     return true

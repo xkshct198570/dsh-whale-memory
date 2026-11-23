@@ -1090,6 +1090,7 @@ test('POST /rules/delete purge：删文件、墓碑编号不复用、镜像归�
   const res = await callWith(fx.handler, 'POST', '/whale-memory/api/rules/delete', {
     key: 'iron-rule-17',
     mode: 'purge',
+    confirmKey: 'iron-rule-17',
     identity: { userId: 'u9' },
   })
   assert.equal(res.status, 200, JSON.stringify(res.body))
@@ -1155,6 +1156,7 @@ test('POST /rules/delete purge：删文件、墓碑编号不复用、镜像归�
   const purgedAgain = await callWith(fx.handler, 'POST', '/whale-memory/api/rules/delete', {
     key: 'iron-rule-18',
     mode: 'purge',
+    confirmKey: 'iron-rule-18',
   })
   assert.equal(purgedAgain.status, 200, JSON.stringify(purgedAgain.body))
   assert.deepEqual(purgedAgain.body.retiredNumbers, [17, 18])
@@ -1164,6 +1166,7 @@ test('POST /rules/delete purge：删文件、墓碑编号不复用、镜像归�
   const again = await callWith(fx.handler, 'POST', '/whale-memory/api/rules/delete', {
     key: 'iron-rule-18',
     mode: 'purge',
+    confirmKey: 'iron-rule-18',
   })
   assert.equal(again.status, 404)
   assert.equal(again.body.error, 'rule_not_found')
@@ -1176,6 +1179,7 @@ test('POST /rules/delete purge：删文件、墓碑编号不复用、镜像归�
   const retiredPurged = await callWith(fx.handler, 'POST', '/whale-memory/api/rules/delete', {
     key: 'rule-3',
     mode: 'purge',
+    confirmKey: 'rule-3',
   })
   assert.equal(retiredPurged.status, 200, JSON.stringify(retiredPurged.body))
   assert.equal(nodeFs.existsSync(join(fx.dir, 'rule-3.md')), false)
@@ -1239,7 +1243,7 @@ test('deletePayload purge：单 commit 文案 rule: purge <key> (#n)（注入 ex
     root: fx.dir,
     config: fx.config,
     backend: fx.backend,
-    body: { key: created.key, mode: 'purge' },
+    body: { key: created.key, mode: 'purge', confirmKey: created.key },
     exec: fake.exec,
   })
   assert.equal(purged.ok, true, purged.error)

@@ -241,7 +241,9 @@ test('applyProposal：new 直接落盘（编号/文件/accepted/镜像/渲染/�
     renderAgents: (args) => { renders.push(args); return { ok: true, changed: true, count: 1 } },
   })
   assert.equal(result.ok, true, JSON.stringify(result))
-  assert.equal(result.applied.key, made.proposal.draft.key)
+  // R9-20 ④ 语义变更：机器起草的 iron-rule 落盘 key 由 plan 按最终编号盖成 iron-rule-<n>，
+  // 草案里的临时 key（rule-<domain>-<hash8>）只用于关系判定，不再当文件名。
+  assert.equal(result.applied.key, `iron-rule-${result.applied.number}`)
   assert.equal(result.applied.number, made.proposal.draft.number)
   assert.equal(result.applied.commit, null, 'git:false 时不得报 commit')
   assert.equal(result.applied.mirror.ok, true)
@@ -427,7 +429,8 @@ test('applyProposal：commit 失败 → 回滚已写文件并返回 commit_faile
   assert.equal(result.ok, false)
   assert.equal(result.error, 'commit_failed')
   assert.equal(result.rolledBack, true)
-  assert.equal(existsSync(join(root, `${made.proposal.draft.key}.md`)), false, '回滚必须删掉新文件')
+  // 落盘文件名是 plan 按编号盖的 iron-rule-<n>.md；回滚必须删掉它（检查草案临时 key 会假绿）。
+  assert.equal(existsSync(join(root, `iron-rule-${made.proposal.draft.number}.md`)), false, '回滚必须删掉新文件')
   const manifest = JSON.parse(readFileSync(join(root, 'manifest.json'), 'utf8'))
   assert.equal(manifest.total, 0, 'manifest 必须回到初始态')
   // 候选 accepted 只在 commit 成功后写：commit 失败必须仍是 pending（可重试）。
@@ -448,7 +451,8 @@ test('applyProposal：编号被抢占 → 锁内复核后自动顺延（不复�
   assert.notEqual(result.applied.number, taken.rule.front.number, '不得复用被占编号')
   const numbers = listRules(root).rules.map((doc) => Number(doc.front.number)).filter((n) => n > 0)
   assert.equal(new Set(numbers).size, numbers.length, '编号必须唯一')
-  assert.equal(existsSync(join(root, `${made.proposal.draft.key}.md`)), true)
+  // 落盘 key/文件名由 plan 按顺延后的编号盖成，不再是提案草案的临时 key。
+  assert.equal(existsSync(join(root, `${result.applied.key}.md`)), true)
 })
 
 test('applyProposal：requireGit=true 且 git 不可用 → git_required（不写文件）', async (t) => {
@@ -511,7 +515,7 @@ test('confirmPendingForSession：无 pending / 无 nonce 不动状态；收录 <
   for (const query of ['确认', '好', '可以', '好，那删掉吧']) {
     const got = await confirmPendingForSession({ sessionId: 's1', query, rulesDir: root, config: { rules: {} } })
     assert.equal(got.code, 'no_confirm', query)
-    assert.equal(existsSync(join(root, `${made.proposal.draft.key}.md`)), false, query)
+    assert.equal(existsSync(join(root, `iron-rule-${made.proposal.draft.number}.md`)), false, query)
   }
   // 非本会话 nonce（面板里另一条候选）不得顶替：必须拒绝且不动文件。
   assert.equal((await confirmPendingForSession({
@@ -519,15 +523,15 @@ test('confirmPendingForSession：无 pending / 无 nonce 不动状态；收录 <
   })).code, 'nonce_mismatch')
   const applied = await confirmPendingForSession({
     sessionId: 's1',
-    query: ` 收录  ${nonce.toUpperCase()} `, // 空格/大小写容忍
+    query: ` 收录  P${nonce.slice(1)} `, // 空格与 p/HEX 大小写容忍（返回统一小写 nonce）
     rulesDir: root,
     config: { rules: {} },
     identity: IDENTITY,
     git: false,
   })
   assert.equal(applied.ok, true, JSON.stringify(applied))
-  assert.equal(applied.applied.key, made.proposal.draft.key)
-  assert.equal(existsSync(join(root, `${made.proposal.draft.key}.md`)), true)
+  assert.equal(applied.applied.key, `iron-rule-${applied.applied.number}`)
+  assert.equal(existsSync(join(root, `${applied.applied.key}.md`)), true)
   // 确认成功后映射清空：同一句话不会再重复收录。
   const again = await confirmPendingForSession({ sessionId: 's1', query: `收录 ${nonce}`, rulesDir: root, config: { rules: {} }, git: false })
   assert.equal(again.code, 'no_pending')
@@ -541,7 +545,7 @@ test('buildProposalAskLine：提示行必须带 nonce；confirmNonceOf 只认 �
   assert.match(line, /【规则候选】/)
   assert.ok(line.includes(`收录 ${nonce}`), line)
   assert.equal(confirmNonceOf(`收录${nonce}`), nonce)
-  assert.equal(confirmNonceOf(`收录 ${nonce.toUpperCase()}`), nonce)
+  assert.equal(confirmNonceOf(`收录 P${nonce.slice(1)}`), nonce)
   for (const q of ['好', '可以', '确认', '先不收录 p12345678', '收录', '']) {
     assert.equal(confirmNonceOf(q), '', q)
   }

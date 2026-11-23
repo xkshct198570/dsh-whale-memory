@@ -149,9 +149,24 @@ export function runRulesSelfHeal({ config, backend, log = () => {}, store = rule
       if (result.recovered && result.recovered.recovered) {
         log(`[whale-memory] rules txn recovered id=${result.recovered.id || '-'}`)
       }
+      if (result.recovered && result.recovered.failed) {
+        // 恢复失败：.txn 已保留，health 会红；此时继续播种/镜像/摘要会把混合态固化，
+        // 必须停在恢复前状态，等下一次启动或人工处置。
+        log('[whale-memory] rules txn recovery failed：跳过播种/镜像/摘要（health 红）')
+        return { ...result, skipped: 'txn_recovery_failed' }
+      }
     } catch (err) {
       log(`[whale-memory] rules txn recover fail-open: ${err?.message || err}`)
     }
+  }
+
+  // 0.5) 恢复后无条件重建 manifest：它是生成物，幂等；purge 的“文件已删/manifest 未重建”
+  //      崩溃窗口靠这一步收敛（health 不再永久红，下一次写入也不用先踩一次 ensure）。
+  try {
+    const rebuilt = store.regenerateManifest(dir)
+    if (!rebuilt.ok) log(`[whale-memory] rules manifest rebuild failed: ${rebuilt.error || 'unknown'}`)
+  } catch (err) {
+    log(`[whale-memory] rules manifest rebuild fail-open: ${err?.message || err}`)
   }
 
   // 1) 默认铁律播种（后台；播种本身不阻塞 init）。

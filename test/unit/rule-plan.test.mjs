@@ -4,10 +4,10 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { writeRule } from '../../src/core/rule-store.js'
+import { updateRule, writeRule, writeTombstone } from '../../src/core/rule-store.js'
 import { createProposal } from '../../src/core/rule-proposal.js'
 import { buildApplyPlan, checkFrontConsistency } from '../../src/core/rule-plan.js'
 
@@ -262,12 +262,69 @@ test('buildApplyPlan：铁律编号打满 1–999 → number_exhausted（绝不�
   const root = freshRoot(t)
   const made = createProposal({ text: '以后都别删源文件', identity: IDENTITY, rulesDir: root, config: { rules: {} } })
   // 墓碑占满 1–999（模拟编号耗尽）；草案号缺失 → 只能走 nextFreeNumber，必须返回 null。
-  const retired = []
-  for (let n = 1; n <= 999; n += 1) retired.push({ key: `iron-rule-${n}`, number: n, at: '2026-11-22T00:00:00.000Z' })
-  writeFileSync(join(root, 'manifest.json'), `${JSON.stringify({ retired }, null, 2)}\n`)
+  // R9-20 口径变更：墓碑真源是 retired/*.json，不是 manifest.retired（后者禁止当取号输入）。
+  mkdirSync(join(root, 'retired'), { recursive: true })
+  for (let n = 1; n <= 999; n += 1) {
+    writeFileSync(
+      join(root, 'retired', `iron-rule-${n}.json`),
+      `${JSON.stringify({ key: `iron-rule-${n}`, number: n, numbers: [n], at: '2026-11-22T00:00:00.000Z', reason: 'purge' })}\n`,
+    )
+  }
   const proposal = { ...made.proposal, draft: { ...made.proposal.draft, number: 0 } }
   const got = buildApplyPlan({ proposal, rulesDir: root, config: { rules: {} }, decisions: {} })
   assert.equal(got.ok, false)
   assert.equal(got.error, 'number_exhausted')
   assert.equal(got.needsManual, true)
+})
+
+// ---------------------------------------------------------------------------
+// R9-20：affected_inactive / 墓碑闸 / plan 决定 iron-rule key
+// ---------------------------------------------------------------------------
+
+test('buildApplyPlan：受影响规则文件在盘但 status≠active → affected_inactive（附 status/path）', (t) => {
+  const root = freshRoot(t)
+  seed(root, { modality: 'must_not', exceptions: [] }, '源文件禁止删除。')
+  const made = createProposal({
+    text: '源文件必须保留，过程稿归档到临时目录', identity: IDENTITY, rulesDir: root, config: { rules: {} },
+  })
+  assert.equal(made.ok, true, made.code)
+  assert.equal(made.proposal.relation.relation, 'conflict')
+  const retired = updateRule({ root, key: 'rule-src-keep', patch: { status: 'retired' } }, { git: false })
+  assert.equal(retired.ok, true, JSON.stringify(retired))
+  const got = buildApplyPlan({ proposal: made.proposal, rulesDir: root, config: { rules: {} }, decisions: {} })
+  assert.equal(got.ok, false)
+  assert.equal(got.error, 'affected_inactive')
+  assert.equal(got.failures[0].code, 'affected_inactive')
+  assert.equal(got.failures[0].key, 'rule-src-keep')
+  assert.equal(got.failures[0].status, 'retired')
+  assert.match(got.failures[0].path, /rule-src-keep\.md$/, '必须给出仍在盘上的文件路径')
+})
+
+test('buildApplyPlan：删掉 manifest 后仍按墓碑拒绝 number_retired（manifest 不是取号输入）', (t) => {
+  const root = freshRoot(t)
+  assert.equal(writeRule(root, { front: frontOf({ key: 'iron-rule-1', type: 'iron-rule', number: 1, exceptions: [] }), text: '必须保留审计日志。' }, { git: false }).ok, true)
+  assert.equal(writeTombstone(root, { key: 'iron-rule-5', number: 5 }).ok, true)
+  rmSync(join(root, 'manifest.json'), { force: true })
+  const made = createProposal({ text: '以后都别删源文件', identity: IDENTITY, rulesDir: root, config: { rules: {} } })
+  assert.equal(made.ok, true, made.code)
+  assert.equal(made.proposal.draft.number, 7, '提案期编号必须含墓碑并跳过保留号 6（max(1,5)+1=6 → 7）')
+  // 伪造"提案拿到墓碑号"：plan 必须在锁内按墓碑拒绝，不论 manifest 是否存在。
+  const proposal = { ...made.proposal, draft: { ...made.proposal.draft, number: 5 } }
+  const got = buildApplyPlan({ proposal, rulesDir: root, config: { rules: {} }, decisions: {} })
+  assert.equal(got.ok, false)
+  assert.equal(got.error, 'number_retired')
+  assert.equal(got.failures[0].code, 'number_retired')
+})
+
+test('buildApplyPlan：机器起草 iron-rule 的 target key/path 由最终编号决定（iron-rule-<n>）', (t) => {
+  const root = freshRoot(t)
+  const made = createProposal({ text: '以后都别删源文件', identity: IDENTITY, rulesDir: root, config: { rules: {} } })
+  assert.equal(made.ok, true, made.code)
+  const got = buildApplyPlan({ proposal: made.proposal, rulesDir: root, config: { rules: {} }, decisions: {} })
+  assert.equal(got.ok, true, JSON.stringify(got.failures))
+  const { plan } = got
+  assert.equal(plan.target.key, `iron-rule-${plan.target.number}`)
+  const target = plan.files.find((file) => file.role === 'target')
+  assert.equal(target.key, plan.target.key)
+  assert.match(target.path, new RegExp(`/iron-rule-${plan.target.number}\\.md$`))
 })

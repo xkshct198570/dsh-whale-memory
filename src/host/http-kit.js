@@ -15,21 +15,49 @@ export function isLoopback(addr) {
 /** 本机 GUI 允许的 host 名（不含端口）。 */
 const LOCAL_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1'])
 
-/** Host 头 → 主机名：去端口、IPv6 去括号；空/非法返回 ''。 */
+/**
+ * Host 头 → 主机名：去端口、IPv6 去括号。
+ *
+ * 严格只返回「形态合法」的主机名，任何畸形（`[evil`、`[]`、`:8080`、userinfo、
+ * 未加括号的 IPv6、非数字端口）一律返回 ''。为什么不能宽松：历史实现把畸形 Host
+ * 也当成「空 Host」放行，DNS rebinding 页面就能带 `Host: [evil` 同源 GET 走规则全文。
+ *
+ * @param {unknown} value
+ * @returns {string} '' = 畸形/空
+ */
 function hostnameOf(value) {
   const raw = String(value ?? '').trim().toLowerCase()
   if (!raw) return ''
+  // userinfo（`user@host`）不是合法 Host 头；带 @ 一律按畸形拒绝。
+  if (raw.includes('@')) return ''
+  // 未加括号的 IPv6 只有本机回环 `::1` 可接受，其余（多冒号）按畸形。
+  if (raw === '::1') return '::1'
   if (raw.startsWith('[')) {
     const end = raw.indexOf(']')
-    return end > 0 ? raw.slice(1, end) : ''
+    if (end < 0) return ''
+    const name = raw.slice(1, end)
+    const rest = raw.slice(end + 1)
+    // `[::1]evil`、`[::1]8080` 都不是 Host 头合法形态。
+    if (rest && !/^:\d+$/.test(rest)) return ''
+    return name
   }
-  return raw.split(':')[0]
+  const parts = raw.split(':')
+  if (parts.length === 1) return parts[0]
+  if (parts.length === 2 && /^\d+$/.test(parts[1])) return parts[0]
+  return ''
 }
 
-/** 本机 Host 头：空头放行（curl 无 Host 的历史行为），只拒绝明确的外部 Host。 */
+/**
+ * 本机 Host 头：缺省/空串放行（curl 与无 Host 的本机客户端历史行为），
+ * 非空必须是本机名之一；畸形一律 false（见 `hostnameOf`）。
+ *
+ * @param {unknown} host
+ * @returns {boolean}
+ */
 export function isLocalHostName(host) {
-  const name = hostnameOf(host)
-  return !name || LOCAL_HOSTNAMES.has(name)
+  const raw = String(host ?? '').trim()
+  if (!raw) return true
+  return LOCAL_HOSTNAMES.has(hostnameOf(raw))
 }
 
 /**
@@ -86,8 +114,26 @@ export function sendJson(res, status, body) {
   res.end(text)
 }
 
-/** 读 JSON body，硬顶 maxBytes；返回 { ok, value } 或 { ok:false, status, error }。 */
-export async function readJson(req, maxBytes = 64 * 1024) {
+/**
+ * 读 JSON body，硬顶 maxBytes；返回 { ok, value } 或 { ok:false, status, error }。
+ *
+ * `Content-Length` 已知且超限时先 413 并 `req.resume()` 排空：不排空会让大体积请求
+ * 继续占着连接把字节喂给 socket（keep-alive 下污染下一次请求），且让客户端以为还能重试。
+ *
+ * `opts.allowEmpty`：无载荷端点（render-agents / rebuild-mirror）允许真空 body 返回
+ * `value:null`；但它仍必须检查返回值——413/其它 400 不能静默继续。
+ *
+ * @param {import('node:http').IncomingMessage} req
+ * @param {number} [maxBytes]
+ * @param {{allowEmpty?:boolean}} [opts]
+ * @returns {Promise<{ok:true,value:any}|{ok:false,status:number,error:string}>}
+ */
+export async function readJson(req, maxBytes = 64 * 1024, opts = {}) {
+  const declared = Number(req?.headers?.['content-length'])
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    req?.resume?.()
+    return { ok: false, status: 413, error: 'payload_too_large' }
+  }
   const chunks = []
   let size = 0
   for await (const chunk of req) {
@@ -95,7 +141,11 @@ export async function readJson(req, maxBytes = 64 * 1024) {
     if (size > maxBytes) return { ok: false, status: 413, error: 'payload_too_large' }
     chunks.push(chunk)
   }
-  if (!size) return { ok: false, status: 400, error: 'invalid_json' }
+  if (!size) {
+    return opts?.allowEmpty === true
+      ? { ok: true, value: null }
+      : { ok: false, status: 400, error: 'invalid_json' }
+  }
   try {
     return { ok: true, value: JSON.parse(Buffer.concat(chunks).toString('utf8')) }
   } catch {

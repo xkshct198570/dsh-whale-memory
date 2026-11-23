@@ -23,6 +23,7 @@ import { deriveWorkspace, resolveIdentity } from './identity.js'
 import { bool, num, value } from './config-values.js'
 import { judgeReply } from '../core/adoption.js'
 import { listRules } from '../core/rule-store.js'
+import { isRuleStatement } from '../core/rules.js'
 import { agentsPathOf, fileHasMarkers } from '../core/rule-render.js'
 import {
   buildProposalAskLine,
@@ -469,6 +470,8 @@ export function installHook(ctx, {
     const askMode = String(value(config?.rules?.askMode, 'panel+chat'))
     if (!askMode.includes('chat')) return
     if (chars(query) >= CONFIRM_QUERY_MAX) return
+    // R9-19 ②：提案闸先于信号检测。任务书/提问/多句长文不建候选，也不追加提示行。
+    if (!isRuleStatement(query)) return
     const run = () => {
       try {
         if (disposed) return

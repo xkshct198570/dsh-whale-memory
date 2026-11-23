@@ -266,8 +266,13 @@ function seedLocked({ base, defaults, marker, markerFile, fs, git, log, opts }) 
     return { ...baseResult, ok: true, skipped: 'tombstoned', seeded: 0, tombstoned: seeded.tombstoned, keys: adopted }
   }
   if (seeded.count === 0) {
+    // 全部失败：不写 marker（下轮重试）。因 manifest 写失败导致时明确回 manifest_failed，
+    // 让调用方/health 区分“存储坏了”与“规则内容坏了”。
+    const manifestFailure = seeded.invalid.some((item) => Array.isArray(item.errors)
+      && item.errors.some((error) => error?.code === 'manifest_failed'))
     return {
-      ...baseResult, ok: false, error: 'all_invalid', seeded: 0, skippedInvalid: seeded.invalid.length,
+      ...baseResult, ok: false, error: manifestFailure ? 'manifest_failed' : 'all_invalid',
+      seeded: 0, skippedInvalid: seeded.invalid.length,
       invalid: seeded.invalid, tombstoned: seeded.tombstoned,
     }
   }
@@ -417,7 +422,13 @@ function finalizeSeed({
     ...(tombstoned ? { tombstoned } : {}),
   }
   const manifest = regenerateManifest(base, { fs })
-  if (!manifest.ok) log(`[whale-memory] rules seed manifest failed: ${manifest.error || 'unknown'}`)
+  if (!manifest.ok) {
+    // 架构书 §2.9：manifest 重建失败 → 不写 marker（否则下轮 already_seeded 直接跳过，
+    // manifest 永远坏着）。文件已写，下轮启动自愈会先重建 manifest 再重试播种。
+    log(`[whale-memory] rules seed manifest failed: ${manifest.error || 'unknown'}`)
+    return { ...baseResult, ok: false, error: 'manifest_failed', detail: manifest.error,
+      seeded: seededKeys.length, skippedInvalid: invalid.length, invalid, manifest: null }
+  }
   ensureRuleGitignore(base, { fs })
 
   const message = `rules: seed defaults (${seededKeys.length})`

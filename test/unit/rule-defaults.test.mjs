@@ -10,6 +10,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import * as nodeFs from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -503,4 +504,27 @@ test('首播不复活墓碑：purge #17 后（无 marker）重播跳过 17，编
   const created = createRule({ root: rulesRoot, draft: { text: '必须保留审计日志。', type: 'iron-rule' } }, { git: false })
   assert.equal(created.ok, true, created.error)
   assert.equal(created.number, 18, '重播后新规则仍从 18 起，不复用 17')
+})
+
+
+test('R9-21：manifest 重建失败 → 不写 .seeded.json（下轮重试，health 红）', (t) => {
+  const rulesRoot = mkdtempSync(join(tmpdir(), 'whale-seed-mf-'))
+  t.after(() => rmSync(rulesRoot, { recursive: true, force: true }))
+  const defaults = join(rulesRoot, '__defaults__')
+  mkdirSync(defaults, { recursive: true })
+  writeDefault(defaults, frontOf({ key: 'iron-rule-1', number: 1 }), '必须先验证再覆盖正式库。')
+  // 只让 manifest.json 的原子 rename 失败，其它文件写入保持真实。
+  const fakeFs = { ...nodeFs }
+  fakeFs.renameSync = (from, to) => {
+    if (String(to).endsWith(MANIFEST_FILE)) {
+      const err = new Error('ENOSPC: manifest write failed')
+      err.code = 'ENOSPC'
+      throw err
+    }
+    return nodeFs.renameSync(from, to)
+  }
+  const result = seedDefaultRules({ root: rulesRoot, defaultsDir: defaults }, { git: false, fs: fakeFs })
+  assert.equal(result.ok, false)
+  assert.equal(result.error, 'manifest_failed')
+  assert.equal(existsSync(join(rulesRoot, SEED_MARKER)), false, 'manifest 失败不得写 marker')
 })

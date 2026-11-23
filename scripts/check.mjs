@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 上架静态门：E1–E14（计划书 §6）+ 禁区扫描 + waterfall 守卫。
+ * 上架静态门：E1–E15（计划书 §6 + R9-06 错误码单一真源）+ 禁区扫描 + waterfall 守卫。
  *
  * 为什么要有这一份：市场安装失败大多不是功能问题，而是 manifest/导出/文件清单/
  * 文档产物这类机械问题；这里把可机检的部分前置，让每次改动当场红，而不是到 S5
@@ -24,6 +24,16 @@ const report = (id, reasons) => {
 }
 
 const read = (p) => readFileSync(join(root, p), 'utf8')
+/** locale JSON 的嵌套结构平铺成客户端 t() 用的点号键（meta.title 等）。 */
+function flattenLocale(node, prefix = '') {
+  const out = {}
+  for (const [key, value] of Object.entries(node || {})) {
+    const dotted = prefix ? `${prefix}.${key}` : key
+    if (value && typeof value === 'object' && !Array.isArray(value)) Object.assign(out, flattenLocale(value, dotted))
+    else out[dotted] = value
+  }
+  return out
+}
 const isFile = (p) => existsSync(join(root, p)) && statSync(join(root, p)).isFile()
 const isDir = (p) => existsSync(join(root, p)) && statSync(join(root, p)).isDirectory()
 const isNonEmptyDir = (p) => isDir(p) && readdirSync(join(root, p)).some((x) => x !== '.gitkeep')
@@ -383,7 +393,7 @@ gate('E12', () => {
 // ---------------------------------------------------------------------------
 // E13 files 精确 + 构建产物入库
 // ---------------------------------------------------------------------------
-const REQUIRED_FILES = ['index.js', 'src/host', 'src/core', 'lib/client.js', 'cordis.patch.yml', 'locale/*.json', 'docs', 'icon.svg', 'README.md', 'LICENSE', 'CHANGELOG.md']
+const REQUIRED_FILES = ['index.js', 'src/host', 'src/shared', 'src/core', 'lib/client.js', 'cordis.patch.yml', 'locale/*.json', 'docs', 'icon.svg', 'README.md', 'LICENSE', 'CHANGELOG.md']
 const BANNED_FILES = ['test', 'test/', 'scripts', 'scripts/', 'node_modules', 'node_modules/', 'src/client', 'src/client/']
 
 gate('E13', () => {
@@ -415,6 +425,93 @@ gate('E14', () => {
     for (const [name, spec] of Object.entries(pkg[field] || {})) {
       if (String(spec).startsWith('link:')) r.push(`${field}.${name} 使用了 link:（市场索引要求 npm 发布版本）`)
     }
+  }
+  return r
+})
+
+// ---------------------------------------------------------------------------
+// E15 错误码单一真源（code -> {status, localeKey}）与引用登记
+// ---------------------------------------------------------------------------
+gate('E15', async () => {
+  const r = []
+  const tablePath = 'src/shared/error-table.mjs'
+  if (!isFile(tablePath)) return ['缺 src/shared/error-table.mjs（错误码单一真源）']
+  let mod
+  try {
+    mod = await import(`${pathToFileURL(join(root, tablePath)).href}?gate=${Date.now()}`)
+  } catch (err) {
+    return [`error-table.mjs 无法 import：${err.message}`]
+  }
+  const table = mod.ERROR_TABLE
+  if (!table || typeof table !== 'object') return ['error-table.mjs 未导出 ERROR_TABLE']
+  // 发布包 files 必须带上 src/shared：漏了 market 安装后路由 import 直接崩。
+  if (!Array.isArray(pkg.files) || !pkg.files.includes('src/shared')) {
+    r.push('package.json files 必须含 src/shared（error-table 是运行时 import，不是构建期依赖）')
+  }
+  const dicts = {}
+  for (const lang of ['zh', 'en', 'ja']) {
+    try { dicts[lang] = flattenLocale(JSON.parse(read(`locale/${lang}.json`))) } catch (err) {
+      r.push(`locale/${lang}.json 解析失败：${err.message}`)
+    }
+  }
+  for (const [code, entry] of Object.entries(table)) {
+    if (!/^[a-z][a-z0-9_]*$/.test(code)) r.push(`错误码 ${code} 不是 snake_case`)
+    if (!Number.isInteger(entry?.status) || entry.status < 100 || entry.status > 599) {
+      r.push(`错误码 ${code} 的 status 非法：${JSON.stringify(entry?.status)}`)
+    }
+    if (entry?.unmapped === true) {
+      if (entry.localeKey !== null) r.push(`错误码 ${code} 标了 unmapped 但仍有 localeKey`)
+      continue
+    }
+    if (typeof entry?.localeKey !== 'string' || !entry.localeKey.startsWith('err.')) {
+      r.push(`错误码 ${code} 缺 localeKey（无文案须显式 unmapped:true）`)
+      continue
+    }
+    for (const lang of Object.keys(dicts)) {
+      if (typeof dicts[lang]?.[entry.localeKey] !== 'string' || !dicts[lang][entry.localeKey].trim()) {
+        r.push(`${lang} 缺文案键 ${entry.localeKey}（错误码 ${code}）`)
+      }
+    }
+  }
+  // 代码里引用的字面错误码必须已登记（未登记码会落 unknown_error/400）。
+  const refs = new Set()
+  for (const dir of ['src/host', 'src/core', 'src/shared']) {
+    for (const file of walk(dir)) {
+      const text = readFileSync(file, 'utf8')
+      for (const m of text.matchAll(/error:\s*['"]([a-z][a-z0-9_]*)['"]/g)) refs.add(m[1])
+      // 计划/提案的失败出口是 failed('code', ...)，同样是对外错误码。
+      for (const m of text.matchAll(/\bfailed\(\s*['"]([a-z][a-z0-9_]*)['"]/g)) refs.add(m[1])
+    }
+  }
+  for (const code of [...refs].sort()) {
+    if (!Object.prototype.hasOwnProperty.call(table, code)) r.push(`代码引用错误码 ${code} 未在 error-table 登记`)
+  }
+  // 路由必须查表，不能又长出本地 if 链。
+  const routesSrc = read('src/host/rules-routes.js')
+  const sfStart = routesSrc.indexOf('function statusForError')
+  if (sfStart < 0) r.push('rules-routes.js 缺 statusForError')
+  else {
+    const sfEnd = routesSrc.indexOf('\n}', sfStart)
+    const sf = routesSrc.slice(sfStart, sfEnd < 0 ? undefined : sfEnd)
+    if (!/statusOf\(/.test(sf)) r.push('statusForError 未查 error-table（statusOf）')
+    if (/code === ['"]/.test(sf)) r.push('statusForError 仍有本地 if 链（状态码未单一真源）')
+  }
+  // 客户端：422/500 不得折叠 unknown_error；未映射码必须原文透出 [code]。
+  const client = read('lib/client.js')
+  const scStart = client.indexOf('function statusCode(status)')
+  const scEnd = client.indexOf('async function callJson', scStart)
+  if (scStart < 0) r.push('client 缺 statusCode()')
+  else {
+    const sc = client.slice(scStart, scEnd < 0 ? undefined : scEnd)
+    if (!/status === 422[\s\S]*?unprocessable/.test(sc)) r.push('client statusCode 未把 422 映射成 unprocessable（禁止折叠 unknown_error）')
+    if (!/status === 500[\s\S]*?server_error/.test(sc)) r.push('client statusCode 未把 500 映射成 server_error（禁止折叠 unknown_error）')
+  }
+  const etStart = client.indexOf('function errText(t, err)')
+  const etEnd = client.indexOf('// ------------------------------------------------------------- formatting', etStart)
+  if (etStart < 0) r.push('client 缺 errText()')
+  else {
+    const et = client.slice(etStart, etEnd < 0 ? undefined : etEnd)
+    if (!et.includes("'[' + code + ']'")) r.push('client errText 未把未映射码原文透出 [code]')
   }
   return r
 })
@@ -479,5 +576,5 @@ if (failed) {
   console.error(`[gate] FAILED：${failed} 项未过（见上）`)
   process.exitCode = 1
 } else {
-  console.log(`[gate] OK ${pkg.name}@${pkg.version}：E1–E14 全通过（禁区/waterfall 守卫也过）`)
+  console.log(`[gate] OK ${pkg.name}@${pkg.version}：E1–E15 全通过（禁区/waterfall 守卫也过）`)
 }

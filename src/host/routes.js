@@ -7,7 +7,8 @@
  * 本层不 import core：存储能力全部经注入的 backend 接口调用。
  */
 import { Buffer } from 'node:buffer'
-import { clamp, isLoopback, readJson, sendJson, isWriteMethod, writeRequestProblem } from './http-kit.js'
+import { clamp, isLocalHostName, isLoopback, readJson, sendJson, isWriteMethod, writeRequestProblem } from './http-kit.js'
+import { statusOf } from '../shared/error-table.mjs'
 import { resolveIdentity } from './identity.js'
 import { bool, value } from './config-values.js'
 import { Config } from './config.js'
@@ -179,6 +180,13 @@ export function createRoutes({
 
   /** 主分发（内部）：抛错由下面的 handle 统一兜底成 502 JSON。 */
   const dispatch = async (req, res) => {
+    // Host 闸覆盖所有方法（含 GET）：DNS rebinding 页面可带畸形/外部 Host 同源 GET
+    // 走规则全文、整库导出与详情正文，必须在任何路由/身份解析之前拒绝。
+    // 空 Host 仍放行（curl 与本机客户端历史行为），见 isLocalHostName 的严格形态判定。
+    if (!isLocalHostName(req.headers?.host)) {
+      return sendJson(res, 403, { ok: false, error: 'cross_origin_denied' })
+    }
+
     // 每次请求读实时配置：面板改了 allowRemote 必须立刻生效，不能闭包快照。
     const addr = req.socket?.remoteAddress
     if (!bool(config?.panel?.allowRemote, false) && !isLoopback(addr)) {
@@ -534,7 +542,7 @@ export function createRoutes({
       const direction = String(body.value?.direction || 'pull')
       if (!['pull', 'push', 'both'].includes(direction)) return sendJson(res, 400, { ok: false, error: 'invalid_direction' })
       const dryRun = body.value?.dryRun !== false
-      if (!dryRun && body.value?.confirm !== true) return sendJson(res, 400, { ok: false, error: 'confirm_required' })
+      if (!dryRun && body.value?.confirm !== true) return sendJson(res, statusOf('confirm_required'), { ok: false, error: 'confirm_required' })
       const transport = new HttpSyncTransport({ baseUrl: value(config?.sync?.bridgeUrl, ''), log })
       if (!transport.baseUrl) return sendJson(res, 501, { ok: false, error: 'sync_bridge_unset' })
       const ident = resolveIdentity(getIdentityCfg())

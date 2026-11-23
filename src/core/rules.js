@@ -179,6 +179,41 @@ function extractConditions(text) {
 }
 
 // ---------------------------------------------------------------------------
+// 提案闸：只有"单句、短、陈述"的文本才进入信号检测
+// ---------------------------------------------------------------------------
+
+/** 提案闸硬顶：超过 120 码点的句子一律不是规则陈述（任务书/长文不进候选）。 */
+export const RULE_STATEMENT_MAX_CHARS = 120
+/** 请求/任务动词：出现即说明用户在提问或派活，不是在下规则。 */
+const REQUEST_VERB_RE = /(?:请|帮我|帮忙|对比|审查|分析|解释|查一下|总结|告诉我|看看)/
+/** 代码块/行内代码/Markdown 链接/裸 URL：规则陈述不带这些（带出处/片段的都是转述）。 */
+const CODE_OR_LINK_RE = /(?:```|`[^`]*`|https?:\/\/|www\.|!?\[[^\]]*\]\([^)]*\))/
+
+/**
+ * 判断一句话是不是"可以进入提案闸的规则陈述"（架构书 §3.1）。
+ *
+ * 判据：单句、≤120 码点、无问号、无换行、无请求动词、无代码块/链接。
+ * 这是**前置闸**（hook 在 createProposal 之前调用）：任务书、提问、多句长文一律不产候选，
+ * 避免"用户贴一段施工任务 → 机器把任务描述收成铁律"的误触发（R9-19）。
+ *
+ * @param {string} text 用户原句
+ * @returns {boolean}
+ */
+export function isRuleStatement(text) {
+  const raw = asText(text)
+  if (!raw.trim()) return false
+  if (Array.from(raw).length > RULE_STATEMENT_MAX_CHARS) return false
+  if (/[\r\n]/.test(raw)) return false
+  if (/[?？]/.test(raw)) return false
+  if (CODE_OR_LINK_RE.test(raw)) return false
+  if (REQUEST_VERB_RE.test(raw)) return false
+  // 单句：句末标点只允许出现在结尾；中间再有句末标点就是多句（「因为…。所以…」）。
+  const body = raw.trim().replace(/[。！!]+$/, '')
+  if (/[。！!]/.test(body)) return false
+  return true
+}
+
+// ---------------------------------------------------------------------------
 // 信号检测
 // ---------------------------------------------------------------------------
 

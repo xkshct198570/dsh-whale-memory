@@ -44,6 +44,10 @@ export const SLOT_OVERLAP_MIN = 0.3
  * 这里复制一份；两处口径必须同改（有黄金样例 `compileStructured：强定规→铁律` 盯着）。 */
 const IRON_STRONG_RE = /(记成铁律|铁律|以后都|以后一律|以后不要|以后别|从此以后|从此|永久|永远|一律|任何情况下|任何时候|每次都要|永远不要|always|forever|permanently)/i
 const IRON_REF_RE = /铁律\s*(?:#|No\.?|编号)?\s*([0-9]{1,3})/i
+/** 明确"改/更新/新建/设为/收进…铁律N"的指令：只有这种句才把铁律号当身份（否则只是引用）。 */
+const IRON_DIRECTIVE_RE = /(?:记成|记入|记录为|改成|改为|改到|更新|修改|新建|设为|设置为|收进|收录|收为)[^。！!？?\n]{0,16}?铁律\s*(?:#|No\.?|编号)?\s*([0-9]{1,3})/i
+/** 句首"铁律N："是规则本体的标题（历史/默认播种件），算显式身份；句中引用不算。 */
+const IRON_LABEL_RE = /^\s*铁律\s*(?:#|No\.?|编号)?\s*([0-9]{1,3})\s*[：:]/
 const RULE_KEY_REF_RE = /rule:([a-z0-9][a-z0-9._-]{0,63})/i
 
 /** 模糊词（架构书 §4.5）：铁律一律不得出现。 */
@@ -239,9 +243,11 @@ function chars(text) {
  */
 export function extractExplicitRef(text) {
   const raw = textOf(text)
-  const iron = raw.match(IRON_REF_RE)
-  if (iron) {
-    const number = Number(iron[1])
+  // R9-19：`铁律N` 默认只当引用（「务必做到铁律10」不得生成 iron-rule-10）。
+  // 只有明确指令（改/更新/新建/设为/收进…铁律N）或句首「铁律N：」标题才返回身份。
+  const directive = raw.match(IRON_DIRECTIVE_RE) || raw.match(IRON_LABEL_RE)
+  if (directive) {
+    const number = Number(directive[1])
     if (Number.isInteger(number) && number > 0) return { key: `iron-rule-${number}`, number }
   }
   const keyRef = raw.match(RULE_KEY_REF_RE)
@@ -743,7 +749,10 @@ export function compileStructured(text, signals = {}, opts = {}) {
 
   const source = trimmed(opts.source ?? sig.source ?? 'unknown').toLowerCase() || 'unknown'
   const explicitRef = extractExplicitRef(raw)
-  const strong = IRON_STRONG_RE.test(raw)
+  // 纯引用（命中 `铁律N` 但没有明确"改/更新/新建…"指令）不得当强定规：
+  // 否则一句「务必做到铁律10」会被收成新铁律、还按引用号造 key（R9-19）。
+  const bareIronRef = IRON_REF_RE.test(raw) && !explicitRef
+  const strong = IRON_STRONG_RE.test(raw) && !bareIronRef
   // owner 显式 + 强定规（或显式点名铁律N）才配 iron-rule；其他来源最高 rule（架构书 §4.1）。
   const isIron = source === 'owner' && sig.explicit && (strong || Boolean(explicitRef?.number))
 
@@ -802,7 +811,11 @@ export function compileStructured(text, signals = {}, opts = {}) {
   // 编号：只有 iron-rule 占号（R8-01）；普通规则/候选 number 必须 null。
   // 显式铁律N > refine 沿用旧号 > 新建取 nextNumber（跳过占号与空号 6）。
   const sameKey = existingKeys.get(key)
-  const taken = takenNumbers(existingRules)
+  // R9-20：取号单一真源——调用方传 occupancy（文件名∪front∪墓碑）时以它为准；
+  // 只有纯函数单测/脱仓储调用才退回"既有规则"集合。
+  const taken = opts.occupancy
+    ? new Set(Array.from(opts.occupancy).filter((n) => Number.isInteger(Number(n)) && Number(n) > 0).map(Number))
+    : takenNumbers(existingRules)
   let number = null
   if (!isIron) {
     number = null

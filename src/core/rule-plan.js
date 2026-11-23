@@ -25,13 +25,12 @@ import { join, resolve } from 'node:path'
 import { normalizeRuleText } from './rules.js'
 import {
   RESERVED_NUMBERS,
-  computeManifest,
   defaultRuleRoot,
-  fileRuleNumbers,
-  isRetiredNumber,
   listRules,
+  nextRuleNumber,
   normalizeRuleDoc,
-  readManifest,
+  occupancy,
+  readTombstones,
   serializeRuleDocument,
 } from './rule-store.js'
 import {
@@ -257,21 +256,33 @@ export function buildApplyPlan({
     return { ok: true, plan }
   }
 
-  // 受影响旧规则：磁盘真源优先；已物理删除 → affected_missing（不回写提案快照）。
+  // 受影响旧规则查**全量**规则（R9-20）：文件还在盘上但 status≠active 是"停用"不是"已删除"，
+  // 必须报 affected_inactive（附 status/path）；只有文件真不存在才 affected_missing。
+  const allByKey = new Map(allRules.map((doc) => [trimmed(doc.front.key), doc]))
   const affectedDocs = []
   for (const snap of Array.isArray(proposal.affected) ? proposal.affected : []) {
     const key = trimmed(snap?.key)
     if (!key) continue
-    const live = byKey.get(key)
+    const live = allByKey.get(key)
     if (!live) {
       return failed('affected_missing', [{ code: 'affected_missing', key, detail: '受影响规则已不在磁盘（可能已彻底删除）' }])
+    }
+    const status = trimmed(live.front.status)
+    if (status !== 'active') {
+      return failed('affected_inactive', [{
+        code: 'affected_inactive',
+        key,
+        status,
+        path: live.file,
+        detail: `受影响规则已停用（status=${status}），文件仍在 ${live.file}；先启用或改选受影响规则`,
+      }])
     }
     affectedDocs.push({ key, front: live.front, text: textOf(live.text), file: live.file })
   }
   affectedDocs.sort((a, b) => a.key.localeCompare(b.key))
 
   // 目标 key：refine 必须命中同 key；其它关系若已存在同 key 则拒绝覆盖（改 key 走单独动作）。
-  const targetKey = trimmed(draft.key)
+  let targetKey = trimmed(draft.key)
   const existingTarget = byKey.get(targetKey)
   if (existingTarget && relation !== 'refine') {
     return failed('target_conflict', [{
@@ -280,6 +291,15 @@ export function buildApplyPlan({
   }
   if (relation === 'refine' && !existingTarget) {
     return failed('target_missing', [{ code: 'target_missing', key: targetKey, detail: 'refine 目标规则已不在磁盘' }])
+  }
+  // key 全仓唯一（跨 scope 也不得同名）：同 key 的文件存在但不是 active 时，新建会覆盖旧文件/撞号。
+  if (!existingTarget && allByKey.has(targetKey)) {
+    const clash = allByKey.get(targetKey)
+    return failed('target_conflict', [{
+      code: 'target_conflict',
+      key: targetKey,
+      detail: `key 已存在（status=${trimmed(clash.front.status)}），不得覆盖；请走 refine/单独编辑`,
+    }])
   }
 
   // 面板白名单：只处理列出的受影响规则（不在白名单里的保持原样，不 supersede、不改写）。
@@ -299,30 +319,26 @@ export function buildApplyPlan({
     : (ackRaw === true ? acceptedAffected.map((doc) => doc.key) : [])
   const rewrites = rewriteMapOf(decided)
 
-  // 目标 front：refine 沿用旧编号/created；新建按草案号或 manifest 下一个空号。
+  // 目标 front：refine 沿用旧编号/created；新建取号只走 occupancy()（R9-20 单一真源）。
   // 编号只属于 iron-rule（R8-01）：普通规则/候选一律 number=null（store 校验会拒非 null）。
-  const retired = Array.isArray(readManifest(base)?.retired) ? readManifest(base).retired : []
-  const manifest = computeManifest(allRules, retired, fileRuleNumbers(base))
   const targetType = trimmed(draft.type) || 'rule'
   const targetIsIron = targetType === 'iron-rule'
-  const retiredNumbers = new Set(retired.map((item) => Number(item?.number)).filter((n) => Number.isInteger(n) && n > 0))
-  const occupiedNumbers = new Set()
-  for (const doc of allRules) {
-    if (trimmed(doc.front.key) === targetKey) continue
-    const n = Number(doc.front.number)
-    if (Number.isInteger(n) && n > 0) occupiedNumbers.add(n)
-  }
-  // 非法 front 的 iron-rule-<n>.md 也占号：提案/apply 不得把号发给已被磁盘占用的编号。
-  for (const n of fileRuleNumbers(base)) occupiedNumbers.add(n)
-  for (const n of RESERVED_NUMBERS) occupiedNumbers.add(n)
-  /** 顺延到第一个合法空号（跳过保留号/占号/墓碑）；nextNumber 兜底也要过同一把筛。
-   *  铁律编号硬顶 1–999：到顶返回 null（调用方给 number_exhausted，绝不越界发号）。 */
+  // 墓碑是独立真源：occupancy() 已含墓碑，但重分配每一步还要单独查墓碑，
+  // 命中即 number_retired（不得顺延到墓碑号，架构书 §2.5.2）。
+  const tombstoneNumbers = new Set(readTombstones(base)
+    .map((item) => Number(item?.number))
+    .filter((n) => Number.isInteger(n) && n > 0))
+  const occupiedNumbers = occupancy(base, { listed: { rules: allRules } })
+  /** 顺延到第一个合法空号；墓碑命中立即失败（不跳过），硬顶 1–999。 */
   const nextFreeNumber = (start) => {
     let n = Number.isInteger(start) && start > 0 ? start : 1
     for (; n <= RULE_NUMBER_MAX_TENTH; n += 1) {
-      if (!occupiedNumbers.has(n) && !retiredNumbers.has(n)) return n
+      if (tombstoneNumbers.has(n)) return { ok: false, code: 'number_retired', number: n }
+      if (RESERVED_NUMBERS.includes(n)) continue
+      if (occupiedNumbers.has(n)) continue
+      return { ok: true, number: n }
     }
-    return null
+    return { ok: false, code: 'number_exhausted', number: null }
   }
   let targetNumber = null
   let numberAdjusted = null
@@ -336,27 +352,42 @@ export function buildApplyPlan({
       let reason = ''
       if (!Number.isInteger(proposed) || proposed <= 0) reason = 'missing'
       else if (reservedNumber(proposed)) reason = 'reserved'
+      else if (tombstoneNumbers.has(proposed)) reason = 'retired'
       else if (occupiedNumbers.has(proposed)) reason = 'occupied'
-      else if (retiredNumbers.has(proposed)) reason = 'retired'
       if (reason === 'retired') {
         return failed('number_retired', [{
           code: 'number_retired', key: targetKey, detail: `编号 ${proposed} 已被墓碑占位（永不复用）`,
         }])
       }
       if (reason) {
-        const reallocated = nextFreeNumber(manifest.nextNumber)
-        if (reallocated === null) {
-          return failed('number_exhausted', [{ code: 'number_exhausted', key: targetKey, detail: '1–999 没有可用铁律编号' }])
+        const reallocated = nextFreeNumber(nextRuleNumber(occupiedNumbers))
+        if (!reallocated.ok) {
+          return failed(reallocated.code, [{
+            code: reallocated.code,
+            key: targetKey,
+            detail: reallocated.code === 'number_retired'
+              ? `编号 ${reallocated.number} 已被墓碑占位（永不复用）`
+              : '1–999 没有可用铁律编号',
+          }])
         }
-        numberAdjusted = { from: Number.isInteger(proposed) ? proposed : null, to: reallocated, reason }
-        targetNumber = reallocated
-      } else if (isRetiredNumber(base, proposed)) {
-        return failed('number_retired', [{
-          code: 'number_retired', key: targetKey, detail: `编号 ${proposed} 已写墓碑（永不复用）`,
-        }])
+        numberAdjusted = { from: Number.isInteger(proposed) ? proposed : null, to: reallocated.number, reason }
+        targetNumber = reallocated.number
       } else {
         targetNumber = proposed
       }
+    }
+  }
+  // R9-20 ④：机器起草的 iron-rule，落盘 key 由仓储/plan 按最终编号盖成 iron-rule-<n>，
+  // 草案里的临时 key 只用于关系判定。refine 沿用既有 key（兼容非标准文件名的历史铁律）。
+  if (targetIsIron && !existingTarget && Number.isInteger(targetNumber) && targetNumber > 0) {
+    targetKey = `iron-rule-${targetNumber}`
+    const clash = allByKey.get(targetKey)
+    if (clash) {
+      return failed('target_conflict', [{
+        code: 'target_conflict',
+        key: targetKey,
+        detail: `目标 key ${targetKey} 已被占用（status=${trimmed(clash.front.status)}），不得覆盖`,
+      }])
     }
   }
   const created = existingTarget ? (trimmed(existingTarget.front.created) || dayOf(now)) : dayOf(now)

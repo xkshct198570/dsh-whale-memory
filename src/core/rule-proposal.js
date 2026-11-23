@@ -30,12 +30,13 @@ import {
 } from './rule-reconcile.js'
 import {
   atomicWriteFile,
-  computeManifest,
   defaultRuleRoot,
   ensureRuleRepo,
   gitCommit,
   listRules,
-  readManifest,
+  nextRuleNumber,
+  occupancy,
+  readTombstones,
   regenerateManifest,
   writeRule,
 } from './rule-store.js'
@@ -307,11 +308,15 @@ export function createProposal({
   // 编号口径必须与 manifest/create/health 同源：用全量规则（含 inactive/候选外的历史文件）
   // ＋文件名＋墓碑算 nextNumber；关系判定仍只看 activeRules。
   // （非 `iron-rule-<n>.md` 文件名的 inactive 铁律，只能靠全量 rules 的 front 号占位。）
-  const manifest = computeManifest(listed.rules, readManifest(base)?.retired, storeApi.fileRuleNumbers(base))
+  // R9-20：提案期取号与 plan/create/health 同口径——occupancy() 是唯一入口
+  // （文件名编号 ∪ 解析成功 front 编号 ∪ 墓碑）；manifest.retired 不再参与取号。
+  const occupiedNumbers = occupancy(base, { listed })
+  const nextNumber = nextRuleNumber(occupiedNumbers)
 
   const compiled = compileStructured(raw, signals, {
     existingRules: activeRules,
-    nextNumber: manifest.nextNumber,
+    nextNumber,
+    occupancy: occupiedNumbers,
     source,
     workspace: trimmed(ident.workspace),
     // role 必须进草案：候选 hash 含 role（架构书 §3.2），否则跨角色会共用命中去重/冷却。
@@ -320,6 +325,36 @@ export function createProposal({
   if (!compiled.ok) return { ok: false, code: compiled.error, detail: compiled.detail }
   const draft = compiled.draft
   const relation = classifyRelation(draft, activeRules)
+  // R9-19 ④：候选创建前先查 key 全仓唯一（跨 scope 也不得同名）与编号占用。
+  // 注定 target_conflict/number_conflict/number_retired 的候选不创建（也不追加提示行），
+  // 否则用户看到的"待确认"到了 apply 才失败（假承诺）。同 scope 同 key 走 refine 语义。
+  const allByKey = new Map(listed.rules.map((doc) => [trimmed(doc.front.key), doc]))
+  const sameKeyDoc = allByKey.get(draft.key)
+  if (sameKeyDoc && relation.relation !== 'refine') {
+    return {
+      ok: false,
+      code: 'target_conflict',
+      detail: {
+        key: draft.key,
+        scope: trimmed(sameKeyDoc.front.scope),
+        status: trimmed(sameKeyDoc.front.status),
+        reason: 'key_exists_outside_refine',
+      },
+    }
+  }
+  if (draft.type === 'iron-rule' && Number.isInteger(Number(draft.number)) && Number(draft.number) > 0) {
+    const number = Number(draft.number)
+    const refineDoc = relation.relation === 'refine' ? sameKeyDoc : null
+    const ownsNumber = Boolean(refineDoc) && Number(refineDoc.front.number) === number
+    if (!ownsNumber) {
+      if (readTombstones(base).some((item) => Number(item.number) === number)) {
+        return { ok: false, code: 'number_retired', detail: { number, key: draft.key } }
+      }
+      if (occupiedNumbers.has(number)) {
+        return { ok: false, code: 'number_conflict', detail: { number, key: draft.key } }
+      }
+    }
+  }
   const affected = snapshotAffected(activeRules, relation.targets)
 
   const hash = proposalHashOf(raw, draft)
@@ -1247,8 +1282,11 @@ export function buildProposalAskLine(proposal = {}) {
   return `${head}——回复「收录 ${nonce}」确认收进铁律，或到规则页签「待确认」面板处理。`
 }
 
-/** 聊天确认的唯一合法形态：`收录 <p + 8 位>`（大小写/空格容忍；不接受「好/可以/确认」）。 */
-const CONFIRM_NONCE_RE = /收录\s*[pP]\s*([0-9a-zA-Z]{4,16})/
+/**
+ * 聊天确认的唯一合法形态：**整句** `[确认]收录 <p + 8 位 hex>`（架构书 §3.4）。
+ * 正则锚定整句：句中转述、引用提示行、带问号/否定/额外文字一律不算确认。
+ */
+const CONFIRM_NONCE_RE = /^\s*(?:确认)?收录\s*[pP]([0-9a-fA-F]{8})\s*[。！!]?\s*$/
 
 /**
  * 从一句话里取确认 nonce（带 `p` 前缀，小写）。
@@ -1257,8 +1295,6 @@ const CONFIRM_NONCE_RE = /收录\s*[pP]\s*([0-9a-zA-Z]{4,16})/
 export function confirmNonceOf(query) {
   const raw = trimmed(query)
   if (!raw) return ''
-  // 否定优先：「先不收录 p1234」包含确认形态，必须先挡掉（与 detectConfirmIntent 同口径）。
-  if (/(不收录|先不|不要|不用|别|算了|取消|拒绝)/.test(raw)) return ''
   const match = raw.match(CONFIRM_NONCE_RE)
   return match ? `p${match[1].toLowerCase()}` : ''
 }

@@ -23,6 +23,10 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import * as nodeFs from 'node:fs'
 import { createHash, randomBytes } from 'node:crypto'
+import { acquireRepoLock, withRepoLock } from './rule-lock.js'
+
+/** 锁协议实现已抽到 rule-lock.js；这里保持旧导出名，调用方无需改动。 */
+export { acquireRepoLock, withRepoLock }
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { detectSignals, normalizeRuleText, ruleKeyOf } from './rules.js'
@@ -479,8 +483,14 @@ export function validateRule(front, text, opts = {}) {
   if (/<!--|-->/.test(body)) push('html_comment_marker', null, '正文不得含 HTML 注释标记（<!-- / -->）')
 
   const numbers = opts.numbers instanceof Map ? opts.numbers : new Map()
-  if (Number.isInteger(f.number) && numbers.has(f.number) && numbers.get(f.number) !== f.key) {
-    push('duplicate_number', 'number', `编号 ${f.number} 已被 ${numbers.get(f.number)} 占用`)
+  if (Number.isInteger(f.number) && numbers.has(f.number)) {
+    const owner = numbers.get(f.number)
+    // 墓碑号永不复用：map 里以 `retired:<key>` 标记，命中即 number_retired（即使 key 相同）。
+    if (typeof owner === 'string' && owner.startsWith('retired:')) {
+      push('number_retired', 'number', `编号 ${f.number} 已写墓碑（永不复用）`)
+    } else if (owner !== f.key) {
+      push('duplicate_number', 'number', `编号 ${f.number} 已被 ${owner} 占用`)
+    }
   }
 
   // summary：可选；只用于摘要展示，因此强制单行 + 硬顶 120 码点（超了就是把正文塞进摘要）。
@@ -534,11 +544,6 @@ function hashText(text) {
   return createHash('sha256').update(String(text ?? ''), 'utf8').digest('hex')
 }
 
-/** 同步等待（主线程无 await 可用；锁只持有毫秒级，阻塞可接受）。 */
-function sleepSync(ms) {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(1, ms))
-}
-
 /**
  * 落盘到磁盘（tmp + fsync + rename + fsync 目录）：墓碑必须先于删文件真正持久化。
  *
@@ -583,157 +588,6 @@ function fsyncDir(dir, fs = nodeFs) {
 /** @param {string} file @returns {string} */
 function dirnameOf(file) {
   return dirname(String(file))
-}
-
-/**
- * 仓库级写锁：`.locks/repo.lock`（mkdir 原子），`owner.json` 记 pid/ts。
- *
- * 为什么一把锁而不是每 key 一把：manifest/commit/编号都是**全仓**资源，多把锁只会制造
- * "看起来能并发、实际互相覆盖"的假并发。锁不续租（接口冻结 staleMs=120s）：持锁期间的
- * git commit 最长也就秒级，用一个大阈值覆盖整个临界区，比每 2s touch 更简单可靠。
- *
- * @param {string} root
- * @param {{fs?: typeof nodeFs, timeoutMs?: number, staleMs?: number}} [opts]
- * @returns {{ok:boolean, release?:Function, owner?:object, error?:string}}
- */
-export function acquireRepoLock(root, opts = {}) {
-  const fs = opts.fs || nodeFs
-  const base = baseDir(root)
-  const lockRoot = join(base, LOCK_DIR)
-  const lock = join(lockRoot, REPO_LOCK)
-  const ownerFile = join(lock, 'owner.json')
-  const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : 5000
-  const staleMs = Number.isFinite(opts.staleMs) ? opts.staleMs : REPO_LOCK_STALE_MS
-  const started = Date.now()
-  try { fs.mkdirSync(lockRoot, { recursive: true }) } catch (err) {
-    return { ok: false, error: `lock_dir_failed:${err?.message || err}` }
-  }
-  for (;;) {
-    const owner = { pid: process.pid, ts: Date.now(), nonce: randomBytes(8).toString('hex') }
-    try {
-      fs.mkdirSync(lock)
-      try { fs.writeFileSync(ownerFile, `${JSON.stringify(owner)}\n`, 'utf8') } catch (err) {
-        try { fs.rmdirSync(lock) } catch { /* 清不掉也继续报错，不吞 */ }
-        return { ok: false, error: `lock_owner_failed:${err?.message || err}` }
-      }
-      return {
-        ok: true,
-        owner,
-        /**
-         * 只删"自己那一把"：stale 接管后旧持有者的 release 晚到，若直接 rmdir 会把
-         * 新持有者的锁删掉（两个进程同时进临界区）。nonce 不匹配即视为已被接管，不删。
-         */
-        release() {
-          let held = null
-          try { held = JSON.parse(fs.readFileSync(ownerFile, 'utf8')) } catch { held = null }
-          if (!held || held.nonce !== owner.nonce) return false
-          try { fs.unlinkSync(ownerFile) } catch { /* owner 可能已被接管 */ }
-          try { fs.rmdirSync(lock) } catch { /* 已被清理/权限变化：不应掩盖写入结果 */ }
-          return true
-        },
-      }
-    } catch (err) {
-      if (err?.code !== 'EEXIST') return { ok: false, error: `lock_failed:${err?.message || err}` }
-      let held = null
-      try {
-        held = JSON.parse(fs.readFileSync(ownerFile, 'utf8'))
-      } catch { held = null }
-      let heldAt = Number(held?.ts)
-      if (!Number.isFinite(heldAt)) {
-        // owner.json 没写成（持锁进程刚 mkdir 就崩）：退回目录 mtime 判活。
-        try { heldAt = fs.statSync(lock).mtimeMs } catch { heldAt = 0 }
-      }
-      if (Number.isFinite(heldAt) && Date.now() - heldAt > staleMs) {
-        try {
-          if (typeof fs.rmSync === 'function') fs.rmSync(lock, { recursive: true, force: true })
-          else fs.rmdirSync(lock)
-        } catch { /* 被别的进程刚接管/清理：回到循环重抢 */ }
-        continue
-      }
-      if (Date.now() - started > timeoutMs) return { ok: false, error: 'repo_locked', owner: held }
-      sleepSync(10)
-    }
-  }
-}
-
-/**
- * 在仓库级锁内执行同步函数；抛错也释放。
- *
- * @template T
- * @param {string} root @param {() => T} fn
- * @param {{fs?: typeof nodeFs, timeoutMs?: number, staleMs?: number}} [opts]
- * @returns {T | {ok:false, error:string}}
- */
-export function withRepoLock(root, fn, opts = {}) {
-  const lock = acquireRepoLock(root, opts)
-  if (!lock.ok) return { ok: false, error: lock.error, lock: lock.owner || null }
-  try {
-    return fn()
-  } finally {
-    lock.release()
-  }
-}
-
-/**
- * 同 key 跨进程互斥：mkdir 是原子的，抢不到就等；崩溃遗留锁超过 staleMs 视为失效。
- * 为什么必须跨进程：规则目录可能被编辑器/脚本/面板同时写；仅靠 tmp+rename 能保证
- * 文件不半截，但编号校验、历史快照仍会交错。锁范围只覆盖准备→落盘→manifest。
- *
- * @param {string} root @param {string} key
- * @param {{fs?: typeof nodeFs, timeoutMs?: number, staleMs?: number}} [opts]
- * @returns {{ok:boolean,release?:Function,error?:string}}
- */
-export function acquireRuleLock(root, key, opts = {}) {
-  if (!isValidRuleKey(key)) return { ok: false, error: 'invalid_key' }
-  const fs = opts.fs || nodeFs
-  const lockRoot = join(baseDir(root), LOCK_DIR)
-  const lock = join(lockRoot, `${key}.lock`)
-  const ownerFile = join(lock, 'owner.json')
-  const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : 3000
-  const staleMs = Number.isFinite(opts.staleMs) ? opts.staleMs : 10000
-  const started = Date.now()
-  try { fs.mkdirSync(lockRoot, { recursive: true }) } catch (err) {
-    return { ok: false, error: `lock_dir_failed:${err?.message || err}` }
-  }
-  for (;;) {
-    const owner = { pid: process.pid, key, ts: Date.now(), nonce: randomBytes(8).toString('hex') }
-    try {
-      fs.mkdirSync(lock)
-      try { fs.writeFileSync(ownerFile, `${JSON.stringify(owner)}\n`, 'utf8') } catch (err) {
-        try { fs.rmdirSync(lock) } catch { /* 清不掉也继续报错 */ }
-        return { ok: false, error: `lock_owner_failed:${err?.message || err}` }
-      }
-      return {
-        ok: true,
-        owner,
-        release() {
-          // nonce 不匹配 = 锁已被 stale 接管，不能删别人的锁（见 repo lock 同注释）。
-          let held = null
-          try { held = JSON.parse(fs.readFileSync(ownerFile, 'utf8')) } catch { held = null }
-          if (!held || held.nonce !== owner.nonce) return false
-          try { fs.unlinkSync(ownerFile) } catch { /* owner 可能已被接管 */ }
-          try { fs.rmdirSync(lock) } catch { /* 已被清理/权限变化：不应掩盖写入结果 */ }
-          return true
-        },
-      }
-    } catch (err) {
-      if (err?.code !== 'EEXIST') return { ok: false, error: `lock_failed:${err?.message || err}` }
-      let heldAt = 0
-      try { heldAt = JSON.parse(fs.readFileSync(ownerFile, 'utf8')).ts } catch {
-        try { heldAt = fs.statSync(lock).mtimeMs } catch { heldAt = 0 }
-      }
-      if (Number.isFinite(heldAt) && Date.now() - heldAt > staleMs) {
-        try {
-          // 锁目录里现在有 owner.json，rmdir 会 ENOTEMPTY → 必须递归删。
-          if (typeof fs.rmSync === 'function') fs.rmSync(lock, { recursive: true, force: true })
-          else { try { fs.unlinkSync(ownerFile) } catch { /* 无 owner */ }; fs.rmdirSync(lock) }
-        } catch { /* 刚被接管/清理：回到循环重抢 */ }
-        continue
-      }
-      if (Date.now() - started > timeoutMs) return { ok: false, error: 'rule_locked' }
-      sleepSync(10)
-    }
-  }
 }
 
 /** 17 位时间戳（YYYYMMDDHHmmssSSS），与 DB 快照命名口径一致。 */
@@ -907,6 +761,30 @@ export function readRule(root, key) {
 }
 
 /**
+ * 宽松读：只解析 front/正文，不跑内容守卫。purge 专用——手改写坏的规则也必须删得掉。
+ * key≠文件名仍然拒绝（路径安全与「删错文件」防护），其余内容问题交给快照留证。
+ * @param {string} root @param {string} key @returns {{ok:boolean,rule?:object,error?:string,detail?:any}}
+ */
+export function readRuleLax(root, key) {
+  const base = baseDir(root)
+  if (!KEY_RE.test(String(key ?? ''))) return { ok: false, error: 'invalid_key' }
+  const file = findRuleFile(base, key)
+  if (!file) return { ok: false, error: 'rule_not_found' }
+  const read = readRuleSource(file)
+  if (!read.ok) return { ok: false, error: read.error }
+  const parsed = parseRuleDocument(read.text)
+  if (!parsed.ok) return { ok: false, error: 'invalid_rule', detail: { parse: parsed.error } }
+  const normalized = normalizeRuleDoc(parsed.front, parsed.text)
+  if (normalized.front.key !== String(key)) {
+    return { ok: false, error: 'key_mismatch', detail: { key: String(key), frontKey: normalized.front.key, file } }
+  }
+  return {
+    ok: true,
+    rule: { front: normalized.front, text: normalized.text, bodyStart: parsed.bodyStart, file },
+  }
+}
+
+/**
  * 列出全部规则（根目录 + proposals/）。
  * 解析失败的条目进 errors（不吞、不覆盖），合法条目才参与编号/manifest。
  *
@@ -1004,6 +882,12 @@ export function writeRule(root, input, opts = {}) {
     for (const n of fileRuleNumbers(base, { fs })) {
       if (n === normalized.front.number) continue
       if (!numbers.has(n)) numbers.set(n, `iron-rule-${n}.md`)
+    }
+    // R9-20 ②：墓碑也进编号校验 map（写前拒绝 number_retired，不靠 health 事后报红）。
+    // 墓碑优先于同名文件/其它规则：同一 key 重建后再 purge 的墓碑号也不得复活。
+    for (const item of readTombstones(base, { fs })) {
+      const n = Number(item?.number)
+      if (Number.isInteger(n) && n > 0) numbers.set(n, `retired:${item.key}`)
     }
     const check = validateRule(normalized.front, normalized.text, { numbers })
     if (!check.ok) return { ok: false, error: 'invalid_rule', detail: check.errors }
@@ -1516,13 +1400,21 @@ function removeRuleFile(base, file, opts = {}) {
  *   tombstone?:string,commit?:object|null,error?:string,detail?:any,rolledBack?:boolean,
  *   rollbackFailures?:string[]}}
  */
+/** 删墓碑（purge 事务落盘失败时撤销）；返回失败描述或 null。 @param {object|null} tomb @param {typeof nodeFs} fs */
+function dropTombstoneSafe(tomb, fs) {
+  if (!tomb || !tomb.path) return null
+  try { fs.unlinkSync(tomb.path); fsyncDir(dirnameOf(tomb.path), fs); return null } catch (err) {
+    return `tombstone:${err?.message || err}`
+  }
+}
+
 export function purgeRule({ root = '', key, identity = {}, traceId = '', now = Date.now() } = {}, opts = {}) {
   const fs = opts.fs || nodeFs
   const base = baseDir(root)
   const lock = acquireRepoLock(base, { fs, timeoutMs: opts.timeoutMs, staleMs: opts.staleMs })
   if (!lock.ok) return { ok: false, error: lock.error }
   try {
-    const got = readRule(base, key)
+    const got = opts.skipValidation === true ? readRuleLax(base, key) : readRule(base, key)
     if (!got.ok) return { ok: false, error: got.error, detail: got.detail }
     const doc = got.rule
     const old = readRuleSource(doc.file, { fs })
@@ -1540,6 +1432,26 @@ export function purgeRule({ root = '', key, identity = {}, traceId = '', now = D
       if (!tomb.ok) return { ok: false, error: 'tombstone_failed', detail: tomb.error }
     }
 
+    // 事务锚点（R9-21）：墓碑已 durable、文件将删除；崩溃后恢复器按 op=purge 收敛。
+    // proposalId 用 `purge:<key>:#<n>` 作 commit 标记（与既有 commit 文案兼容，不新增后缀）。
+    const txnId = `purge-${key}-${Number(now) || Date.now()}-${process.pid}`
+    const txn = writeTxn(base, {
+      id: txnId,
+      op: 'purge',
+      proposalId: `rule: purge ${key} (#${number})`,
+      createdAt: at,
+      files: [{ key: String(doc.front.key), path: doc.file, oldText }],
+      ...(tomb ? { tombstone: tomb.path } : {}),
+    }, { fs })
+    const clearTxnIfAny = () => {
+      if (!txn.ok) return
+      try { clearTxn(base, txnId, { fs }) } catch { /* 清不掉只影响自愈，不否定已落盘结果 */ }
+    }
+    if (!txn.ok) {
+      const failures = [dropTombstoneSafe(tomb, fs)].filter(Boolean)
+      return { ok: false, error: 'txn_failed', detail: txn.error, rolledBack: failures.length === 0, rollbackFailures: failures }
+    }
+
     const restoreFile = () => {
       const restored = durableWriteFile(doc.file, oldText, { fs })
       return restored.ok ? null : `restore:${restored.error}`
@@ -1554,6 +1466,7 @@ export function purgeRule({ root = '', key, identity = {}, traceId = '', now = D
     const removed = removeRuleFile(base, doc.file, { ...opts, fs })
     if (!removed.ok) {
       const failures = [dropTombstone()].filter(Boolean)
+      clearTxnIfAny()
       return { ...removed, rolledBack: failures.length === 0, rollbackFailures: failures }
     }
 
@@ -1567,10 +1480,12 @@ export function purgeRule({ root = '', key, identity = {}, traceId = '', now = D
       // 失败也要清 index：`git rm` 的删除已暂存，文件却已还原，留着就是幻影删除（R9-03）。
       const reset = resetIndexPaths(base, paths, { exec: opts.exec })
       if (!reset.ok) failures.push(`index:${reset.error}`)
+      clearTxnIfAny()
       return { ok: false, error: 'manifest_failed', detail: manifest.error, rolledBack: failures.length === 0, rollbackFailures: failures }
     }
 
     if (opts.git === false) {
+      clearTxnIfAny()
       return {
         ok: true, key: String(doc.front.key), number, version: Number(doc.front.version) || 1,
         historySnapshot: snap.rev, tombstone: tomb?.path || '', commit: null,
@@ -1581,6 +1496,7 @@ export function purgeRule({ root = '', key, identity = {}, traceId = '', now = D
     if (!commit.ok) {
       // git 不可用是降级（文件已删、commit 跳过）；只有真的提交失败才回滚。
       if (isGitDegraded(commit.error)) {
+        clearTxnIfAny()
         return {
           ok: true, key: String(doc.front.key), number, version: Number(doc.front.version) || 1,
           historySnapshot: snap.rev, tombstone: tomb?.path || '', commit,
@@ -1591,11 +1507,13 @@ export function purgeRule({ root = '', key, identity = {}, traceId = '', now = D
       if (!rebuilt.ok) failures.push(`manifest:${rebuilt.error}`)
       const reset = resetIndexPaths(base, paths, { exec: opts.exec })
       if (!reset.ok) failures.push(`index:${reset.error}`)
+      clearTxnIfAny()
       return {
         ok: false, error: 'commit_failed', detail: { stage: 'commit', error: commit.error },
         rolledBack: failures.length === 0, rollbackFailures: failures,
       }
     }
+    clearTxnIfAny()
     return {
       ok: true, key: String(doc.front.key), number, version: Number(doc.front.version) || 1,
       historySnapshot: snap.rev, tombstone: tomb?.path || '', commit,
@@ -2382,6 +2300,11 @@ export function writeTxn(root, txn = {}, opts = {}) {
     planHash: String(txn?.planHash ?? ''),
     proposalId: String(txn?.proposalId ?? ''),
     createdAt: String(txn?.createdAt ?? new Date().toISOString()),
+    // op/tombstone 让恢复器区分 apply 与 purge 两种事务；旧事务没有 op 按 apply 处理。
+    ...(txn?.op ? { op: String(txn.op) } : {}),
+    ...(txn?.tombstone ? { tombstone: String(txn.tombstone) } : {}),
+    ...(txn?.failedAt ? { failedAt: String(txn.failedAt) } : {}),
+    ...(Array.isArray(txn?.failures) && txn.failures.length ? { failures: txn.failures.map(String) } : {}),
     files,
   }
   try { fs.mkdirSync(join(base, TXN_DIR), { recursive: true }) } catch (err) {
@@ -2465,68 +2388,178 @@ function txnHasCommit(base, txn, opts = {}) {
  *   processed:Array<{id:string, committed:boolean, restored:number, deleted:number,
  *   skipped:number, failures:string[]}>}}
  */
+/**
+ * 记录一次成功恢复（health 可读）：`.txn/.recovered.jsonl` 不是事务文件（不以 .json 结尾），
+ * 不参与 listTxns；只保留最近 20 条，避免无限增长。
+ * @param {string} base @param {object} entry @param {typeof nodeFs} fs
+ */
+function writeRecoveryRecord(base, entry, fs) {
+  const file = join(base, TXN_DIR, '.recovered.jsonl')
+  let lines = []
+  try {
+    lines = String(fs.readFileSync(file, 'utf8')).split('\n').filter(Boolean)
+  } catch { lines = [] }
+  lines.push(JSON.stringify(entry))
+  const kept = lines.slice(-20)
+  try {
+    fs.mkdirSync(join(base, TXN_DIR), { recursive: true })
+    fs.writeFileSync(file, `${kept.join('\n')}\n`, 'utf8')
+  } catch { /* 记录失败不影响恢复结论；health 只是少一条证据 */ }
+}
+
+/** 恢复失败：保留事务文件并写回失败信息，下一轮启动继续重试。 */
+function keepFailedTxn(base, id, txn, failures, fs) {
+  try {
+    writeTxn(base, {
+      ...txn,
+      id,
+      failedAt: new Date().toISOString(),
+      failures,
+    }, { fs })
+  } catch { /* 写不回失败信息也不能清账；文件原样保留 */ }
+}
+
+/**
+ * 恢复一个 purge 事务（无 commit 时把“墓碑已写/文件已删”收敛回删前，或补完删除）：
+ * - 墓碑在、文件已删、manifest 未重建 → 重建 manifest，视为已完成删除（清事务）；
+ * - 墓碑在、文件仍在 → 撤销墓碑 + 还原文件（回到删前，安全优先）；
+ * - 墓碑不在、文件不在 → 用 oldText 还原文件。
+ * @returns {{restored:number,deleted:number,failures:string[]}}
+ */
+function recoverPurgeTxn(base, txn, fs) {
+  const failures = []
+  let restored = 0
+  let deleted = 0
+  const item = Array.isArray(txn.files) ? txn.files[0] : null
+  const raw = String(item?.path ?? '').trim()
+  const file = raw ? (isAbsolute(raw) ? raw : join(base, raw)) : ''
+  const tomb = String(txn?.tombstone ?? '').trim()
+  const tombExists = tomb ? existsSyncSafe(tomb, fs) : false
+  const fileExists = file ? (() => { try { return fs.existsSync(file) } catch { return false } })() : false
+  if (!file) failures.push('purge:missing_path')
+  /** 回到删前时墓碑必须撤销；否则会留下「墓碑号 + 现存同号文件」的红状态。 */
+  const dropTomb = () => {
+    if (!tombExists) return
+    try { fs.unlinkSync(tomb); fsyncDir(dirnameOf(tomb), fs) } catch (err) {
+      failures.push(`tombstone:${err?.message || err}`)
+    }
+  }
+  if (file && !fileExists && item?.oldText !== undefined && item?.oldText !== null) {
+    const wrote = durableWriteFile(file, String(item.oldText), { fs })
+    if (wrote.ok) restored += 1
+    else failures.push(`${raw}:${wrote.error}`)
+    dropTomb()
+  } else if (file && fileExists && tombExists) {
+    // 文件还在但墓碑已写：撤销墓碑（不把编号误作废），文件原样保留。
+    dropTomb()
+  } else if (file && !fileExists && (item?.oldText === undefined || item?.oldText === null)) {
+    // 无旧正文证据：只能视为删除已完成，交给 manifest 重建。
+    deleted += 1
+  }
+  const manifest = regenerateManifest(base, { fs })
+  if (!manifest.ok) failures.push(`manifest:${manifest.error}`)
+  return { restored, deleted, failures }
+}
+
+/**
+ * 启动恢复：把**全部**未完成事务收敛到一致状态（循环处理，不只第一条）。
+ *
+ * 判据分两层：
+ * 1. git 里已有本事务的提交（精确 grep proposalId/txn id）→ 事务已发布，只清日志，绝不回滚；
+ * 2. 无提交 → apply 逐文件按 `newText` 的 sha256 复核（只有仍是本事务写下的中间态才恢复）；
+ *    purge 走 `recoverPurgeTxn`（墓碑/文件/manifest 三态收敛）。
+ *
+ * **恢复失败必须保留 `.txn`**（写回 failedAt/failures），下一轮启动重试；只有全绿才清账。
+ * 成功清账后写一条 `.txn/.recovered.jsonl`，供 `/rules/health` 展示 `recovered_txn`。
+ *
+ * @param {string} root
+ * @param {{exec?:Function, log?:Function, fs?:typeof nodeFs}} [opts]
+ * @returns {{recovered:boolean, id?:string, ids:string[],
+ *   failed:boolean,
+ *   processed:Array<{id:string, op:string, committed:boolean, restored:number, deleted:number,
+ *   skipped:number, failures:string[]}>}}
+ */
 export function recoverPendingTxn(root, opts = {}) {
   const fs = opts.fs || nodeFs
   const log = typeof opts.log === 'function' ? opts.log : () => {}
   const base = baseDir(root)
   const ids = listTxns(base, { fs })
-  if (!ids.length) return { recovered: false, ids: [], processed: [] }
+  if (!ids.length) return { recovered: false, failed: false, ids: [], processed: [] }
   const processed = []
   let recovered = false
+  let failed = false
   for (const id of ids) {
     const txn = readTxn(base, id, { fs })
     if (!txn) {
-      clearTxn(base, id, { fs })
-      processed.push({ id, committed: false, restored: 0, deleted: 0, skipped: 0, failures: ['unreadable'] })
+      // 坏事务日志：保留文件（不能证明安全），health 会报；不静默清。
+      failed = true
+      processed.push({ id, op: '?', committed: false, restored: 0, deleted: 0, skipped: 0, failures: ['unreadable'] })
       continue
     }
+    const op = String(txn?.op || 'apply')
     const committed = txnHasCommit(base, txn, opts)
     let restored = 0
     let deleted = 0
     let skipped = 0
-    const failures = []
+    let failures = []
     if (!committed) {
-      for (const item of Array.isArray(txn.files) ? txn.files : []) {
-        const raw = String(item?.path ?? '').trim()
-        if (!raw) continue
-        const file = isAbsolute(raw) ? raw : join(base, raw)
-        const expected = item?.newText === undefined || item?.newText === null ? null : hashText(item.newText)
-        // 无法验证（老 txn 没记 newText）→ 不动文件，只清账：安全优先于"尽量回滚"。
-        if (!expected) { skipped += 1; continue }
-        const current = readRuleSource(file, { fs })
-        if (item?.oldText === null || item?.oldText === undefined) {
-          if (!current.ok) continue
-          if (hashText(current.text) !== expected) { skipped += 1; continue }
-          try { fs.unlinkSync(file); deleted += 1 } catch (err) {
-            if (err?.code !== 'ENOENT') failures.push(`${raw}:${err?.message || err}`)
+      if (op === 'purge') {
+        const outcome = recoverPurgeTxn(base, txn, fs)
+        restored = outcome.restored
+        deleted = outcome.deleted
+        failures = outcome.failures
+        if (restored || deleted) recovered = true
+      } else {
+        for (const item of Array.isArray(txn.files) ? txn.files : []) {
+          const raw = String(item?.path ?? '').trim()
+          if (!raw) continue
+          const file = isAbsolute(raw) ? raw : join(base, raw)
+          const expected = item?.newText === undefined || item?.newText === null ? null : hashText(item.newText)
+          // 无法验证（老 txn 没记 newText）→ 不动文件：安全优先于"尽量回滚"。
+          if (!expected) { skipped += 1; continue }
+          const current = readRuleSource(file, { fs })
+          if (item?.oldText === null || item?.oldText === undefined) {
+            if (!current.ok) { skipped += 1; continue }
+            if (hashText(current.text) !== expected) { skipped += 1; continue }
+            try { fs.unlinkSync(file); deleted += 1 } catch (err) {
+              if (err?.code !== 'ENOENT') failures.push(`${raw}:${err?.message || err}`)
+            }
+            continue
           }
-          continue
+          if (!current.ok) { skipped += 1; continue }
+          if (hashText(current.text) !== expected) { skipped += 1; continue }
+          const wrote = durableWriteFile(file, String(item.oldText), { fs })
+          if (wrote.ok) restored += 1
+          else failures.push(`${raw}:${wrote.error}`)
         }
-        if (!current.ok) { skipped += 1; continue }
-        if (hashText(current.text) !== expected) { skipped += 1; continue }
-        const wrote = durableWriteFile(file, String(item.oldText), { fs })
-        if (wrote.ok) restored += 1
-        else failures.push(`${raw}:${wrote.error}`)
+        if (restored || deleted) recovered = true
+        const manifest = regenerateManifest(base, { fs })
+        if (!manifest.ok) failures.push(`manifest:${manifest.error}`)
       }
-      if (restored || deleted) recovered = true
-      const manifest = regenerateManifest(base, { fs })
-      if (!manifest.ok) failures.push(`manifest:${manifest.error}`)
     }
-    clearTxn(base, id, { fs })
-    if (restored || deleted) {
-      log(`[whale-memory] txn recovered id=${id} restored=${restored} deleted=${deleted} skipped=${skipped}`)
-    } else if (committed) {
-      log(`[whale-memory] txn already committed, cleared id=${id}`)
-    } else if (skipped) {
-      log(`[whale-memory] txn stale (files changed since), cleared id=${id} skipped=${skipped}`)
+    if (failures.length) {
+      failed = true
+      keepFailedTxn(base, id, txn, failures, fs)
+      log(`[whale-memory] txn recovery failed id=${id} op=${op} failures=${failures.join(';')}（保留事务，下轮重试）`)
+    } else {
+      clearTxn(base, id, { fs })
+      writeRecoveryRecord(base, {
+        id, op, committed, restored, deleted, skipped, at: new Date().toISOString(),
+      }, fs)
+      if (restored || deleted) {
+        log(`[whale-memory] txn recovered id=${id} op=${op} restored=${restored} deleted=${deleted} skipped=${skipped}`)
+      } else if (committed) {
+        log(`[whale-memory] txn already committed, cleared id=${id}`)
+      } else if (skipped) {
+        log(`[whale-memory] txn stale (files changed since), cleared id=${id} skipped=${skipped}`)
+      }
     }
-    if (failures.length) log(`[whale-memory] txn recovery partial id=${id} failures=${failures.join(';')}`)
     processed.push({
-      id, committed, restored, deleted, skipped,
+      id, op, committed, restored, deleted, skipped,
       failures: failures.length ? failures : [],
     })
   }
-  return { recovered, id: processed[0]?.id, ids: processed.map((item) => item.id), processed }
+  return { recovered, failed, id: processed[0]?.id, ids: processed.map((item) => item.id), processed }
 }
 
 // ---------------------------------------------------------------------------

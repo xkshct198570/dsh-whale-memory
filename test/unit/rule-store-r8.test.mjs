@@ -16,7 +16,6 @@ import {
   RULE_FILE_MAX,
   RULE_NUMBER_MAX,
   acquireRepoLock,
-  acquireRuleLock,
   atomicWriteFile,
   clearTxn,
   commitRuleChanges,
@@ -222,10 +221,10 @@ test('仓库锁：第二写者超时被拒 repo_locked；释放后可再取', (t
   third.release()
 })
 
-test('仓库锁 stale：owner.json 超 120s → 允许接管', (t) => {
+test('仓库锁：owner pid 已死 → 允许接管（时间不参与判死）', (t) => {
   const root = freshRoot(t)
   mkdirSync(join(root, '.locks', 'repo.lock'), { recursive: true })
-  writeFileSync(join(root, '.locks', 'repo.lock', 'owner.json'), `${JSON.stringify({ pid: 99999, ts: Date.now() - 130000 })}\n`, 'utf8')
+  writeFileSync(join(root, '.locks', 'repo.lock', 'owner.json'), `${JSON.stringify({ pid: 999999, ts: Date.now() - 130000, nonce: 'dead-owner' })}\n`, 'utf8')
   const got = acquireRepoLock(root, { timeoutMs: 200 })
   assert.equal(got.ok, true, got.error)
   got.release()
@@ -238,6 +237,7 @@ test('锁 nonce：stale 接管后旧持有者 release 不得删新锁', (t) => {
   const ownerFile = join(root, '.locks', 'repo.lock', 'owner.json')
   // 模拟"持锁进程卡住超过 stale"：owner.ts 拨到 130s 前，第二写者接管。
   const staleOwner = JSON.parse(readFileSync(ownerFile, 'utf8'))
+  staleOwner.pid = 999999
   staleOwner.ts = Date.now() - 130000
   writeFileSync(ownerFile, `${JSON.stringify(staleOwner)}\n`, 'utf8')
   const second = acquireRepoLock(root, { timeoutMs: 200 })
@@ -247,22 +247,6 @@ test('锁 nonce：stale 接管后旧持有者 release 不得删新锁', (t) => {
   assert.equal(released, false, '旧持有者的 release 必须识别出锁已被接管')
   const third = acquireRepoLock(root, { timeoutMs: 50 })
   assert.equal(third.ok, false, '新持有者的锁不得被旧 release 删掉')
-  assert.equal(second.release(), true)
-})
-
-test('per-key 锁 nonce：stale 接管后旧 release 不删新锁', (t) => {
-  const root = freshRoot(t)
-  const first = acquireRuleLock(root, 'iron-rule-1', { timeoutMs: 50, staleMs: 1000 })
-  assert.equal(first.ok, true, first.error)
-  const ownerFile = join(root, '.locks', 'iron-rule-1.lock', 'owner.json')
-  const staleOwner = JSON.parse(readFileSync(ownerFile, 'utf8'))
-  staleOwner.ts = Date.now() - 5000
-  writeFileSync(ownerFile, `${JSON.stringify(staleOwner)}\n`, 'utf8')
-  const second = acquireRuleLock(root, 'iron-rule-1', { timeoutMs: 300, staleMs: 1000 })
-  assert.equal(second.ok, true, second.error)
-  assert.equal(first.release(), false)
-  const third = acquireRuleLock(root, 'iron-rule-1', { timeoutMs: 50, staleMs: 1000 })
-  assert.equal(third.ok, false, '旧 release 不得删新锁')
   assert.equal(second.release(), true)
 })
 

@@ -14,7 +14,8 @@ import { join } from 'node:path'
 import * as nodeFs from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import {
-  createRule, fileRuleNumbers, listRules, occupancy, readManifest, readRule, regenerateManifest, writeRule,
+  createRule, fileRuleNumbers, listRules, occupancy, purgeRule, readManifest, readRule, regenerateManifest,
+  readTombstones, recoverPendingTxn, writeRule, writeTombstone, writeTxn, validateRule, TXN_DIR,
 } from '../../src/core/rule-store.js'
 import { createProposal } from '../../src/core/rule-proposal.js'
 
@@ -211,4 +212,109 @@ test('R9-02：提案期编号与 manifest/create 同口径（非标准文件名�
   })
   assert.equal(made.ok, true, made.code)
   assert.equal(made.proposal.draft.number, 4, '提案期不得再承诺已被 inactive 文件占用的 3 号')
+})
+
+test('R9-20：writeRule 编号校验含墓碑 → number_retired（连自己的墓碑号也不得复活）', (t) => {
+  const root = freshRoot(t)
+  assert.equal(writeRule(root, { front: ironFront(1), text: '必须保留审计日志。' }, { git: false }).ok, true)
+  const purged = purgeRule({ root, key: 'iron-rule-1' }, { git: false })
+  assert.equal(purged.ok, true, purged.error)
+  assert.equal(occupancy(root).has(1), true, '墓碑必须进唯一占用入口')
+  assert.equal(readManifest(root).nextNumber, 2)
+
+  // 同一 key 重建：墓碑号即使是自己的也拒绝（编号永不复用），错误码必须是 number_retired。
+  const same = writeRule(root, { front: ironFront(1), text: '必须保留审计日志。' }, { git: false })
+  assert.equal(same.ok, false)
+  assert.equal(same.error, 'invalid_rule')
+  assert.equal(same.detail.some((item) => item.code === 'number_retired'), true, JSON.stringify(same.detail))
+  assert.equal(existsSync(join(root, 'iron-rule-1.md')), false, '墓碑号不得落盘')
+
+  // 换 key 但复用墓碑号也必须拒绝（编号占用与 key 无关）。
+  const other = writeRule(root, { front: ironFront(1, { key: 'iron-rule-legacy' }), text: '必须保留历史版本。' }, { git: false })
+  assert.equal(other.ok, false)
+  assert.equal(other.error, 'invalid_rule')
+  assert.equal(other.detail.some((item) => item.code === 'number_retired'), true, JSON.stringify(other.detail))
+
+  // create 走 occupancy()：墓碑后必须发 2，不得回收 1。
+  const created = createRule({ root, draft: { type: 'iron-rule', text: '必须先验证再覆盖正式库。' } })
+  assert.equal(created.ok, true, created.error)
+  assert.equal(created.number, 2)
+  assert.equal(created.key, 'iron-rule-2')
+})
+
+test('R9-20：validateRule 收到墓碑标记 map → number_retired（不是 duplicate_number）', (t) => {
+  const root = freshRoot(t)
+  assert.equal(writeTombstone(root, { key: 'iron-rule-4', number: 4 }).ok, true)
+  // 写入口自己会带墓碑；这里直接锁 validateRule 的错误码语义，避免未来有人把它改回撞号。
+  assert.equal(existsSync(join(root, 'retired', 'iron-rule-4.json')), true)
+  const numbers = new Map([[4, 'retired:iron-rule-4']])
+  const check = validateRule(ironFront(4), '必须保留审计日志。', { numbers })
+  assert.equal(check.ok, false)
+  assert.equal(check.errors.some((item) => item.code === 'number_retired'), true, JSON.stringify(check.errors))
+  assert.equal(check.errors.some((item) => item.code === 'duplicate_number'), false)
+})
+
+
+// ---------------------------------------------------------------------------
+// R9-21：purge 事务锚点 + 恢复失败保留 txn
+// ---------------------------------------------------------------------------
+
+test('R9-21：purge 事务在墓碑后/删文件前崩溃 → 恢复撤销墓碑并保留文件', (t) => {
+  const root = freshRoot(t)
+  const created = createRule({ root, draft: { text: '必须保留审计日志。', type: 'iron-rule' } }, { git: false })
+  assert.equal(created.ok, true)
+  const file = created.path
+  const oldText = readFileSync(file, 'utf8')
+  const tomb = writeTombstone(root, { key: created.key, number: created.number, reason: 'purge' })
+  assert.equal(tomb.ok, true)
+  const txn = writeTxn(root, {
+    id: 'purge-sim-1',
+    op: 'purge',
+    proposalId: `rule: purge ${created.key} (#${created.number})`,
+    createdAt: new Date().toISOString(),
+    files: [{ key: created.key, path: file, oldText }],
+    tombstone: tomb.path,
+  })
+  assert.equal(txn.ok, true)
+  // 文件仍在（模拟“墓碑已写、git rm 前 kill -9”）
+  const out = recoverPendingTxn(root, { log: () => {} })
+  assert.equal(out.failed, false)
+  assert.equal(existsSync(file), true, '文件必须保留/还原')
+  assert.equal(readTombstones(root).length, 0, '恢复删前状态必须撤销墓碑')
+  assert.equal(existsSync(join(root, TXN_DIR, 'purge-sim-1.json')), false, '成功后清事务')
+  const health = listRules(root)
+  assert.equal(health.rules.length, 1)
+})
+
+test('R9-21：purge 事务在文件已删/manifest 未重建时崩溃 → 恢复还原文件并重建 manifest', (t) => {
+  const root = freshRoot(t)
+  const created = createRule({ root, draft: { text: '必须保留审计日志。', type: 'iron-rule' } }, { git: false })
+  const file = created.path
+  const oldText = readFileSync(file, 'utf8')
+  const tomb = writeTombstone(root, { key: created.key, number: created.number, reason: 'purge' })
+  rmSync(file)
+  assert.equal(writeTxn(root, {
+    id: 'purge-sim-2',
+    op: 'purge',
+    proposalId: `rule: purge ${created.key} (#${created.number})`,
+    files: [{ key: created.key, path: file, oldText }],
+    tombstone: tomb.path,
+  }).ok, true)
+  const out = recoverPendingTxn(root, { log: () => {} })
+  assert.equal(out.failed, false)
+  assert.equal(existsSync(file), true, '无 commit 必须还原文件')
+  assert.equal(readTombstones(root).length, 0, '还原文件必须撤销墓碑')
+  const manifest = readManifest(root)
+  assert.equal(manifest.total, 1, 'manifest 必须由恢复重建')
+})
+
+test('R9-21：坏事务日志不得静默清除，failed=true 且文件保留', (t) => {
+  const root = freshRoot(t)
+  const txnDir = join(root, TXN_DIR)
+  const { mkdirSync } = nodeFs
+  mkdirSync(txnDir, { recursive: true })
+  writeFileSync(join(txnDir, 'broken.json'), 'not-json', 'utf8')
+  const out = recoverPendingTxn(root, { log: () => {} })
+  assert.equal(out.failed, true)
+  assert.equal(existsSync(join(txnDir, 'broken.json')), true, '无法证明安全时必须保留锚点')
 })
