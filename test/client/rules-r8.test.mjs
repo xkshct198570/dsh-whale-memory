@@ -145,11 +145,14 @@ test('详情：错误态可重试 + versions 合并进历史 + git 提交 subjec
   assert.deepEqual(api.mergeRuleVersions([], []), [])
 })
 
-test('长列表 overflow:auto 双轴滚动；窄屏横向滚动容器保留', () => {
+// R9-07 契约改版：旧断言锁的是「表格容器 overflowY:auto + maxHeight:70vh」双轴滚动，
+// 而 R9-07 要求表格只横滚、纵向交给页根（单一纵向滚动根）。计划书 §6 允许「确需改语义
+// 必须写明改哪条」，这里按新契约重写同一条用例，未新增/删除其他用例。
+test('长列表只横滚（纵向交给页根）；窄屏横向滚动容器保留', () => {
   const table = tableSource()
-  assert.match(table, /overflowY: 'auto'/, '长列表缺纵向滚动')
   assert.match(table, /overflowX: 'auto'/, '窄屏横向滚动被删')
-  assert.match(table, /maxHeight: '70vh'/, '缺高度上限，长列表会撑满页面')
+  assert.doesNotMatch(table, /overflowY: 'auto'/, '表格容器仍在纵向滚动（应交给页根）')
+  assert.doesNotMatch(table, /maxHeight/, '表格容器仍设高度（70vh 已按 R9-07 去掉）')
   assert.ok(table.indexOf("overflowX: 'auto'") < table.indexOf("h('table'"), '滚动容器必须在表格外层')
 })
 
