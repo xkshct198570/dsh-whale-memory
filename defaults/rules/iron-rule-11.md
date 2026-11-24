@@ -9,13 +9,13 @@ modality: must
 action: 提炼后落库
 object: "入库记忆／规则／铁律"
 conditions: [点名入库的记忆规则铁律, 记忆清洁改写, 主动总结入库]
-exceptions: [口语冗余, 歧义句, 带提示词尾巴/链接, 无法取证断言]
+exceptions: []
 status: active
 merged_into: ""
 superseded_by: ""
 created: 2026-11-22
 updated: 2026-11-24
-version: 3
+version: 4
 origin: default:iron-rule-11
 ---
 

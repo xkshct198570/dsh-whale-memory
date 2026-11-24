@@ -173,7 +173,7 @@ test('例外清单不丢：17 保留 5 条、14 保留 pin 例外、11 保留 4 
   const byKey = new Map(allDocs.map(({ doc }) => [doc.front.key, doc]))
   assert.equal(byKey.get('iron-rule-17').front.exceptions.length, 5)
   assert.ok(byKey.get('iron-rule-14').front.exceptions.some((item) => item.includes('pin')))
-  assert.equal(byKey.get('iron-rule-11').front.exceptions.length, 4)
+  assert.equal(byKey.get('iron-rule-11').front.exceptions.length, 0, '11 的 exceptions 不得再填禁收内容')
 })
 
 test('defaults/README.md 说明默认值可改可停用可删除，计 20 文件，且 13 不参与播种', () => {

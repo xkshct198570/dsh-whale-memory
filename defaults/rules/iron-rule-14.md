@@ -9,13 +9,13 @@ modality: must
 action: 同轮产出四件
 object: 网络通路交付
 conditions: [交付网络通路]
-exceptions: ["net.sh pin 显式登记的真身 IP 须带复核命令与失效判据"]
+exceptions: ["net.sh pin 显式登记的真身 IP（须带复核命令与失效判据）"]
 status: active
 merged_into: ""
 superseded_by: ""
 created: 2026-11-22
 updated: 2026-11-24
-version: 2
+version: 3
 origin: default:iron-rule-14
 ---
 
