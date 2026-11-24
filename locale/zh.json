@@ -926,5 +926,7 @@
   "err.report_missing": "收尾报告不存在",
   "err.report_path_outside": "报告路径越界，已拒绝",
   "overview.wrapDisabled": "会话收尾已关闭；到「设置 → 收尾沉淀」启用。",
-  "err.busy_wrap": "已有收尾任务在跑，稍后再试（可能在别的会话）"
+  "err.busy_wrap": "已有收尾任务在跑，稍后再试（可能在别的会话）",
+  "settings.wrapRetentionDays": "台账/报告保留天数",
+  "settings.wrapRetentionDaysDesc": "默认 180 天；0=永久。只清理已结束的收尾记录与不再被引用的报告，排队/运行中的不删。"
 }

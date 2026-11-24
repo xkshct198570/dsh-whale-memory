@@ -71,6 +71,7 @@ Session wrap group:
 | `wrap.maxItems` | `8` | Maximum candidates/proposals per run |
 | `wrap.autoAccept` | `false` | Bypass shadow review (not recommended) |
 | `wrap.maxRunsPerDay` | `6` | Automatic triggers per day; explicit/manual are not capped |
+| `wrap.retentionDays` | `180` | Delete finished runs and unreferenced reports older than this; `0` keeps forever |
 | `wrap.report` | `true` | Write a Markdown report without raw conversation |
 | `wrap.model` | `''` | Override the model id; provider still comes from the default selection |
 

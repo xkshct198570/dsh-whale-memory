@@ -926,5 +926,7 @@
   "err.report_missing": "Wrap report not found",
   "err.report_path_outside": "Report path outside the reports directory; refused",
   "overview.wrapDisabled": "Session wrap is off. Enable it under Settings → Session wrap.",
-  "err.busy_wrap": "A wrap run is already queued or running; try again shortly (possibly another session)"
+  "err.busy_wrap": "A wrap run is already queued or running; try again shortly (possibly another session)",
+  "settings.wrapRetentionDays": "Run/report retention (days)",
+  "settings.wrapRetentionDaysDesc": "Default 180; 0 keeps forever. Only finished runs and unreferenced reports are removed; queued/running runs are never deleted."
 }

@@ -80,19 +80,20 @@ test('真宿主：显式收尾入队 run+job+spool，/wrap/status 可见；job p
       if (!row) await new Promise((resolve) => setTimeout(resolve, 25))
     }
     assert.ok(row, '显式收尾必须建 wrap_runs 行')
-    assert.equal(row.state, 'queued')
+    // 入队后会主动踢一次 keeper：干净 host 没有 llm，执行会立刻落 skipped:no_model。
+    assert.ok(['queued', 'running', 'skipped'].includes(row.state), `unexpected state ${row.state}`)
     assert.equal(row.trigger, 'explicit')
 
     const job = db.prepare("SELECT * FROM jobs WHERE kind='wrap' ORDER BY id DESC LIMIT 1").get()
     assert.ok(job, '必须有 wrap job')
-    assert.equal(job.state, 'queued')
+    assert.ok(['queued', 'running', 'done'].includes(job.state), `unexpected job state ${job.state}`)
     assert.equal(String(job.payload).includes('动库前先备份'), false, 'job payload 不得含正文')
 
     const status = await (await fetch(base + '/whale-memory/api/wrap/status')).json()
     assert.equal(status.ok, true)
     assert.equal(status.supported, true)
     assert.equal(status.latest.id, Number(row.id))
-    assert.equal(status.latest.state, 'queued')
+    assert.equal(status.latest.state, row.state)
     assert.equal(JSON.stringify(status).includes('动库前先备份'), false, '状态接口不得泄露正文')
 
     const spoolDir = join(home, 'spool', 'session-wrap')

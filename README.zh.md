@@ -58,7 +58,7 @@
 | 注入 | 召回与注入 | `enabled=true`、`maxHits=5`、`charBudget=1500`（**0 = 关闭注入**）、`intentBudget=true`、`minRel=0.34`、`timeoutMs=2000` |
 | 写入 | 记不记、怎么审 | `enabled=true`、`reviewMode='shadow'`（候选需在面板接受才入库；`auto` 直接落库）、`maxChars=500`、`dailyCap=200`、`judge='rules'`、`searchFeed=false`、`searchTtlHours=24` |
 | 反思 | 后台提炼 | `enabled=false`、`idleMinutes=30`、`maxItems=8`、`maxRunsPerDay=24`、`model=''` |
-| 收尾 | 会话结束沉淀 | `enabled=true`、`explicit=true`、`idle=false`、`disposed=false`（后台两路默认关）、`idleMinutes=10`、`maxItems=8`、`autoAccept=false`、`maxRunsPerDay=6`（只限自动）、`report=true`、`model=''`、`maxMaterialChars=12000` |
+| 收尾 | 会话结束沉淀 | `enabled=true`、`explicit=true`、`idle=false`、`disposed=false`（后台两路默认关）、`idleMinutes=10`、`maxItems=8`、`autoAccept=false`、`maxRunsPerDay=6`（只限自动）、`retentionDays=180`、`report=true`、`model=''`、`maxMaterialChars=12000` |
 | 巩固 | 定期合并 | `enabled=true`、`intervalHours=6` |
 | 向量 | 语义检索 | `enabled=false`、`endpoint=''`、`model=''`、`batch=16`（当前版本未接外部嵌入服务） |
 | 隐私 | 脱敏与保留 | `redact=true`、`retentionDays=0`（0 = 不自动清理） |

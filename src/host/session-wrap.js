@@ -179,6 +179,7 @@ export function installSessionWrap(ctx, {
       maxItems: num(w.maxItems, 8),
       autoAccept: bool(w.autoAccept, false),
       spoolTtlHours: num(w.spoolTtlHours, 24),
+      retentionDays: num(w.retentionDays, 180),
       maxRunsPerDay: num(w.maxRunsPerDay, 6),
       report: reportOverride === null ? bool(w.report, true) : Boolean(reportOverride),
       model: String(value(w.model, '') || ''),
@@ -235,6 +236,18 @@ export function installSessionWrap(ctx, {
   const enqueueJob = (run, spoolPath) => {
     const jobId = keeper.enqueue('wrap', { runId: Number(run.id), spoolPath, materialHash: run.material_hash })
     withDb((db) => updateRun(db, run.id, { job_id: Number(jobId), state: 'queued' }))
+    // 入队后主动踢一次 keeper：面板「立即收尾」不能等 10 分钟定时 tick。
+    // tick 自身有单飞/水位闸门，重复踢只会 skipped:'busy'，不会起第二个 job。
+    if (typeof keeper.tick === 'function') {
+      try {
+        const task = keeper.tick()
+        if (task && typeof task.catch === 'function') {
+          task.catch((err) => log(`[whale-memory] wrap kick tick fail-open: ${err?.message || err}`))
+        }
+      } catch (err) {
+        log(`[whale-memory] wrap kick tick fail-open: ${err?.message || err}`)
+      }
+    }
     return Number(jobId)
   }
 
@@ -715,6 +728,53 @@ export function installSessionWrap(ctx, {
     } catch { return { ok: false, error: 'report_unreadable' } }
   }
 
+  /**
+   * 台账/报告保留策略：删除超过 retentionDays 的终态 run，并清扫不再被任何 run 引用的旧报告。
+   * 只动 done/failed/skipped 的 run（queued/running 可能在续跑，绝不删）；0 = 永久保留。
+   * 报告先收集“仍在台账里的路径”再删，避免删掉仍可回查的报告。
+   */
+  function sweepStorage() {
+    if (!supported) return { runs: 0, reports: 0 }
+    const days = wrapCfg().retentionDays
+    if (!(days > 0)) return { runs: 0, reports: 0 }
+    const cutoff = now() - days * 86400
+    let runs = 0
+    let keptPaths = new Set()
+    try {
+      runs = withDb((db) => {
+        const info = db.prepare(`DELETE FROM wrap_runs WHERE created_at < ?
+          AND state IN ('done','failed','skipped')`).run(cutoff)
+        const rows = db.prepare("SELECT report_path FROM wrap_runs WHERE report_path <> ''").all()
+        keptPaths = new Set(rows.map((row) => String(row.report_path)))
+        return Number(info?.changes || 0)
+      })
+    } catch (err) {
+      log(`[whale-memory] wrap retention runs fail-open: ${err?.message || err}`)
+      return { runs: 0, reports: 0 }
+    }
+    let reports = 0
+    try {
+      const dir = reportDir()
+      if (existsSync(dir)) {
+        for (const name of readdirSync(dir)) {
+          if (!/^session-wrap-.*\.md$/.test(name)) continue
+          const abs = join(dir, name)
+          if (keptPaths.has(abs)) continue
+          try {
+            if (statSync(abs).mtimeMs < cutoff * 1000) {
+              rmSync(abs, { force: true })
+              reports += 1
+            }
+          } catch { /* 单文件失败不影响其它 */ }
+        }
+      }
+    } catch (err) {
+      log(`[whale-memory] wrap retention reports fail-open: ${err?.message || err}`)
+    }
+    if (runs || reports) log(`[whale-memory] wrap retention deleted runs=${runs} reports=${reports} days=${days}`)
+    return { runs, reports }
+  }
+
   /** spool TTL 清扫：只删超过 TTL 的文件；终态由 execute 自己删，不在清扫里猜状态。 */
   function sweepSpool({ ttlHours = null } = {}) {
     const ttl = Math.max(1, Number(ttlHours) || wrapCfg().spoolTtlHours)
@@ -778,10 +838,12 @@ export function installSessionWrap(ctx, {
     bootTimer = setTimeout(() => {
       try { reconcile() } catch (err) { log(`[whale-memory] wrap reconcile fail-open: ${err?.message || err}`) }
       try { sweepSpool() } catch (err) { log(`[whale-memory] wrap spool sweep fail-open: ${err?.message || err}`) }
+      try { sweepStorage() } catch (err) { log(`[whale-memory] wrap retention fail-open: ${err?.message || err}`) }
     }, Math.max(0, Number(reconcileDelayMs) || 1500))
     if (typeof bootTimer.unref === 'function') bootTimer.unref()
     timer = setInterval(() => {
       try { sweepSpool() } catch (err) { log(`[whale-memory] wrap spool sweep fail-open: ${err?.message || err}`) }
+      try { sweepStorage() } catch (err) { log(`[whale-memory] wrap retention fail-open: ${err?.message || err}`) }
     }, SWEEP_INTERVAL_MS)
     if (typeof timer.unref === 'function') timer.unref()
   }
@@ -800,7 +862,7 @@ export function installSessionWrap(ctx, {
   }
 
   return {
-    onTrigger, manual, status, report, sweepSpool, reconcile, execute,
+    onTrigger, manual, status, report, sweepSpool, sweepStorage, reconcile, execute,
     canAutoTrigger, supported, dispose,
   }
 }

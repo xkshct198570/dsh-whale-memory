@@ -191,7 +191,8 @@ console.log(
 
 /** 客户端标记块期望内容（与 --write 生成结果逐字一致）。 */
 function expectedBlock() {
-  const json = JSON.stringify(dicts, null, 2).replace(/\n/g, '\n    ')
+  // 生成块是构建产物，不是人读源码：紧凑 JSON 避免 2.7k 行数据淹没 client.js 的真实逻辑。
+  const json = JSON.stringify(dicts)
   return `${MARK_START}\n    const dict = ${json}\n    ${MARK_END}`
 }
 

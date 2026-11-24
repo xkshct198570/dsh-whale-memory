@@ -68,6 +68,8 @@ export const Config = z.object({
     maxItems: z.natural().min(1).max(32).default(8).volatile(),
     autoAccept: z.boolean().default(false).volatile(),
     spoolTtlHours: z.natural().min(1).max(720).default(24),
+    // 终态 run/报告的保留天数；0=永久。queued/running 永不删。
+    retentionDays: z.natural().min(0).max(3650).default(180),
     maxRunsPerDay: z.natural().min(1).max(96).default(6),
     report: z.boolean().default(true).volatile(),
     model: z.string().default(''),

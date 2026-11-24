@@ -62,7 +62,7 @@ test('i18n 三语键集完全一致', () => {
 test('client 标记块与 locale JSON 逐字一致', () => {
   const START = '// >>> locale:generated（由 scripts/i18n-check.mjs --write 生成，勿手改）'
   const END = '// <<< locale:generated'
-  const json = JSON.stringify(dicts, null, 2).replace(/\n/g, '\n    ')
+  const json = JSON.stringify(dicts)
   const expected = `${START}\n    const dict = ${json}\n    ${END}`
   assert.ok(CLIENT.includes(START), '缺少生成块起始标记')
   assert.ok(CLIENT.includes(END), '缺少生成块结束标记')
@@ -320,10 +320,10 @@ const EFFECT_EXCEPTIONS = {
   'panel.tab': 'instant', // 保存后 Panel 立即切换页签（onSaved）
 }
 
-test('设置项元数据单处定义：67 字段默认值对齐 config.js', () => {
+test('设置项元数据单处定义：68 字段默认值对齐 config.js', () => {
   const meta = settingsMeta()
   const schema = configSchema()
-  assert.equal(Object.keys(meta).length, 67, 'SETTINGS_META 字段数必须等于 Config 的 14 组 / 67 字段')
+  assert.equal(Object.keys(meta).length, 68, 'SETTINGS_META 字段数必须等于 Config 的 14 组 / 68 字段')
   for (const [key, item] of Object.entries(meta)) {
     const [group, field = null] = key.split('.')
     const raw = schema[group] ? (field === null ? schema[group].def : schema[group][field] && schema[group][field].def) : null

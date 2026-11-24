@@ -6,7 +6,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { openDb, closeDb } from '../../src/core/db.js'
@@ -63,6 +63,8 @@ function fakeKeeper(db) {
       jobs.push({ id, kind, payload })
       return id
     },
+    tickCount: 0,
+    tick() { this.tickCount += 1; return Promise.resolve({ ran: [] }) },
     status() {
       const rows = db.prepare('SELECT id,kind,state,attempts,last_error FROM jobs ORDER BY id DESC LIMIT 200').all()
       let running = 0
@@ -138,6 +140,7 @@ test('onTrigger：run+spool+job 幂等；spool 0600；job payload 只含指针�
   const mode = statSync(payload.spoolPath).mode & 0o777
   assert.equal(mode, 0o600, `spool 权限必须 0600，实际 ${mode.toString(8)}`)
 
+  assert.ok(s.keeper.tickCount >= 1, '入队后必须主动踢一次 keeper（立即收尾不能等 10 分钟 tick）')
   const again = await s.wrap.onTrigger({ sessionId: 's1', trigger: 'explicit', material: MATERIAL, identity: { userId: 'u1' }, header: { id: 's1' }, hash: 'hash-1', now: Date.now() / 1000 })
   assert.equal(again.ok, true)
   assert.equal(again.existing, true, '同材料必须幂等')
@@ -479,3 +482,40 @@ function sDeleteSpool(runOut, keeper, db) {
   } catch { /* ignore */ }
   void runOut
 }
+
+
+test('保留策略：只删超期终态 run 与不再被引用的旧报告；queued/running 与在册报告不动', async (t) => {
+  const s = setup(t, { overrides: { wrap: { ...configOf('/tmp').wrap, retentionDays: 2 } } })
+  const { utimesSync } = await import('node:fs')
+  const now = Date.now() / 1000
+  const oldAt = now - 5 * 86400
+  // 旧 done run + 旧报告（不在册）
+  const oldRun = s.withDb((db) => db.prepare(`INSERT INTO wrap_runs
+    (session_id,material_hash,state,trigger,phase,candidates,report_path,created_at,updated_at)
+    VALUES ('old','old','done','idle','done',1,?,?,?)`).run(
+    join(s.dir, 'reports', 'session-wrap-old.md'), oldAt, oldAt).lastInsertRowid)
+  mkdirSync(join(s.dir, 'reports'), { recursive: true })
+  const oldReport = join(s.dir, 'reports', 'session-wrap-old.md')
+  writeFileSync(oldReport, '# old')
+  utimesSync(oldReport, oldAt, oldAt)
+  // 旧 done run 但报告仍被保留记录引用：报告不得删
+  const keptReport = join(s.dir, 'reports', 'session-wrap-kept.md')
+  writeFileSync(keptReport, '# kept')
+  utimesSync(keptReport, oldAt, oldAt)
+  const keptRun = s.withDb((db) => db.prepare(`INSERT INTO wrap_runs
+    (session_id,material_hash,state,trigger,phase,report_path,created_at,updated_at)
+    VALUES ('kept','kept','queued','idle','created',?,?,?)`).run(keptReport, oldAt, oldAt).lastInsertRowid)
+  // 新 done run：不删
+  const newRun = s.withDb((db) => db.prepare(`INSERT INTO wrap_runs
+    (session_id,material_hash,state,trigger,phase,created_at,updated_at)
+    VALUES ('new','new','done','idle','done',?,?)`).run(now, now).lastInsertRowid)
+
+  const swept = s.wrap.sweepStorage()
+  assert.equal(swept.runs, 1, '只删超期且终态的 run')
+  assert.equal(swept.reports, 1, '只删不在册的旧报告')
+  assert.equal(s.withDb((db) => db.prepare('SELECT count(*) n FROM wrap_runs WHERE id=?').get(oldRun).n), 0)
+  assert.equal(existsSync(oldReport), false)
+  assert.equal(existsSync(keptReport), true, '仍在册（queued）的报告不得删')
+  assert.equal(s.withDb((db) => db.prepare('SELECT count(*) n FROM wrap_runs WHERE id=?').get(keptRun).n), 1)
+  assert.equal(s.withDb((db) => db.prepare('SELECT count(*) n FROM wrap_runs WHERE id=?').get(newRun).n), 1)
+})

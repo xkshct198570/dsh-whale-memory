@@ -1,6 +1,6 @@
 # 会话收尾沉淀（Session Wrap）· 架构书 v1（已落地）
 
-> 状态：**W1–W6 已实现并通过 1010 项测试**（1009 pass / 1 skip / 0 fail）；尚未做 live 重启验证与 0.6.4 发布。
+> 状态：**W1–W6 已实现并通过 1011 项测试**（1010 pass / 1 skip / 0 fail）；尚未做 live 重启验证与 0.6.4 发布。
 > 基线：鲸忆 0.6.4 工作树（schema v5）/ DSH 0.2.2-rc.5 / Node ≥22.13。
 > 适用对象：local / hybrid 后端的 owner 会话；http 后端明确不支持（无本地 run 台账）。
 
@@ -191,6 +191,7 @@ switch_ready_json, error, created_at, updated_at`；唯一 `(session_id, materia
 | `wrap.maxItems` | 8 | 即时 | 单次最多条目 |
 | `wrap.autoAccept` | false | 即时 | 自动接受候选（绕过 shadow，默认关） |
 | `wrap.spoolTtlHours` | 24 | 重载 | spool 保留 |
+| `wrap.retentionDays` | 180 | 重载 | 终态 run/报告保留天数；0=永久；queued/running 不删 |
 | `wrap.maxRunsPerDay` | 6 | 重载 | **只限制 idle/disposed**；显式/手动是人工动作不受限 |
 | `wrap.report` | true | 即时 | 写报告 |
 | `wrap.model` | '' | 重载 | 覆盖模型 id；provider 仍取默认选择 |
@@ -217,9 +218,9 @@ switch_ready_json, error, created_at, updated_at`；唯一 `(session_id, materia
 
 ## 15. 测试与证据
 
-- 全量：`npm test` → **1010 tests / 1009 pass / 1 skip / 0 fail**（17s）。
+- 全量：`npm test` → **1011 tests / 1010 pass / 1 skip / 0 fail**（17s）。
 - 新增分层：意图/材料/蒸馏/报告/审计单测 49+；采集 11；编排 11；路由契约 6；run 台账 6；真宿主装载 1；客户端渲染冒烟 +2。
-- 静态门：`node scripts/check.mjs` E1–E16 全通过；`i18n` 三语 924 键；`manual --check` 一致。
+- 静态门：`node scripts/check.mjs` E1–E16 全通过；`i18n` 三语 926 键；`manual --check` 一致。
 - 关键断言：job payload/status/report 无原文；spool 0600；done 不重跑；断点续跑不重复调模型；写失败 job 不 done；候选 forceShadow；accept 保留 origin；report 越界拒绝；rate limit 只拦自动。
 
 ## 16. 迁移 / 回滚 / 风险
