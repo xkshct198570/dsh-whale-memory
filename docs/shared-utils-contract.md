@@ -37,7 +37,7 @@
 
 ## 5. 下一步
 
-**P3a（本仓）**：rule-store 按 parse+manifest / history+git+lock / write+facade 拆分，门面只 re-export；`check-deps` 白名单保持空。
+**P3b（本仓）**：rule-reconcile 按 compile/relation/merge-prompt/guards 拆分，门面只 re-export；`check-deps` 白名单保持空；每步导出对拍、定向测试、`lint-size`/`check` 全绿才下一步。P3a 已收口（tag `p3a-done`）：rule-store 8 模块 + 64 行纯 re-export 门面。
 
 **P6（跨插件）**：
 
