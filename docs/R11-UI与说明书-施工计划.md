@@ -28,7 +28,7 @@
 - 不重启/杀 DSH；只对精确 PID 动手；网关只从 `~/start-gateway.sh` 起。
 - 动库前 `wal_checkpoint(TRUNCATE)` → `VACUUM INTO backup/whale-<ts>.db`。
 - 回滚：插件 git `git revert 753b88c`（或 check out `v0.6.3` 前一个提交）；规则仓按 `history/<key>/` 快照或 git revert 恢复单条；DB 用重启前快照覆盖（先停插件写入）。
-- 铁律编号不复用；被并条只加 `merged_into`，不回收编号；Release 不覆盖旧 tag 资产。
+- 铁律编号不复用；被并条物理删除并写墓碑（8/20 已作废），不回收编号；Release 不覆盖旧 tag 资产。
 
 ## 4. 交接入口
 
