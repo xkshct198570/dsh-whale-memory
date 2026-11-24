@@ -2,8 +2,8 @@
  * 默认铁律内容单测：包内 `defaults/` 是市场安装后的默认铁律。
  *
  * 口径：
- * - `defaults/rules/` = 20 文件：19 条带编号（1–19 除空号 6、除本地专用 13，另含 21／22）+ 1 条无编号安全行（number: 0，key=iron-rule-safety）；
- * - `iron-rule-8` 已并入 `iron-rule-7`（`merged_into: iron-rule-7`），文件与编号保留作指针；
+ * - `defaults/rules/` = 20 文件：19 条带编号（1–19 除空号 6、除本地专用 13，另含 21／22／23）+ 1 条无编号安全行（number: 0，key=iron-rule-safety）；
+ * - `iron-rule-8` 的判据并入 `iron-rule-7`，编号 8 已作废（墓碑），不再随包播种；
  * - `defaults/rules-local/iron-rule-13.md` = 本机对照组专属，仅 workspace 作用域，不参与默认播种；
  * - 每条都必须能被规则仓同一套 parse/normalize/validate 口径接受，正文指令形态、无理由句与模糊词。
  */
@@ -28,7 +28,7 @@ const readmePath = join(root, 'defaults', 'README.md')
 
 const VAGUE_RE = /(尽量|最好|尽可能|大概|也许|可能)/
 const REASON_RE = /(因为|由于|理由是)/
-const EXPECTED_NUMBERS = [1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22]
+const EXPECTED_NUMBERS = [1, 2, 3, 4, 5, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23]
 
 /** 读一个目录下的 .md 文件（README 不算规则），返回原文与解析结果。 */
 function loadDocs(dir) {
@@ -89,7 +89,7 @@ test('全部文件通过 validateRule（numbers Map 排除自身）', () => {
   }
 })
 
-test('编号集合 = 1–19 除空号 6 与 13、再加 21／22 的 19 个带号 + 1 个 number=0，且无重复', () => {
+test('编号集合 = 1–19 除空号 6 与 13、再加 21／22／23 的 19 个带号 + 1 个 number=0，且无重复', () => {
   const numbers = generalDocs.map(({ doc }) => doc.front.number).sort((a, b) => a - b)
   assert.deepEqual([...new Set(numbers)], numbers, 'rules/ 内编号不得重复')
 
@@ -97,10 +97,12 @@ test('编号集合 = 1–19 除空号 6 与 13、再加 21／22 的 19 个带号
   assert.equal(zero.length, 1, '必须恰有一条无编号（number: 0）的安全行')
 
   const numbered = numbers.filter((n) => n > 0)
-  assert.deepEqual(numbered, EXPECTED_NUMBERS.filter((n) => n !== 6 && n !== 13), '带号规则只允许 1–19 除 6 与 13，加 21／22')
+  assert.deepEqual(numbered, EXPECTED_NUMBERS.filter((n) => n !== 6 && n !== 13), '带号规则只允许 1–19 除 6 与 13，加 21／22／23')
   assert.ok(!numbers.includes(6), '空号 6 永不复用')
   assert.ok(numbers.includes(18) && numbers.includes(19), '18/19 必须随包播种（D2）')
   assert.ok(numbers.includes(21) && numbers.includes(22), '21/22 必须随包播种（R11/WP4）')
+  assert.ok(numbers.includes(23), '23 必须随包播种（可维护性结构闸门）')
+  assert.ok(!numbers.includes(8), '墓碑编号 8 不得随包复活')
   assert.ok(!numbers.includes(20), '墓碑编号 20 不得随包复活')
   assert.equal(numbered.length, 19)
 })
@@ -152,7 +154,7 @@ test('origin 标明默认来源或本机手工入仓，key 与文件名一致', 
   }
 })
 
-test('统一 front 口径：iron-rule / P0 / active / 入仓日期（22–24）/ 只有 8 带合并指针', () => {
+test('统一 front 口径：iron-rule / P0 / active / 入仓日期（22–24）/ 无合并指针', () => {
   for (const { name, doc } of allDocs) {
     assert.equal(doc.front.type, 'iron-rule', `${name} type`)
     assert.equal(doc.front.priority, 'P0', `${name} priority`)
@@ -160,12 +162,8 @@ test('统一 front 口径：iron-rule / P0 / active / 入仓日期（22–24）/
     // 18/19 是 2026-11-23 入仓，21/22 是 2026-11-24；其余 2026-11-22，R11 重编后 updated 统一 2026-11-24。
     assert.ok(['2026-11-22', '2026-11-23', '2026-11-24'].includes(doc.front.created), `${name} created=${doc.front.created}`)
     assert.ok(['2026-11-22', '2026-11-23', '2026-11-24'].includes(doc.front.updated), `${name} updated=${doc.front.updated}`)
-    if (doc.front.key === 'iron-rule-8') {
-      // 8 并入 7：指针是唯一合法非空 merged_into（链终点 7 仍 active）。
-      assert.equal(doc.front.merged_into, 'iron-rule-7', `${name} 合并指针必须指向 7`)
-    } else {
-      assert.equal(doc.front.merged_into, '', `${name} merged_into`)
-    }
+    // 8 已作废，默认包不再有合并指针；所有随包规则 merged_into 为空。
+    assert.equal(doc.front.merged_into, '', `${name} merged_into`)
     assert.equal(doc.front.superseded_by, '', `${name} superseded_by`)
     assert.equal(doc.front.role, '', `${name} role`)
   }
@@ -186,6 +184,6 @@ test('defaults/README.md 说明默认值可改可停用可删除，计 20 文件
   assert.match(readme, /不参与默认播种/)
   assert.match(readme, /20 个文件/, 'README 必须写对文件数')
   assert.match(readme, /19 条带编号/, 'README 必须写对带号条数')
-  assert.match(readme, /merged_into: iron-rule-7/, 'README 必须说明 8 并入 7')
-  assert.match(readme, /23/, 'README 必须写对下一条编号')
+  assert.match(readme, /8.*墓碑|墓碑.*8/, 'README 必须说明 8 已作废')
+  assert.match(readme, /24/, 'README 必须写对下一条编号')
 })

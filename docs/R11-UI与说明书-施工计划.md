@@ -8,7 +8,8 @@
 1. **Session Wrap live 验证**：W1–W6 已实现（架构/计划见 `docs/Session-Wrap-*`）；profile 以 link 指向本仓，host 重启前 `/wrap` 与 `wrap` 设置组不可用。重启后验三路由+保存；隔离安装见施工计划 §2。
 2. **市场 PR**：`awesome-dsh-plugin/awesome-dsh-plugin#18412` 已开（两条 entry），check **success**；等维护者评审。合并后 README 由上游生成，不手改。
 3. **可选：live 重启**：加载本轮 host 修复（allowRemote peer 闸、写队列、错误码、Session Wrap）与 schema v5；client 可先更新，host 不重启仍是旧代码。
-4. **可选优化（有实测再合，不做不算欠账）**：面板规则健康入口；`computeMetrics` 5–10s 缓存（受 stats 即时性测试约束，需先量化面板轮询开销）；worker 按 dbPath 复用连接。
+4. **可维护性重组（下一会话开工）**：铁律 23 已入仓；架构书/施工计划见 `/mnt/i/ai-workspace/ai-router/docs/鲸忆与人设插件-可维护性重组-架构书-v1-2026-11-24.md` 与同名施工计划。P1 先做客户端源/产物构建骨架，随后按依赖拆 `rule-store/writer/backend/rule-reconcile/rule-proposal` 与 rules/client；重组期间冻结新功能。
+5. **可选优化（有实测再合，不做不算欠账）**：面板规则健康入口；`computeMetrics` 5–10s 缓存（受 stats 即时性测试约束，需先量化面板轮询开销）；worker 按 dbPath 复用连接。
 
 ## 2. 验收依据（已实测）
 
