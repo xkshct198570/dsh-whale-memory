@@ -653,12 +653,14 @@ test('WP2 设置信息架构：顺序固定、首屏四组展开、其余默认�
   assert.match(CLIENT, /SETTINGS_GROUP_ORDER\.map\(\(key\) => \(groupNodes\[key\]/, '未按顺序渲染分组')
   assert.match(CLIENT, /h\(React\.Fragment, \{ key \}, groupNodes\[key\]\(\)\)/, '分组列表缺稳定 key')
   // 折叠卡自己取文案：调用方必须注入 t，否则首渲染就 ReferenceError。
-  assert.equal((CLIENT.match(/t, titleKey: 'settings\.group/g) || []).length, 13, '13 个分组卡必须全部注入 t')
+  assert.equal((CLIENT.match(/t, titleKey: 'settings\.group/g) || []).length, 14, '13 个网格分组 + 危险区都必须注入 t')
   assert.match(CLIENT, /t, titleKey: 'settings\.groupRecall'/)
   assert.match(CLIENT, /SETTINGS_CORE_GROUP_KEYS = new Set\(\[\s*'settings\.groupRecall', 'settings\.groupWrite', 'settings\.groupIdentity', 'settings\.groupRules',\s*\]\)/)
   assert.match(CLIENT, /function readGroupOpen\(/, '缺展开状态读取')
   assert.match(CLIENT, /function writeGroupOpen\(/, '缺展开状态持久化')
   assert.match(CLIENT, /titleKey === 'settings\.groupDanger'/, '危险区未强制展开')
+  // 危险区调用必须也传 titleKey/t：只传 title 会让 alwaysOpen 判定失败并调用未注入的 t（R11 白屏根因）。
+  assert.match(CLIENT, /t, titleKey: 'settings\.groupDanger'/, '危险区分组卡缺 titleKey/t')
   // 布局根因：input 不再继承 flex-basis；grid 不再 stretch。
   assert.match(CLIENT, /fieldInput: \{\s*flex: '0 0 auto', width: '100%'/, 'input 仍会被 column flex-basis 拉高')
   assert.match(CLIENT, /groupGrid: \{\s*display: 'grid', gridTemplateColumns: 'repeat\(auto-fit, minmax\(260px, 1fr\)\)',\s*gap: '10px', alignItems: 'start',/, 'grid 仍会拉伸空卡')
