@@ -24,6 +24,7 @@ import {
   localeCounts,
   readSchemaVersion,
   readTestCounts,
+  readTestRunMeta,
   sha256File,
 } from './capture-baseline.mjs'
 
@@ -282,12 +283,22 @@ async function main() {
     try {
       const baseline = readBaselineJson(SNAPSHOT_FILES.testCounts)
       const current = readTestCounts()
-      const diffs = []
+      const meta = readTestRunMeta()
       for (const key of ['pass', 'skip', 'fail']) {
-        if (baseline?.[key] !== current[key]) diffs.push(`${key} ${baseline?.[key]} != ${current[key]}`)
+        if (!Number.isInteger(baseline?.[key])) throw new Error(`基线 test-counts.${key} 不是整数（${JSON.stringify(baseline?.[key])}）`)
       }
+      // 口径是“不降”而不是“相等”：重构期新增契约测试会合法抬高 pass，不能把新增当回归。
+      // 判据与 posttest 的 check-test-counts 同源：exitCode=0、fail=0、pass≥基线、skip≤基线。
+      const diffs = []
+      if (meta.exitCode !== 0) diffs.push(`exitCode ${meta.exitCode} != 0`)
+      if (!Number.isInteger(meta.tests) || meta.tests < current.pass + current.skip) {
+        diffs.push(`tests ${meta.tests} < pass+skip ${current.pass + current.skip}`)
+      }
+      if (current.fail !== 0) diffs.push(`fail ${current.fail} != 0`)
+      if (current.pass < baseline.pass) diffs.push(`pass ${current.pass} < 基线 ${baseline.pass}`)
+      if (current.skip > baseline.skip) diffs.push(`skip ${current.skip} > 基线 ${baseline.skip}`)
       if (diffs.length > 0) fail(`test-counts: ${diffs.join('; ')}`)
-      else ok('test-counts', `pass=${current.pass} skip=${current.skip} fail=${current.fail}`)
+      else ok('test-counts', `pass=${current.pass}（基线 ${baseline.pass}）skip=${current.skip} fail=${current.fail}`)
     } catch (err) {
       fail(`test-counts: ${err?.message || err}`)
     }

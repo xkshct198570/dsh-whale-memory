@@ -10,7 +10,8 @@ import { Buffer } from 'node:buffer'
 import { clamp, isAllowedHostName, isLoopback, readJson, sendJson, isWriteMethod, writeRequestProblem } from './http-kit.js'
 import { statusOf } from '../shared/error-table.mjs'
 import { resolveIdentity } from './identity.js'
-import { bool, mergePreservingVolatile, value } from './config-values.js'
+import { bool, mergePreservingVolatile, value } from '../shared/config-values.js'
+import { resolveRefsDeep } from '../shared/resolve-refs.js'
 import { Config } from './config.js'
 import { HttpSyncTransport, pullFromGateway, pushToGateway } from '../core/sync.js'
 import { WHALE_PROTOCOL } from '../core/backend.js'
@@ -31,20 +32,6 @@ export const CONFIG_KEYS = ['dataDir', ...CONFIG_GROUPS]
 
 /** schemastery 默认值（空配置即开箱值），作为回显/深合并的基线。 */
 const CONFIG_DEFAULTS = Config({})
-
-/** schemastery 的 `.volatile()` 字段是 Ref；回显一律先解 Ref。 */
-export function resolveTree(input) {
-  if (input && typeof input === 'object' && typeof input.get === 'function' && !Array.isArray(input)) {
-    return resolveTree(input.get())
-  }
-  if (Array.isArray(input)) return input.map((item) => resolveTree(item))
-  if (input && typeof input === 'object') {
-    const out = {}
-    for (const [key, val] of Object.entries(input)) out[key] = resolveTree(val)
-    return out
-  }
-  return input
-}
 
 /**
  * 按叶子字段深合并：对象递归合并，数组/标量直接替换。
@@ -67,7 +54,7 @@ export function deepMergeLeaf(current, patch) {
 
 /** 全部组回显：默认值打底 + 运行时实值覆盖（值一律解 Ref）。 */
 export function echoConfig(config) {
-  return deepMergeLeaf(resolveTree(CONFIG_DEFAULTS), resolveTree(config || {}))
+  return deepMergeLeaf(resolveRefsDeep(CONFIG_DEFAULTS), resolveRefsDeep(config || {}))
 }
 
 /** 统一 trace_id：`x-trace-id` 头（≤64）优先，否则 `panel:<ms>`。 */
@@ -101,7 +88,7 @@ function readBackConfig(editor, entry, fallback) {
     const row = Array.isArray(rows) ? rows.find((item) => item && item.entry === entry) : null
     const override = row?.override
     if (override && typeof override === 'object' && !Array.isArray(override)) {
-      return deepMergeLeaf(fallback || {}, resolveTree(override))
+      return deepMergeLeaf(fallback || {}, resolveRefsDeep(override))
     }
   } catch { /* 回读失败不阻塞保存：以 editor.edit 回调结果为准 */ }
   return fallback
@@ -796,7 +783,7 @@ export function createRoutes({
         let saved = null
         // 只按提交的叶子深合并；current 里的未提交字段原样保留。
         await editor.edit(ctx.fiber.entry, (current) => {
-          saved = deepMergeLeaf(resolveTree(current || {}), patch)
+          saved = deepMergeLeaf(resolveRefsDeep(current || {}), patch)
           return saved
         })
         saved = readBackConfig(editor, ctx.fiber.entry, saved)

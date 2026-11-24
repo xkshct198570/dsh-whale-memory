@@ -34,7 +34,7 @@ import { existsSync, readFileSync, readdirSync, unlinkSync } from 'node:fs'
 import { join, relative as pathRelative } from 'node:path'
 import { readJson, sendJson, isWriteMethod, writeRequestProblem } from './http-kit.js'
 import { statusOf } from '../shared/error-table.mjs'
-import { value } from './config-values.js'
+import { value } from '../shared/config-values.js'
 import { detectGit, gitRequired, refreshGit } from './git-detector.js'
 import {
   DIFF_LINE_LIMIT, MANIFEST_FILE, TXN_DIR, computeManifest, createRule,

@@ -31,6 +31,9 @@ const current = readJson(RESULTS, '.test-results.json（先跑 npm test）')
 const baseline = readJson(BASELINE, 'scripts/baseline/test-counts.json')
 
 const reasons = []
+for (const key of ['pass', 'skip', 'fail']) {
+  if (!Number.isInteger(baseline?.[key])) reasons.push(`基线 test-counts.${key} 不是整数（${JSON.stringify(baseline?.[key])}）`)
+}
 if (current.exitCode !== 0) reasons.push(`测试进程 exitCode=${current.exitCode}（必须为 0；失败运行不得当绿）`)
 if (!Number.isInteger(current.tests) || current.tests < current.pass + current.skip) {
   reasons.push(`tests=${current.tests} < pass+skip=${Number(current.pass) + Number(current.skip)}（计数不自洽）`)

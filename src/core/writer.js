@@ -13,8 +13,8 @@
  * - 影子模式把"会落库"的动作统一降级为 CANDIDATE：审核前 nodes 一行不写，只留 writes 审计；
  *   NOOP/REJECT 不是落库动作，照旧记审计。
  * - 本模块不做邻居注记（applyNeighborNotes 由集成层调用）：写入只负责自己的一致性，扩散注记属于关系层调度。
- * - 配置可能来自 schemastery（`.volatile()` 字段是 Ref）：core 不得 import host，因此本文件自带
- *   `plain()` 解包。不解包时 `Ref === 'auto'` 恒 false、`Number(Ref)` 恒 NaN，
+ * - 配置可能来自 schemastery（`.volatile()` 字段是 Ref）：core 直接 import shared/config-values.js 的
+ *   `value()` 做解包。不解包时 `Ref === 'auto'` 恒 false、`Number(Ref)` 恒 NaN，
  *   auto 会静默退化成 shadow、maxChars/dailyCap 恒回默认值。
  * - 去重要比较来源可信度（架构书 §6.3：owner > self > group > web/tool > import）：
  *   同文但新来源更可信时升 source（MERGE/source_upgrade），否则才 NOOP；
@@ -24,6 +24,7 @@
  * - 影子候选的决策载荷落 writes.payload：审核 accept 按 shadowOf 还原字段并执行同构动作，
  *   不能再用硬编码 normal/semantic/self（那样 SUPERSEDE/MERGE 候选会被静默当 ADD）。
  */
+import { value } from '../shared/config-values.js'
 import { now } from './db.js'
 import { bigrams, contentHash, normalize, similarity } from './tokenize.js'
 import { linkMutex, linkSupersede, normalizeTags } from './relations.js'
@@ -117,20 +118,6 @@ const NUMBER_RE = /\b\d{2,5}\b/g
 /** 空值（null/undefined/空串）不能走 Number()：Number(null)===0 会把"没有时间"当成"时间 0"。 */
 function isBlank(value) {
   return value === null || value === undefined || value === ''
-}
-
-/**
- * 解包 schemastery 的 Ref（`.volatile()` 字段）：`get()` 才是值。
- *
- * 为什么在 core 里重复一份：分层约束禁止 core import host，而配置对象由 host 注入；
- * Ref 直接参与比较会恒假/NaN（`Ref === 'auto'` 为 false、`Number(Ref)` 为 NaN），
- * 结果就是开关"看起来配了但永远不生效"。
- *
- * @param {unknown} value 可能是 Ref 的配置值
- * @returns {unknown} 解包后的原始值
- */
-function plain(value) {
-  return value && typeof value.get === 'function' ? value.get() : value
 }
 
 /**
@@ -370,13 +357,13 @@ const ORIGIN_KEY_RE = /^tool:[^#\s]+#[0-9a-f]{16}$/
 
 /** 决策参数归一：mode 缺省 shadow（保守），maxChars 不许突破 schema 的 500 硬顶。 */
 function resolveOptions(opts) {
-  const o = plain(opts) || {}
+  const o = value(opts) || {}
   return {
-    mode: plain(o.mode) === 'auto' ? 'auto' : 'shadow',
-    maxChars: Math.max(1, Math.min(TEXT_LIMIT, finite(plain(o.maxChars), TEXT_LIMIT))),
-    dailyCap: Math.max(0, Math.floor(finite(plain(o.dailyCap), 200))),
-    protect: plain(o.protect) !== false,
-    redact: plain(o.redact) !== false,
+    mode: value(o.mode) === 'auto' ? 'auto' : 'shadow',
+    maxChars: Math.max(1, Math.min(TEXT_LIMIT, finite(value(o.maxChars), TEXT_LIMIT))),
+    dailyCap: Math.max(0, Math.floor(finite(value(o.dailyCap), 200))),
+    protect: value(o.protect) !== false,
+    redact: value(o.redact) !== false,
     // 忽略规则：面板每行一条正则；只做「不进库」判定，不参与合并/去重。
     ignorePatterns: Array.isArray(o.ignorePatterns)
       ? o.ignorePatterns.map((item) => String(item ?? '').trim()).filter(Boolean)
@@ -686,17 +673,17 @@ function judgeDecision(db, event, verdict, options, base) {
  *   judge?: { used: boolean, action?: string, targetId?: string|null, error?: string } }}
  */
 export function decideWrite(db, event, opts = {}) {
-  const plainOpts = plain(opts) || {}
-  const verdict = plain(plainOpts.judgeVerdict ?? event?.__judgeVerdict)
+  const plainOpts = value(opts) || {}
+  const verdict = value(plainOpts.judgeVerdict ?? event?.__judgeVerdict)
   const base = decideByRules(db, event, opts)
   if (!verdict) return base
   if (base.action === 'REJECT') return { ...base, judge: { used: false, error: 'judge_fallback:rejected' } }
-  if (plain(verdict)?.ok !== true) {
-    const why = String(plain(verdict)?.error || 'invalid_verdict')
+  if (value(verdict)?.ok !== true) {
+    const why = String(value(verdict)?.error || 'invalid_verdict')
     return { ...base, judge: { used: false, error: why } }
   }
   const options = resolveOptions(opts)
-  const applied = judgeDecision(db, event, plain(verdict), options, base)
+  const applied = judgeDecision(db, event, value(verdict), options, base)
   if (!applied.decision) return { ...base, judge: { used: false, error: applied.error } }
   return {
     ...applied.decision,
@@ -888,7 +875,7 @@ function insertNodeRow(db, event, text, { ts, validAt, source, origin, level, me
 /**
  * 配置 → 决策参数（兼容完整 config、write 段、以及扁平的 mode 别名）。
  *
- * 注意：真实 Config 的 write 段字段都是 schemastery Ref，必须先 plain() 再比较；
+ * 注意：真实 Config 的 write 段字段都是 schemastery Ref，必须先 value() 再比较；
  * 否则 `w.reviewMode === 'auto'` 恒 false（auto 静默退化成 shadow）、`finite(Ref)` 恒 NaN
  * （maxChars/dailyCap 恒回默认值）。
  *
@@ -900,20 +887,20 @@ function insertNodeRow(db, event, text, { ts, validAt, source, origin, level, me
  * @returns {{ mode: 'shadow'|'auto', maxChars: number, dailyCap: number, protect: boolean, redact: boolean }}
  */
 function resolveConfig(config) {
-  const c = plain(config)
+  const c = value(config)
   const root = c && typeof c === 'object' ? c : {}
-  const section = plain(root.write)
+  const section = value(root.write)
   const w = section && typeof section === 'object' ? section : root
-  const privacySection = plain(root.privacy)
+  const privacySection = value(root.privacy)
   const privacy = privacySection && typeof privacySection === 'object' ? privacySection : null
   const redact = privacy && privacy.redact !== undefined
-    ? plain(privacy.redact) !== false
-    : plain(w.redact) !== false
+    ? value(privacy.redact) !== false
+    : value(w.redact) !== false
   return {
-    mode: plain(w.reviewMode ?? w.mode) === 'auto' ? 'auto' : 'shadow',
-    maxChars: finite(plain(w.maxChars), TEXT_LIMIT),
-    dailyCap: finite(plain(w.dailyCap), 200),
-    protect: plain(w.protect) !== false,
+    mode: value(w.reviewMode ?? w.mode) === 'auto' ? 'auto' : 'shadow',
+    maxChars: finite(value(w.maxChars), TEXT_LIMIT),
+    dailyCap: finite(value(w.dailyCap), 200),
+    protect: value(w.protect) !== false,
     redact,
     ignorePatterns: Array.isArray(w.ignorePatterns)
       ? w.ignorePatterns.map((item) => String(item ?? '').trim()).filter(Boolean)
@@ -1386,9 +1373,9 @@ export function createWriteQueue({ store, config, log = () => {}, getLlm = null,
   /** judge=llm 开关（兼容 Ref 与扁平 config；读不到一律按 rules）。 */
   const judgeEnabled = (live) => {
     try {
-      const c = plain(live)
-      const w = plain(c?.write)
-      return String(plain(w?.judge ?? '') || '') === 'llm'
+      const c = value(live)
+      const w = value(c?.write)
+      return String(value(w?.judge ?? '') || '') === 'llm'
     } catch {
       return false
     }
@@ -1411,8 +1398,8 @@ export function createWriteQueue({ store, config, log = () => {}, getLlm = null,
     const llm = typeof getLlm === 'function' ? getLlm() : null
     if (!llm || typeof llm.stream !== 'function') return fallback('llm_unavailable')
     const selection = typeof getSelection === 'function' ? getSelection() : null
-    const writeSection = plain(plain(live)?.write)
-    const modelOverride = String(plain(writeSection?.model) ?? '')
+    const writeSection = value(value(live)?.write)
+    const modelOverride = String(value(writeSection?.model) ?? '')
     if (!selection?.provider || (!selection?.model && !modelOverride)) return fallback('no_model')
     const text = normalize(String(event?.text ?? ''))
     const { map, lines } = mapCandidates(candidates.slice(0, JUDGE_CANDIDATE_LIMIT))

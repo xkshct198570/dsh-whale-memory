@@ -7,9 +7,9 @@
  * 失败/超时/内存告急一律跳过，不阻断工具结果。
  */
 import { createHash } from 'node:crypto'
-import { bool, num } from './config-values.js'
+import { bool, num } from '../shared/config-values.js'
 import { resolveIdentity } from './identity.js'
-import { memoryPressure } from './memory-guard.js'
+import { memoryPressure } from '../shared/memory-guard.js'
 
 // 工具名白名单覆盖 DSH 常见检索工具；只认"词边界在开头/下划线"且整体收尾的写法。
 const SEARCH_TOOL_RE = /(^|_)(web_search|websearch|free_search|search_web|advanced_search|multi_search|platform_search|domain_search|video_search|research)$/i

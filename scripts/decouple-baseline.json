@@ -1,42 +1,4 @@
 {
-  "note": "P2a 清零；文档写 4 条，实际含 reflect.js 共 6 条，以代码为准",
-  "allowedEdges": [
-    {
-      "file": "src/core/backend.js",
-      "target": "src/host/memory-guard.js",
-      "reason": "纯函数待搬 src/shared（P2a）",
-      "clearPhase": "P2a"
-    },
-    {
-      "file": "src/core/backend.js",
-      "target": "src/host/config-values.js",
-      "reason": "纯函数待搬 src/shared（P2a）",
-      "clearPhase": "P2a"
-    },
-    {
-      "file": "src/core/keeper.js",
-      "target": "src/host/memory-guard.js",
-      "reason": "纯函数待搬 src/shared（P2a）",
-      "clearPhase": "P2a"
-    },
-    {
-      "file": "src/core/keeper.js",
-      "target": "src/host/config-values.js",
-      "reason": "纯函数待搬 src/shared（P2a）",
-      "clearPhase": "P2a"
-    },
-    {
-      "file": "src/core/reflect.js",
-      "target": "src/host/memory-guard.js",
-      "reason": "纯函数待搬 src/shared（P2a）",
-      "clearPhase": "P2a"
-    },
-    {
-      "file": "src/core/reflect.js",
-      "target": "src/host/config-values.js",
-      "reason": "纯函数待搬 src/shared（P2a）",
-      "clearPhase": "P2a"
-    }
-  ],
+  "allowedEdges": [],
   "pathMigrations": {}
 }

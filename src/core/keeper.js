@@ -17,8 +17,8 @@
  */
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import { memoryPressure } from '../host/memory-guard.js'
-import { bool, num, value } from '../host/config-values.js'
+import { memoryPressure } from '../shared/memory-guard.js'
+import { bool, num, value } from '../shared/config-values.js'
 import { METRIC_DEFS, computeMetrics, writeMetricsRows } from './metrics.js'
 import { parseTags, rebuildTagEdges, upsertEdge } from './relations.js'
 

@@ -20,7 +20,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameS
 import { createHash } from 'node:crypto'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { homedir } from 'node:os'
-import { bool, num, value } from './config-values.js'
+import { bool, num, value } from '../shared/config-values.js'
 import { buildDistillPrompt, clampSummary, parseDistillOutput, validateDistillItems } from '../core/distill.js'
 import { renderWrapReport, wrapReportFileName } from '../core/wrap-report.js'
 import { auditMemory } from '../core/memory-hygiene.js'

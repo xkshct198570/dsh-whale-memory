@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 跨插件共享工具漂移闸（P1 现状）：只读盘点 src/host/http-kit.js 与 src/host/config-values.js
+// 跨插件共享工具漂移闸（P2a 后现状）：只读盘点 src/host/http-kit.js 与 src/shared/config-values.js
 // 的行数与导出符号，作为 P6 差异审计的输入；不建跨插件共享包、不写文件。
 //
 // 依赖方向：scripts → node 原生模块 + acorn；不 import 业务代码。
@@ -11,7 +11,7 @@ import * as acorn from 'acorn'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const PARSE_OPTS = { ecmaVersion: 'latest', sourceType: 'module', allowHashBang: true }
-const TARGETS = ['src/host/http-kit.js', 'src/host/config-values.js']
+const TARGETS = ['src/host/http-kit.js', 'src/shared/config-values.js']
 
 /**
  * 统计文件行数（末行无换行时不虚增一行）。
@@ -78,4 +78,4 @@ if (fails.length > 0) {
   for (const line of fails) console.error(`[shared-drift] FAIL：${line}`)
   process.exit(1)
 }
-console.log('[shared-drift] ok（P1 未建跨插件共享包；P6 填充 API/行为差异审计）')
+console.log('[shared-drift] ok（未建跨插件共享包；P6 填充 API/行为差异审计）')

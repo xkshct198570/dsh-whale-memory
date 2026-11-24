@@ -24,7 +24,7 @@ export const BASELINE_DIR = join(ROOT, 'scripts/baseline')
 export const CLIENT_FILE = join(ROOT, 'lib/client.js')
 const CLIENT_REL = 'lib/client.js'
 const INDEX_FILE = join(ROOT, 'index.js')
-const TEST_RESULTS_FILE = join(ROOT, '.test-results.json')
+export const TEST_RESULTS_FILE = join(ROOT, '.test-results.json')
 
 /** 路由快照的固定端点集合：只锁状态码与顶层 JSON 字段集合，不锁值。 */
 export const ROUTE_ENDPOINTS = [
@@ -102,6 +102,21 @@ function scanSchemaVersion(file) {
   }
   const hit = /(?:export\s+)?(?:const|let|var)\s+SCHEMA_VERSION\s*=\s*(-?\d+)/.exec(source)
   return hit ? Number(hit[1]) : null
+}
+
+/**
+ * 读测试运行元信息（exitCode/tests）：对拍要证明“这次真跑且成功”，不能只看三元组。
+ * 缺文件/字段即抛错，不默认 0。
+ * @returns {{exitCode:number,tests:number}}
+ */
+export function readTestRunMeta() {
+  if (!existsSync(TEST_RESULTS_FILE)) {
+    throw new Error(`test-run: ${relative(ROOT, TEST_RESULTS_FILE)} 不存在，先跑 npm test`)
+  }
+  const data = JSON.parse(readFileSync(TEST_RESULTS_FILE, 'utf8'))
+  if (!Number.isInteger(data?.exitCode)) throw new Error('test-run: .test-results.json 缺少数值 exitCode')
+  if (!Number.isInteger(data?.tests)) throw new Error('test-run: .test-results.json 缺少数值 tests')
+  return { exitCode: data.exitCode, tests: data.tests }
 }
 
 /**

@@ -21,6 +21,7 @@
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync } from 'node:fs'
 import { join, resolve } from 'node:path'
+import { bool, num, value } from '../shared/config-values.js'
 import { dedupeKey, detectSignals } from './rules.js'
 import {
   buildMergePrompt,
@@ -65,26 +66,6 @@ const REWRITE_RELATIONS = Object.freeze(['merge', 'conflict', 'refine'])
 /** 会话候选映射：只存最新一条（一屏只问一条，避免"确认"指代不明）。 */
 const sessionPending = new Map()
 
-/**
- * 配置取值（core 不能 import host/config-values.js：依赖方向是 host→core）。
- * `.volatile()` 字段在运行时是 Ref，必须 `.get()`；直接比较会恒真（假开关）。
- * @param {any} input @param {any} fallback @returns {any}
- */
-function cfgValue(input, fallback) {
-  const raw = input && typeof input.get === 'function' ? input.get() : input
-  return raw === undefined ? fallback : raw
-}
-
-function cfgBool(input, fallback = false) {
-  const raw = cfgValue(input, fallback)
-  return typeof raw === 'boolean' ? raw : fallback
-}
-
-function cfgNum(input, fallback) {
-  const raw = Number(cfgValue(input, fallback))
-  return Number.isFinite(raw) ? raw : fallback
-}
-
 function textOf(value) {
   return value === null || value === undefined ? '' : String(value)
 }
@@ -125,7 +106,7 @@ function isoNow(now) {
 export function resolveRuleRoot(rulesDir, config) {
   const explicit = trimmed(rulesDir)
   if (explicit) return resolve(explicit)
-  const configured = trimmed(cfgValue(config?.rules?.dir, ''))
+  const configured = trimmed(value(config?.rules?.dir, ''))
   return configured ? resolve(configured) : defaultRuleRoot()
 }
 
@@ -323,7 +304,7 @@ export function createProposal({
   rulesDir, config = {}, log = () => {}, now = Date.now(),
 } = {}) {
   const raw = trimmed(text)
-  if (!cfgBool(config?.rules?.enabled, true)) return { ok: false, code: 'rules_disabled' }
+  if (!bool(config?.rules?.enabled, true)) return { ok: false, code: 'rules_disabled' }
   if (!raw) return { ok: false, code: 'empty' }
 
   const base = resolveRuleRoot(rulesDir, config)
@@ -391,7 +372,7 @@ export function createProposal({
   const hash = proposalHashOf(raw, draft)
   const hash8 = hash.slice(0, 8)
   const dir = join(base, 'proposals')
-  const cooling = isCooling(dir, hash, cfgNum(config?.rules?.askCooldownDays, 30), now)
+  const cooling = isCooling(dir, hash, num(config?.rules?.askCooldownDays, 30), now)
 
   const existing = listProposals({ rulesDir: base, config, status: 'pending,needs_manual' }).proposals
     .find((item) => textOf(item.hash) === hash)
@@ -436,7 +417,7 @@ export function createProposal({
     summary: summaryOf(draft, relation.relation),
     // 语义提炼状态：默认规则路径已在编译期完成；rules.llm=true 时候选创建后后台再润色一次。
     refine: {
-      state: cfgBool(config?.rules?.llm, false) ? 'pending' : 'rule',
+      state: bool(config?.rules?.llm, false) ? 'pending' : 'rule',
       by: 'rule',
       at: isoNow(now),
     },
@@ -467,7 +448,7 @@ function mkdirIfNeeded(dir) {
  * @returns {string[]} 被标 expired 的 id
  */
 export function enforceProposalCap({ rulesDir, config = {}, now = Date.now(), log = () => {} } = {}) {
-  const max = Math.max(1, cfgNum(config?.rules?.maxProposals, 20))
+  const max = Math.max(1, num(config?.rules?.maxProposals, 20))
   const { proposals, dir } = listProposals({ rulesDir, config, status: 'pending,needs_manual' })
   if (proposals.length <= max) return []
   const keep = new Set(proposals.slice(0, max).map((item) => item.id))
@@ -533,7 +514,7 @@ export function rejectProposal({ id, reason = '', identity = {}, rulesDir, confi
     hash: textOf(proposal.hash),
     ts: now,
     // 绝对到期时间：时钟回拨不会让冷却永久冻结（isCooling 只比 now < expiresAt）。
-    expiresAt: now + Math.max(0, cfgNum(config?.rules?.askCooldownDays, 30)) * 24 * 3600 * 1000,
+    expiresAt: now + Math.max(0, num(config?.rules?.askCooldownDays, 30)) * 24 * 3600 * 1000,
     id: textOf(proposal.id),
     reason: trimmed(reason).slice(0, 200),
     userId: trimmed(ident.userId),
@@ -635,7 +616,7 @@ export async function confirmPendingForSession({
 } = {}) {
   const sid = trimmed(sessionId)
   if (!sid) return { ok: false, code: 'no_session' }
-  if (!cfgBool(config?.rules?.enabled, true)) return { ok: false, code: 'rules_disabled' }
+  if (!bool(config?.rules?.enabled, true)) return { ok: false, code: 'rules_disabled' }
   const pending = getSessionPending(sid, now)
   if (!pending) return { ok: false, code: 'no_pending' }
   // 只认 `收录 <id8>`（大小写/空格容忍）：「好/可以/确认」这类模糊句**不动状态**
@@ -971,7 +952,7 @@ export async function applyProposal({
   const got = readProposal({ rulesDir: base, config, id })
   if (!got.ok) return { ok: false, error: 'proposal_not_found', code: 'proposal_not_found' }
   const proposal = got.proposal
-  if (!cfgBool(config?.rules?.enabled, true)) {
+  if (!bool(config?.rules?.enabled, true)) {
     return { ok: false, error: 'rules_disabled', code: 'rules_disabled', proposal }
   }
   if (!['pending', 'needs_manual'].includes(textOf(proposal.status))) {
@@ -985,7 +966,7 @@ export async function applyProposal({
 
   // requireGit 闸门（R9-05）：显式参数优先（路由把 config 折算成布尔传进来），回落到 config
   // 只为兼容直接调用——两者同源，不制造第二个真源。闸门先于建仓，缺 git 时不落任何目录。
-  const requireGit = gitRequired === null ? cfgBool(config?.rules?.requireGit, false) : Boolean(gitRequired)
+  const requireGit = gitRequired === null ? bool(config?.rules?.requireGit, false) : Boolean(gitRequired)
   const gate = requireGitGate(base, { gitRequired: requireGit, git, ...(exec ? { exec } : {}) })
   if (!gate.ok) {
     return { ok: false, error: 'git_required', code: 'git_required', proposal, detail: gate.detail }
@@ -1002,7 +983,7 @@ export async function applyProposal({
   if (!trimmed(decided.text)) {
     if (!needsRewrite) {
       decided.text = trimmed(draft.text)
-    } else if (!cfgBool(config?.rules?.llm, false)) {
+    } else if (!bool(config?.rules?.llm, false)) {
       const manual = markNeedsManual({
         rulesDir: base, config, proposal, code: 'llm_unavailable',
         detail: '需要改写但 rules.llm=false', now,
@@ -1310,7 +1291,7 @@ export async function applyProposal({
   const postRules = listRules(base).rules
   let mirrorResult = null
   const mirrorFn = typeof mirror === 'function' ? mirror : mirrorRules
-  if (!outcome.duplicate && cfgBool(config?.rules?.mirrorAuto, true) && backend) {
+  if (!outcome.duplicate && bool(config?.rules?.mirrorAuto, true) && backend) {
     try {
       mirrorResult = mirrorFn({ backend, rules: postRules, log })
     } catch (err) {
@@ -1319,11 +1300,11 @@ export async function applyProposal({
   }
   let agentsResult = null
   const agentsFn = typeof renderAgents === 'function' ? renderAgents : renderAgentsDigest
-  if (!outcome.duplicate && cfgBool(config?.rules?.renderAgents, true)) {
+  if (!outcome.duplicate && bool(config?.rules?.renderAgents, true)) {
     try {
       agentsResult = agentsFn({
         rules: postRules, agentsPath: agentsPathOf(base), rulesDir: base, log,
-        budgetChars: cfgNum(config?.rules?.summaryBudgetChars, 6000),
+        budgetChars: num(config?.rules?.summaryBudgetChars, 6000),
       })
     } catch (err) {
       agentsResult = { ok: false, code: 'render_failed', error: String(err?.message || err) }

@@ -7,7 +7,7 @@
  *
  * 两条硬口径（Why）：
  * - 配置来自 schemastery，`write.enabled` 是 Ref；不 `get()` 就直接判 `=== false` 恒假，
- *   "关写"开关等于没有。这里统一解包后再判（core 不 import host，故本地实现 plain()）。
+ *   "关写"开关等于没有。这里统一走 shared/config-values.js 的 value() 解包后再判。
  * - 导入/导出必须保真：状态（superseded/archived/stale）、双时态（valid_at/invalid_at/expired_at/
  *   superseded_by）、命中统计与向量态都要往返；否则 export→import 会把已失效事实"复活"。
  *   导入事务末尾还要用 nodes 与两张 FTS 的行数闸门证明索引没有写坏。
@@ -18,8 +18,8 @@ import { search as searchDb, ftsStats } from './search.js'
 import { planBudget, trimHits } from './budget.js'
 import { applyNeighborNotes, relationStats } from './relations.js'
 import { computeMetrics } from './metrics.js'
-import { memoryPressure } from '../host/memory-guard.js'
-import { bool } from '../host/config-values.js'
+import { memoryPressure } from '../shared/memory-guard.js'
+import { bool, value } from '../shared/config-values.js'
 import { createWriteQueue, isActiveHashConflict, recordEvolution, recordWrite, withTx } from './writer.js'
 import { DbWorkerClient } from './workers/client.js'
 import { HybridBackend } from './hybrid.js'
@@ -62,16 +62,6 @@ const IMPORT_INSERT_SQL = `INSERT INTO nodes
 function pickEnum(value, allowed, fallback) {
   const v = String(value ?? '')
   return allowed.has(v) ? v : fallback
-}
-
-/**
- * schemastery Ref 解包：`.volatile()` 字段 `get()` 才是值。
- * 不 import host（分层约束），在 core 内做同一口径。
- * @param {unknown} value
- * @returns {unknown}
- */
-function plain(value) {
-  return value && typeof value.get === 'function' ? value.get() : value
 }
 
 /** 数值回落（空值/null 不参与 Number，避免 Number(null)===0 的假值）。 */
@@ -719,9 +709,9 @@ export class LocalBackend {
     const text = normalize(String(q?.text || ''))
     if (!text) return { ok: false, error: 'invalid_text' }
     if (text.length > 500) return { ok: false, error: 'text_too_long' }
-    const writeCfg = plain(this._config()?.write) || {}
+    const writeCfg = value(this._config()?.write) || {}
     // 关写开关必须先解包 Ref（schemas 里是 .volatile()，直接 === false 恒假，开关等于没有）。
-    if (plain(writeCfg.enabled) === false) return { ok: false, error: 'write_disabled' }
+    if (value(writeCfg.enabled) === false) return { ok: false, error: 'write_disabled' }
     const ident = q?.identity || {}
     const tags = Array.isArray(q.tags) ? q.tags.filter((x) => typeof x === 'string').slice(0, 32) : []
     const event = {
@@ -1521,7 +1511,7 @@ export function createBackend(cfg, extra = {}) {
       const c = extra.config
       return typeof c === 'function' ? c() : c
     }
-    const syncTimeout = Number(plain(liveConfig()?.sync?.httpTimeoutMs))
+    const syncTimeout = Number(value(liveConfig()?.sync?.httpTimeoutMs))
     const httpTimeoutMs = Number.isFinite(syncTimeout) && syncTimeout > 0 ? syncTimeout : 800
     const local = new LocalBackend({
       dataDir: extra.dataDir || '',

@@ -25,7 +25,7 @@ import * as ruleStore from './src/core/rule-store.js'
 import { seedDefaultRules } from './src/core/rule-defaults.js'
 import { mirrorRules } from './src/core/rule-mirror.js'
 import { agentsPathOf, renderAgentsDigest } from './src/core/rule-render.js'
-import { bool, num } from './src/host/config-values.js'
+import { bool, num } from './src/shared/config-values.js'
 
 export { Config }
 export const inject = ['webServer', 'systemPrompt']

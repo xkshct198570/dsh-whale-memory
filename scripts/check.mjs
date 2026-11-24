@@ -221,8 +221,8 @@ gate('E7', async () => {
   }
 
   // volatile 是 Ref：必须经 config-values 的 .get() 解包，且不得在别处再声明 volatile
-  const helperPath = 'src/host/config-values.js'
-  if (!isFile(helperPath)) r.push('缺 src/host/config-values.js（Ref 解包单一真源）')
+  const helperPath = 'src/shared/config-values.js'
+  if (!isFile(helperPath)) r.push('缺 src/shared/config-values.js（Ref 解包单一真源）')
   else {
     const helper = read(helperPath)
     if (!/\.get\s*\(\s*\)/.test(helper)) r.push('config-values.js 必须用 .get() 解包 volatile Ref')

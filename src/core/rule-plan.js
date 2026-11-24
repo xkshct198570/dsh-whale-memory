@@ -22,6 +22,7 @@
 import { createHash } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
+import { value } from '../shared/config-values.js'
 import { normalizeRuleText } from './rules.js'
 import {
   RESERVED_NUMBERS,
@@ -62,12 +63,6 @@ function trimmed(value) {
   return textOf(value).trim()
 }
 
-/** @param {any} input @param {any} fallback @returns {any} */
-function cfgValue(input, fallback) {
-  const raw = input && typeof input.get === 'function' ? input.get() : input
-  return raw === undefined ? fallback : raw
-}
-
 /** @param {string} text @returns {string} sha256 hex（全量，不做前缀）；空串有稳定值。 */
 function sha256(text) {
   return createHash('sha256').update(textOf(text), 'utf8').digest('hex')
@@ -93,7 +88,7 @@ function dayOf(now) {
 function rootOf(rulesDir, config) {
   const explicit = trimmed(rulesDir)
   if (explicit) return resolve(explicit)
-  const configured = trimmed(cfgValue(config?.rules?.dir, ''))
+  const configured = trimmed(value(config?.rules?.dir, ''))
   return configured ? resolve(configured) : defaultRuleRoot()
 }
 
@@ -608,9 +603,9 @@ function reservedNumber(number) {
   return RESERVED_NUMBERS.includes(Number(number))
 }
 
-/** guardStrict 读法：布尔/字符串两种配置都要吃（与 rule-proposal 同口径）。 */
+/** guardStrict 读法：schema 是 boolean；字符串（旧配置/手工配置）按 off/false/0/no 视为关。 */
 function cfgBoolGuard(config) {
-  const raw = cfgValue(config?.rules?.guardStrict, true)
+  const raw = value(config?.rules?.guardStrict, true)
   if (typeof raw === 'boolean') return raw
   if (typeof raw === 'string') return !['0', 'false', 'off', 'no'].includes(raw.trim().toLowerCase())
   return Boolean(raw)

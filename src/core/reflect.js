@@ -5,8 +5,8 @@
  * - runReflect：读近期 episodic → DSH 默认模型（ctx.llm.stream）→ 解析 JSON → 落库（source=self）。
  * - 调度：installReflectScheduler 在空闲 ≥idleMinutes 时跑，OOM/忙时跳过；手动可触发。
  */
-import { num } from '../host/config-values.js'
-import { memoryPressure } from '../host/memory-guard.js'
+import { num } from '../shared/config-values.js'
+import { memoryPressure } from '../shared/memory-guard.js'
 
 const MAX_MATERIAL = 6000
 const MAX_ITEM_CHARS = 500
