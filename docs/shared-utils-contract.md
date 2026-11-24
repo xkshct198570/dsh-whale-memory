@@ -1,4 +1,4 @@
-# 跨插件共享工具契约（P2a 后现状与下一步）
+# 跨插件共享工具契约（P2 收口后现状与下一步）
 
 ## 1. 现状：本仓共享层 + 仍分叉的 host 工具
 
@@ -37,7 +37,7 @@
 
 ## 5. 下一步
 
-**P2b–P2d（本仓）**：keeper → session-wrap → routes 按职责拆，门面只 re-export；`check-deps` 白名单保持空。
+**P3a（本仓）**：rule-store 按 parse+manifest / history+git+lock / write+facade 拆分，门面只 re-export；`check-deps` 白名单保持空。
 
 **P6（跨插件）**：
 
