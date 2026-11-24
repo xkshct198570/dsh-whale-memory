@@ -1008,7 +1008,9 @@ export class LocalBackend {
     const statusChanged = status !== row.status
     const tagsChanged = tags !== row.tags
     const pointerChanged = String(nextPointer ?? '') !== String(row.superseded_by ?? '')
-    const ts = now()
+    // CAS 基线必须严格递增：同一毫秒内两次保存若返回相同 updated_at，客户端下一次提交仍带旧值
+    // 会被误判 node_changed（A3 偶发红）。至少比旧值大 1 微秒。
+    const ts = Math.max(now(), Number(row.updated_at || 0) + 0.000001)
     const traceId = String(opts?.traceId || '').slice(0, 64)
     const mode = opts?.mode === 'sync' ? 'sync' : 'manual'
 
