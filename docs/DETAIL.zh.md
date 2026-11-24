@@ -9,7 +9,8 @@
 3. **六页签面板**：概览、记忆库（检索/编辑/归档/导入导出）、召回、写入与关系、规则、设置；规则页含候选、历史 diff/回滚、Git 状态与 `/rules/health`。
 4. **写入可控**：单条 ≤500 字；默认 shadow 复核，候选经面板接受后才入库；JSONL 导入导出，改动留审计。
 5. **规则可版本化**：铁律以 `~/.dsh/rules/` 的 Markdown 文件为真源，提案 → plan/apply → 单次 commit；彻底删除写墓碑、编号永不复用；数据库只做检索镜像且不参与召回。
-6. **旧库可迁移**：附 `migrate-audit` 脚本，只读对账、备份后迁移关系边，操作见 `docs/MIGRATION.md`。
+6. **会话收尾**：说「收尾/换会话/记一下这次教训」、空闲或关闭会话时，一次有界提炼出教训/决策/待办；候选默认进 shadow，规则只生成提案，报告不含原始对话。
+7. **旧库可迁移**：附 `migrate-audit` 脚本，只读对账、备份后迁移关系边，操作见 `docs/MIGRATION.md`。
 
 ## 安装
 
@@ -27,4 +28,4 @@
 
 ## 隐私与限制
 
-默认数据只在本机；仅当手动把后端配成 http/hybrid 时，才向所填 url 发 stats/recent/search/recall/write/version 请求；不写遥测、不外传。召回失败 fail-open；全局规则依赖 AGENTS 摘要；`rules.llm=false` 时合并/冲突候选需面板改写。
+默认数据只在本机；仅当手动把后端配成 http/hybrid 时，才向所填 url 发 stats/recent/search/recall/write/version 请求；不写遥测、不外传。收尾原始材料只进 0600 临时 spool（默认 24h 自删、不进灾备），报告/日志/状态不含原文。召回失败 fail-open；全局规则依赖 AGENTS 摘要；`rules.llm=false` 时合并/冲突候选需面板改写。

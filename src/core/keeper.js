@@ -23,7 +23,7 @@ import { METRIC_DEFS, computeMetrics, writeMetricsRows } from './metrics.js'
 import { parseTags, rebuildTagEdges, upsertEdge } from './relations.js'
 
 /** 允许的作业类型（schema jobs.kind 语义；write 由写队列独占，keeper 不调度）。 */
-export const JOB_KINDS = ['consolidate', 'reflect', 'write', 'vector', 'archive', 'report', 'import']
+export const JOB_KINDS = ['consolidate', 'reflect', 'write', 'vector', 'archive', 'report', 'import', 'wrap']
 /** keeper 不得接管的 kind：write 的排队/重试/崩溃续跑全在 writer 的写队列里。 */
 export const KEEPER_RESERVED_KINDS = Object.freeze(['write'])
 

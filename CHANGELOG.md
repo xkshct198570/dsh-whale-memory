@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.4 — 2026-11-24（R12 会话收尾沉淀）
+
+- 新增 Session Wrap：显式（“收尾/换会话/记一下这次教训”）、空闲（默认关，可在设置打开）、`session/disposed`（默认关）、面板「立即收尾」四入口走同一条有界管线：采集最近 20 轮/12000 码点 → 单次模型蒸馏 → 原文 evidence 校验 → shadow 候选/规则提案/待办 → 不含原文的报告 → 只读清洁审计 → 可切会话结论。
+- 数据：schema v5 新增 `wrap_runs`（唯一 `(session_id, material_hash)`，状态机 + `phase` + `distilled_json` 断点）；迁移前整库快照；`wrap` 成为 keeper 第 8 种 job，原始材料只进 0600 spool（TTL 24h、不进灾备），崩溃后启动对账补 job、终态删 spool。
+- 写入：新增单条 `forceShadow`，即使全局 `write.reviewMode=auto`，收尾候选仍进 shadow；候选 accept 保留原始 `origin`（不再统一改写 `shadow-review`），`/writes` 返回扁平 `origin` 供面板过滤。
+- 安全：只处理 owner 会话、子代理不采集；消息入缓冲前复用 `privacyCheck` 脱敏；报告/状态/日志/job payload 无原文；报告读取用路径相对性拒绝越界；allowRemote 下收尾状态/报告也拒绝远端。
+- UI：概览「最近收尾」卡（状态/触发/候选/提案/待办/可切会话/错误/立即收尾/按需查看报告）；设置新增「收尾沉淀」组 13 项；写入页「只看收尾候选（n）」与来源徽标；首启推荐卡明确会花模型 token。
+- 规则：收尾的 `rule` 条目只走 `createProposal`（source=session-wrap），不自动 apply；无规范句证据的条目降级为 lesson。
+- 失败语义：无模型 → `skipped:no_model`（保留 spool，可手动重试）；坏 JSON/超时 → failed 重试；候选写失败 → run=failed 且 job 不标 done，报告先落盘；`write_disabled/privacy/text_too_long` 等永久原因标记 skip 不重试。
+- 测试：1010（1009 pass / 1 skip / 0 fail）；新增意图/材料/蒸馏/报告/审计/台账/采集/编排/路由/真宿主/渲染冒烟；E1–E16、三语 924 键、manual 生成块全绿。
+- 契约变更（同轮测试同步改写）：`JOB_KINDS` 增加 `wrap`；schema 版本 5；shadow accept 的 `origin` 保真；`SETTINGS_META` 67 字段/14 组。
+
 ## 0.6.3 — 2026-11-24（R11 设置体验、使用说明、铁律重编 + 上架前审查修复）
 
 - 设置首启推荐：全新安装且配置全为默认值时出现「推荐配置」卡；应用只提交与基线不同的叶子，跳过/保存过就不再出现；已有配置不弹、不覆盖。同步推荐以 `dryRun=true` 起步（先记录待同步项、不改远端），反思需模型才建议开；四个需外部条件的开关带「推荐开启」徽标。

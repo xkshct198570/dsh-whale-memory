@@ -55,6 +55,26 @@ export const Config = z.object({
     maxRunsPerDay: z.natural().min(1).max(96).default(24),
   }).default({}),
 
+  // 会话收尾（Session Wrap）：显式/空闲/dispose 三触发 → 有界提炼 → shadow 候选/规则提案/报告。
+  // 默认 enabled=true 但只跑一次/材料，且 idle 受 maxRunsPerDay 限制；首启推荐卡会明确“会花模型 token”。
+  wrap: z.object({
+    enabled: z.boolean().default(true).volatile(),
+    explicit: z.boolean().default(true).volatile(),
+    // 升级即开启后台空闲/关闭收尾会在用户不知情下花模型 token（审查 P1）：默认只留显式，
+    // 后台两路需用户在设置里显式打开；首启卡与组说明都写明这一点。
+    idle: z.boolean().default(false).volatile(),
+    disposed: z.boolean().default(false).volatile(),
+    idleMinutes: z.natural().min(5).max(1440).default(10),
+    maxItems: z.natural().min(1).max(32).default(8).volatile(),
+    autoAccept: z.boolean().default(false).volatile(),
+    spoolTtlHours: z.natural().min(1).max(720).default(24),
+    maxRunsPerDay: z.natural().min(1).max(96).default(6),
+    report: z.boolean().default(true).volatile(),
+    model: z.string().default(''),
+    maxMaterialChars: z.natural().min(1000).max(50000).default(12000),
+    timeoutMs: z.natural().min(5000).max(600000).default(60000),
+  }).default({}),
+
   consolidate: z.object({
     enabled: z.boolean().default(true).volatile(),
     intervalHours: z.natural().min(1).max(168).default(6),

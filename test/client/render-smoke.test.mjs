@@ -34,6 +34,11 @@ const DEFAULT_CONFIG = {
     maxProposals: 20, guardStrict: true, mirrorAuto: true, askCooldownDays: 30,
   },
   reflect: { enabled: false, model: '', idleMinutes: 30, maxItems: 8, maxRunsPerDay: 24 },
+  wrap: {
+    enabled: true, explicit: true, idle: false, disposed: false, idleMinutes: 10,
+    maxItems: 8, autoAccept: false, spoolTtlHours: 24, maxRunsPerDay: 6,
+    report: true, model: '', maxMaterialChars: 12000, timeoutMs: 60000,
+  },
   consolidate: { enabled: true, intervalHours: 6 },
   embed: { enabled: false, endpoint: '', model: '', batch: 16 },
   privacy: { redact: true, retentionDays: 0 },
@@ -47,7 +52,7 @@ const DEFAULT_CONFIG = {
 }
 
 /** 载入 client bundle，返回 apply() 后注册的两个 slot 组件。 */
-function loadSlots(configOverride = null) {
+function loadSlots(configOverride = null, extra = {}) {
   const config = configOverride ? { ...DEFAULT_CONFIG, ...configOverride } : DEFAULT_CONFIG
   let factory = null
   const sandbox = {
@@ -59,15 +64,22 @@ function loadSlots(configOverride = null) {
     queueMicrotask,
     URL,
     fetch: async (url) => {
-      const body = String(url).endsWith('/config')
+      const path = String(url)
+      const body = path.endsWith('/config')
         ? { ok: true, config }
-        : { ok: true, items: [], series: [], stats: {} }
+        : path.endsWith('/wrap/status') && extra.wrapStatus
+          ? extra.wrapStatus
+          : path.includes('/wrap/report') && extra.wrapReport
+            ? extra.wrapReport
+            : { ok: true, items: [], series: [], stats: {} }
       return { ok: true, status: 200, json: async () => body }
     },
     document: undefined,
     window: {},
     localStorage: {
-      store: new Map(),
+      store: new Map(
+        Object.entries(extra.openGroups || {}).map(([key, value]) => ['wm.settings.open.v1', JSON.stringify({ [key]: value })]),
+      ),
       getItem(key) { return this.store.has(key) ? this.store.get(key) : null },
       setItem(key, value) { this.store.set(key, String(value)) },
     },
@@ -176,4 +188,41 @@ test('全默认配置下首启推荐卡真实出现（configIsDefaults 回归）
   const tree = await mount(slots.main, { t: (key) => key, locale: 'zh' })
   const text = treeText(tree)
   assert.match(text, /settings\.firstRunTitle/, '默认配置应出现首启推荐卡')
+})
+
+
+test('Session Wrap 概览卡：真实状态渲染出状态/计数/可切会话，报告按需展示', async () => {
+  const wrapStatus = {
+    ok: true, supported: true, enabled: true, runsToday: 1, maxRunsPerDay: 6, jobs: 0,
+    latest: {
+      id: 7, state: 'done', trigger: 'explicit', phase: 'done', attempts: 1,
+      createdAt: 1763900000, updatedAt: 1763900060,
+      candidates: 2, ruleProposals: 1, openLoops: 0,
+      switchReady: { ready: true, blockers: [], warnings: [] }, error: '', reportAvailable: true,
+    },
+    recent: [], spool: { files: 0, bytes: 0 }, lastSkip: null, lastManual: null, capture: null,
+  }
+  const { slots, mount } = loadSlots(
+    { panel: { ...DEFAULT_CONFIG.panel, tab: 'overview' } },
+    { wrapStatus, wrapReport: { ok: true, runId: 7, text: '# 会话收尾报告' } },
+  )
+  const tree = await mount(slots.main, { t: (key) => key, locale: 'zh' })
+  const text = treeText(tree)
+  assert.match(text, /overview\.wrapTitle/, '概览必须出现最近收尾卡')
+  assert.match(text, /done|wrap\.stateDone/, '必须显示 run 状态')
+  assert.match(text, /overview\.wrapCandidates/, '必须显示候选计数')
+  assert.match(text, /overview\.wrapReadyYes/, '必须显示可切会话结论')
+  assert.match(text, /overview\.wrapShowReport/, '有报告时必须给入口')
+})
+
+test('Session Wrap 设置组与候选过滤：分组/开关真实渲染，收尾候选可筛', async () => {
+  const { slots, mount } = loadSlots(
+    { panel: { ...DEFAULT_CONFIG.panel, tab: 'settings' } },
+    { openGroups: { 'settings.groupWrap': true } },
+  )
+  const settings = await mount(slots.main, { t: (key) => key, locale: 'zh' })
+  const settingsText = treeText(settings)
+  assert.match(settingsText, /settings\.groupWrap/, '设置页必须有收尾组')
+  assert.match(settingsText, /settings\.wrapEnabled/, '必须有启用开关')
+  assert.match(settingsText, /settings\.wrapCostNote/, '必须明确会花模型 token')
 })

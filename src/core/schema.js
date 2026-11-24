@@ -24,7 +24,7 @@
  * 任何写路径都不得绕过触发器直接改 FTS。
  */
 
-export const SCHEMA_VERSION = 4
+export const SCHEMA_VERSION = 5
 
 /**
  * 对既有表的加法列：[表, 列, 类型]。迁移与 DDL 必须保持一致。
@@ -214,6 +214,41 @@ CREATE TABLE IF NOT EXISTS metrics (
   value     REAL NOT NULL,
   PRIMARY KEY (day, name)
 );
+
+-- v5：会话收尾（Session Wrap）运行台账。
+-- 为什么独立成表而不复用 jobs：jobs 是调度状态机（queued/running/done/failed + 重试退避），
+-- wrap_runs 是**业务结果**（候选/提案/报告/清洁/可切会话），一次 run 可能被重排成多个 job，
+-- 两者生命周期不同；把业务字段塞进 jobs.payload 会让状态查询/面板/审计都要解 JSON。
+-- 幂等键 (session_id, material_hash)：同一会话同一段材料只允许一条 run；新材料产生新行。
+CREATE TABLE IF NOT EXISTS wrap_runs (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id        TEXT NOT NULL,
+  material_hash     TEXT NOT NULL,
+  state             TEXT NOT NULL DEFAULT 'queued'
+                    CHECK (state IN ('queued','running','done','failed','skipped')),
+  trigger           TEXT NOT NULL DEFAULT 'manual',
+  user_id           TEXT NOT NULL DEFAULT '',
+  role_id           TEXT NOT NULL DEFAULT '',
+  workspace         TEXT NOT NULL DEFAULT '',
+  job_id            INTEGER,
+  attempts          INTEGER NOT NULL DEFAULT 0,
+  phase             TEXT NOT NULL DEFAULT 'created'
+                    CHECK (phase IN ('created','distilled','written','reported','done')),
+  summary           TEXT NOT NULL DEFAULT '',
+  distilled_json    TEXT,                              -- {items:[{...,status,reason}],dropped:[]}；续跑断点
+  candidates        INTEGER NOT NULL DEFAULT 0,
+  rule_proposals    INTEGER NOT NULL DEFAULT 0,
+  open_loops        INTEGER NOT NULL DEFAULT 0,
+  report_path       TEXT NOT NULL DEFAULT '',
+  hygiene_json      TEXT,
+  switch_ready_json TEXT,
+  error             TEXT NOT NULL DEFAULT '',
+  created_at        REAL NOT NULL,
+  updated_at        REAL NOT NULL,
+  UNIQUE (session_id, material_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_wrap_runs_created ON wrap_runs(created_at);
+CREATE INDEX IF NOT EXISTS idx_wrap_runs_state   ON wrap_runs(state, updated_at);
 `
 
 /**

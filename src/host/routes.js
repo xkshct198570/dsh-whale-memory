@@ -24,7 +24,7 @@ const PREFIX = '/whale-memory/api'
  * 避免"回显 23 字段、保存手抄 6 组"导致组内叶子被整组覆盖回落默认。
  */
 export const CONFIG_GROUPS = [
-  'backend', 'identity', 'recall', 'write', 'reflect', 'consolidate',
+  'backend', 'identity', 'recall', 'write', 'reflect', 'wrap', 'consolidate',
   'embed', 'privacy', 'edges', 'sync', 'rules', 'panel', 'advanced',
 ]
 export const CONFIG_KEYS = ['dataDir', ...CONFIG_GROUPS]
@@ -154,7 +154,7 @@ export function createRoutes({
   getHostUserId = () => '',
   identityState = null,
   migration = null,
-  ctx, reflect, log = () => {},
+  ctx, reflect, wrap = null, log = () => {},
 }) {
   // 宿主能力只经 adapter（R9-09）：LLM/默认模型选择缺失时降级 null + 一次 domain=host 日志。
   const host = createHostAdapter(ctx, { log })
@@ -201,7 +201,8 @@ export function createRoutes({
    * 反过来 /export 虽为 GET，却是整库原文下载，远端默认不给。
    */
   const REMOTE_READ_POST = new Set([`${PREFIX}/search`, `${PREFIX}/recall-test`])
-  const REMOTE_READ_DENY_GET = new Set([`${PREFIX}/export`])
+  // 收尾状态/报告含 owner 会话摘要与候选计数：远端面板只读也不给，回环仍可用。
+  const REMOTE_READ_DENY_GET = new Set([`${PREFIX}/export`, `${PREFIX}/wrap/status`, `${PREFIX}/wrap/report`])
   const remoteReadable = (method, path) => {
     const m = String(method || '').toUpperCase()
     if (m === 'GET') return !REMOTE_READ_DENY_GET.has(path)
@@ -663,6 +664,51 @@ export function createRoutes({
         return sendJson(res, got?.ok === false ? statusOf(got.error, 400) : 200, got)
       }
       return sendMethodNotAllowed(res, 'GET, PATCH')
+    }
+
+    // 会话收尾（Session Wrap）：一个动作入口 + 只读状态/报告。
+    // 为什么 POST 只收 trigger 而不收材料：材料必须来自宿主会话事件缓冲；
+    // 允许外部塞正文会让报告/候选绕过证据校验，也会把任意文本烧进模型。
+    if (path === `${PREFIX}/wrap` && req.method === 'POST') {
+      if (!wrap || typeof wrap.manual !== 'function') return sendJson(res, 502, { ok: false, error: 'wrap_unavailable' })
+      const body = await readJson(req)
+      if (!body.ok) return sendJson(res, body.status, { ok: false, error: body.error })
+      const got = await wrap.manual()
+      if (!got || got.ok !== true) {
+        const reason = String(got?.reason || 'wrap_failed')
+        const status = reason === 'unsupported_backend' ? 501
+          : reason === 'wrap_disabled' || reason === 'no_material' || reason === 'turn_in_progress'
+            || reason === 'busy' || reason === 'busy_wrap' || reason === 'same_material' ? 409
+            : reason === 'identity_required' ? 400
+              : reason === 'db_error' ? 502 : 500
+        return sendJson(res, status, { ok: false, error: reason })
+      }
+      return sendJson(res, 200, got)
+    }
+
+    if (path === `${PREFIX}/wrap/status` && req.method === 'GET') {
+      if (!wrap || typeof wrap.status !== 'function') return sendJson(res, 502, { ok: false, error: 'wrap_unavailable' })
+      const params = new URL(req.url, 'http://127.0.0.1').searchParams
+      // 面板默认看“本机最近一次”；只有显式带身份参数才按分区过滤（远端已在上面被拒）。
+      const hasOverride = ['userId', 'roleId', 'workspace'].some((key) => params.get(key) !== null)
+      const idn = hasOverride ? requestIdentity(identityParams(params)) : { ok: true, identity: null }
+      if (!idn.ok) return sendJson(res, 400, { ok: false, error: idn.error })
+      const data = wrap.status({ identity: idn.identity })
+      return sendJson(res, data?.ok === false ? statusOf(data.error, 502) : 200, data)
+    }
+
+    if (path === `${PREFIX}/wrap/report` && req.method === 'GET') {
+      if (!wrap || typeof wrap.report !== 'function') return sendJson(res, 502, { ok: false, error: 'wrap_unavailable' })
+      const params = new URL(req.url, 'http://127.0.0.1').searchParams
+      const id = Number(params.get('id'))
+      if (!Number.isInteger(id) || id <= 0) return sendJson(res, 400, { ok: false, error: 'invalid_id' })
+      const got = wrap.report(id)
+      if (!got?.ok) {
+        const error = String(got?.error || 'report_unavailable')
+        const status = error === 'report_missing' ? 404 : error === 'report_path_outside' ? 403 : 502
+        return sendJson(res, status, { ok: false, error })
+      }
+      return sendJson(res, 200, { ok: true, runId: got.runId, text: String(got.text || '') })
     }
 
     if (path === `${PREFIX}/writes` && req.method === 'GET') {

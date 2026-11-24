@@ -14,7 +14,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { closeDb, openDb } from '../../src/core/db.js'
-import { ensureSchema, dedupeActiveHashes } from '../../src/core/schema.js'
+import { SCHEMA_VERSION, ensureSchema, dedupeActiveHashes } from '../../src/core/schema.js'
 import { withTx } from '../../src/core/writer.js'
 import { LocalBackend } from '../../src/core/backend.js'
 import { search, ftsStats } from '../../src/core/search.js'
@@ -289,7 +289,7 @@ test('A1：quick_check 遇到忙锁不隔离健康库（防双库分叉）', asy
   assert.deepEqual(leftovers, [], '忙锁不得把健康库改名隔离')
   const again = openDb(dir)
   t.after(() => closeDb(again))
-  assert.equal(String(again.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value), '4')
+  assert.equal(String(again.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value), String(SCHEMA_VERSION))
 })
 
 test('A2：同名非唯一索引会被拆除并重建为唯一索引，health 依据 sqlite_master 实读', (t) => {

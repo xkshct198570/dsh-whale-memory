@@ -738,6 +738,9 @@ export class LocalBackend {
       // v3：规则置顶随事件下传（writer 落库；默认 0，不改变既有写入口行为）。
       pinned: q?.pinned === 1 || q?.pinned === true ? 1 : 0,
       expired_at: Number.isFinite(Number(q?.expired_at)) ? Number(q.expired_at) : undefined,
+      // 内部写入口专用：单条强制 shadow（session-wrap 候选不受全局 reviewMode=auto 影响）。
+      // 路由 /write 不透传该字段，外部无法用它做除“更保守”以外的任何事。
+      __forceShadow: q?.forceShadow === true,
     }
     const res = await this._writer().enqueue(event)
     if (!res || res.ok === false) {
@@ -1058,9 +1061,21 @@ export class LocalBackend {
     const db = this._db()
     const lim = Math.max(1, Math.min(100, Number(limit) || 20))
     const where = whereOf(opts?.identity, action ? [['action=?', [String(action)]]] : [])
-    const rows = db.prepare(`SELECT id,ts,trace_id,action,node_id,reason,before_text,after_text,mode,user_id,role_id,workspace
+    const rows = db.prepare(`SELECT id,ts,trace_id,action,node_id,reason,before_text,after_text,mode,payload,user_id,role_id,workspace
       FROM writes${where.sql} ORDER BY ts DESC LIMIT ?`).all(...where.params, lim)
-    return { items: rows }
+    // 只把候选来源摘成扁平字段，不回传整段 payload：面板要的是 origin 徽标，
+    // 回传决策载荷会把 tags/双时态/内部 targetId 一起暴露给只读列表。
+    return {
+      items: rows.map((row) => {
+        let origin = ''
+        try {
+          const payload = JSON.parse(String(row.payload || '{}'))
+          origin = typeof payload?.origin === 'string' ? payload.origin : ''
+        } catch { /* 旧候选 payload 坏/空：origin 留空，不影响列表 */ }
+        const { payload: _payload, ...rest } = row
+        return { ...rest, origin }
+      }),
+    }
   }
 
   /**

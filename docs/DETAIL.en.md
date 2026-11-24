@@ -9,7 +9,8 @@ Local long-term memory for DeepSeek Harness sessions: recall before each turn, a
 3. **Six-tab panel** — overview, memories (search/edit/archive/import/export), recall, writes & relations, rules, settings. The rules tab includes proposals, history diff/rollback, git status, and `/rules/health`.
 4. **Controlled writes** — one memory ≤500 characters; shadow review by default, so candidates enter the store only after acceptance; JSONL import/export; audits kept.
 5. **Versioned rules** — iron rules live in `~/.dsh/rules/` Markdown files. Proposal → plan/apply → one commit; purge writes a tombstone and the number is never reused. The database mirror is for the panel only and is excluded from recall.
-6. **Migration** — `migrate-audit` performs read-only reconciliation and backs up before migrating relation edges; see `docs/MIGRATION.md`.
+6. **Session wrap** — saying "wrap up" / "switch session", going idle, or closing a session distils lessons, decisions and open loops in one bounded pass. Candidates stay in shadow, rules only become proposals, and reports contain no raw conversation.
+7. **Migration** — `migrate-audit` performs read-only reconciliation and backs up before migrating relation edges; see `docs/MIGRATION.md`.
 
 ## Install
 
@@ -27,4 +28,4 @@ Local long-term memory for DeepSeek Harness sessions: recall before each turn, a
 
 ## Privacy and limits
 
-Data stays local by default. Only when the backend is manually set to `http`/`hybrid` does it send stats/recent/search/recall/write/version requests to the configured URL; no telemetry, no outbound copy. Recall fails open; global rules depend on the AGENTS digest; with `rules.llm=false`, merge/conflict candidates need a panel rewrite.
+Data stays local by default. Only when the backend is manually set to `http`/`hybrid` does it send stats/recent/search/recall/write/version requests to the configured URL; no telemetry, no outbound copy. Raw wrap material lives only in a 0600 spool (24h TTL by default, excluded from backups); reports, logs and status never contain raw conversation. Recall fails open; global rules depend on the AGENTS digest; with `rules.llm=false`, merge/conflict candidates need a panel rewrite.

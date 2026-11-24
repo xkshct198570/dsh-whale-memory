@@ -941,6 +941,10 @@ function resolveConfig(config) {
  */
 export function processEvent(db, event, config = {}) {
   const options = resolveConfig(config)
+  // 调用方（仅 backend.write 的内部参数）可以对**单条**事件强制 shadow：
+  // Session Wrap 要求即使全局 reviewMode=auto，候选也必须先经审核，且不能靠临时改全局配置
+  // （并发写入会一起被降级）。这是保守方向，不构成提权面。
+  if (event?.__forceShadow === true) options.mode = 'shadow'
   const decision = decideWrite(db, event, options)
   const ts = now()
   const text = normalize(String(decision.afterText ?? event?.text ?? ''))
@@ -1114,11 +1118,14 @@ function acceptCandidate(db, row, text, payload, shadowOf, writeId) {
   }
   const targetId = payload?.targetId ? String(payload.targetId) : ''
   const event = { identity: ident, traceId: String(row.trace_id ?? ''), tags: normalizeTags(payload?.tags) }
+  // 审核落库必须保留候选原始来源：把 origin 一律改写成 shadow-review 会抹掉
+  // session-wrap / 搜索反哺等来源，候选接受后无法再回查是哪次 run 产生的。
+  const landedOrigin = String(payload?.origin || '').trim() || 'shadow-review'
   const insert = () => insertNodeRow(db, event, text, {
     ts,
     validAt: validAtOf({ ...event, referenceTime: payload?.referenceTime }, ts),
     source: mapSource(payload?.source),
-    origin: 'shadow-review',
+    origin: landedOrigin,
     level: validLevel(payload?.level),
     memoryType: validMemoryType(payload?.memory_type),
     expiredAt: validExpiredAt(payload?.expired_at),
@@ -1554,7 +1561,7 @@ export function createWriteQueue({ store, config, log = () => {}, getLlm = null,
    * 审核候选（writes 行 action='CANDIDATE'）。
    * accept：读 writes.payload 还原等级/类型/tags/source/expired_at，并按 shadowOf 执行动作
    *   （ADD/REVIEW 插新节点，MERGE 改目标正文，SUPERSEDE 插新节点并让旧节点失效）；
-   *   origin 固定 'shadow-review'（审核来源可追溯，原事件 origin 仍在 payload 里）。
+   *   origin 保留候选原始来源（payload.origin）；旧候选无 origin 时回落 'shadow-review'。
    * reject：审计行改 REJECT，reason 追加 review:reject[:理由]。
    *
    * @param {number|string} id writes 行 id

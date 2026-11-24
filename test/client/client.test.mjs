@@ -38,14 +38,14 @@ test('五页签 id 都在 TABS 中', () => {
   }
 })
 
-test('设置页至少 6 个分组标题键，且现有 13 组齐全', () => {
+test('设置页至少 6 个分组标题键，且现有 14 组齐全', () => {
   const groups = Object.keys(dicts.zh).filter((key) => key.startsWith('settings.group'))
   assert.ok(groups.length >= 6, `设置分组只有 ${groups.length} 个`)
   for (const group of [
     'settings.groupBackend', 'settings.groupIdentity', 'settings.groupRecall', 'settings.groupWrite',
-    'settings.groupReflect', 'settings.groupConsolidate', 'settings.groupEmbed', 'settings.groupPrivacy',
-    'settings.groupEdges', 'settings.groupSync', 'settings.groupPanel', 'settings.groupAdvanced',
-    'settings.groupDanger',
+    'settings.groupReflect', 'settings.groupWrap', 'settings.groupConsolidate', 'settings.groupEmbed',
+    'settings.groupPrivacy', 'settings.groupEdges', 'settings.groupSync', 'settings.groupPanel',
+    'settings.groupAdvanced', 'settings.groupDanger',
   ]) {
     assert.ok(groups.includes(group), `缺少分组键 ${group}`)
   }
@@ -320,10 +320,10 @@ const EFFECT_EXCEPTIONS = {
   'panel.tab': 'instant', // 保存后 Panel 立即切换页签（onSaved）
 }
 
-test('设置项元数据单处定义：54 字段默认值对齐 config.js', () => {
+test('设置项元数据单处定义：67 字段默认值对齐 config.js', () => {
   const meta = settingsMeta()
   const schema = configSchema()
-  assert.equal(Object.keys(meta).length, 54, 'SETTINGS_META 字段数必须等于 Config 的 13 组 / 54 字段')
+  assert.equal(Object.keys(meta).length, 67, 'SETTINGS_META 字段数必须等于 Config 的 14 组 / 67 字段')
   for (const [key, item] of Object.entries(meta)) {
     const [group, field = null] = key.split('.')
     const raw = schema[group] ? (field === null ? schema[group].def : schema[group][field] && schema[group][field].def) : null
@@ -406,9 +406,9 @@ test('SwitchCard/FieldCard 渲染默认值、通用/本机/需配置徽标与依
   assert.match(CLIENT, /disabled: Boolean\(opt\.disabled\) \|\| meta\.disabled/, '依赖未满足时控件未置灰')
 })
 
-test('13 组顶部场景句三语齐全且不与标题重复', () => {
+test('14 组顶部场景句三语齐全且不与标题重复', () => {
   for (const group of [
-    'Backend', 'Identity', 'Recall', 'Write', 'Reflect', 'Consolidate', 'Embed',
+    'Backend', 'Identity', 'Recall', 'Write', 'Reflect', 'Wrap', 'Consolidate', 'Embed',
     'Privacy', 'Edges', 'Sync', 'Panel', 'Advanced', 'Danger',
   ]) {
     const descKey = `settings.group${group}Desc`
@@ -650,11 +650,11 @@ test('WP1 推荐开启徽标：四个需外部条件的开关带 recommend，bad
 })
 
 test('WP2 设置信息架构：顺序固定、首屏四组展开、其余默认收起、布局根因修复', () => {
-  assert.match(CLIENT, /const SETTINGS_GROUP_ORDER = Object\.freeze\(\[\s*'recall', 'write', 'identity', 'rules', 'backend', 'sync',\s*'reflect', 'consolidate', 'privacy', 'edges', 'panel', 'advanced', 'embed',\s*\]\)/)
+  assert.match(CLIENT, /const SETTINGS_GROUP_ORDER = Object\.freeze\(\[\s*'recall', 'write', 'identity', 'rules', 'backend', 'sync',\s*'reflect', 'wrap', 'consolidate', 'privacy', 'edges', 'panel', 'advanced', 'embed',\s*\]\)/)
   assert.match(CLIENT, /SETTINGS_GROUP_ORDER\.map\(\(key\) => \(groupNodes\[key\]/, '未按顺序渲染分组')
   assert.match(CLIENT, /h\(React\.Fragment, \{ key \}, groupNodes\[key\]\(\)\)/, '分组列表缺稳定 key')
   // 折叠卡自己取文案：调用方必须注入 t，否则首渲染就 ReferenceError。
-  assert.equal((CLIENT.match(/t, titleKey: 'settings\.group/g) || []).length, 14, '13 个网格分组 + 危险区都必须注入 t')
+  assert.equal((CLIENT.match(/t, titleKey: 'settings\.group/g) || []).length, 15, '14 个网格分组 + 危险区都必须注入 t')
   assert.match(CLIENT, /t, titleKey: 'settings\.groupRecall'/)
   assert.match(CLIENT, /SETTINGS_CORE_GROUP_KEYS = new Set\(\[\s*'settings\.groupRecall', 'settings\.groupWrite', 'settings\.groupIdentity', 'settings\.groupRules',\s*\]\)/)
   assert.match(CLIENT, /function readGroupOpen\(/, '缺展开状态读取')

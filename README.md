@@ -4,7 +4,7 @@
 
 Local-first long-term memory for DeepSeek Harness sessions: recall relevant memories before each turn, review and edit them in a six-tab panel, and keep rules in a local git Markdown repository where the database is only a search mirror.
 
-> Current version **0.6.3** (R11: first-run recommendations, collapsible settings groups, offline manual, rewritten core rules): local SQLite memory store, automatic recall, six-tab panel, write auditing and adoption signals, optional two-way sync/outbox, metrics and daily reports, and legacy migration auditing. Rule source of truth: `~/.dsh/rules` (proposals, plan/apply, tombstone numbering, health check).
+> Current version **0.6.4** (R12: session wrap): local SQLite memory store, automatic recall, six-tab panel, write auditing and adoption signals, optional two-way sync/outbox, metrics and daily reports, and legacy migration auditing. Rule source of truth: `~/.dsh/rules` (proposals, plan/apply, tombstone numbering, health check). Session wrap distils lessons, decisions and open loops when a session ends, producing shadow candidates, rule proposals and a report without raw conversation.
 > Requirements: DSH `>=0.2.2-rc.5 <0.3.0`, Node `>=22.13.0` (built-in SQLite).
 
 ## Install
@@ -29,7 +29,7 @@ Overview / Memories / **Rules** / Recall / Writes & relations / Settings.
 
 - Memories: search, edit, archive, import/export, node relations.
 - Rules: rule files, create, edit, retire/reactivate, purge, pending proposals, history diff/rollback, git status, `/rules/health`.
-- Recall and writes: injection parameters, candidates, audit and adoption; Settings groups backend, rules and panel options.
+- Recall and writes: injection parameters, candidates (filterable to wrap candidates), audit and adoption; Overview shows the latest wrap with a Wrap now button and report viewer; Settings groups backend, rules, wrap and panel options.
 
 ### Rules (iron rules)
 
@@ -59,12 +59,27 @@ Rules group (9 visible in the panel, 3 config-only):
 | `rules.injectChars` | `600` | Per-turn scoped-rule budget (config-only; 0 = off) |
 | `rules.createAgentsIfMissing` | `true` | Create a minimal AGENTS block on a clean install (config-only) |
 
-The backend defaults to `local` (`$DSH_HOME/whale-memory/memory.db`). `http`/`hybrid` can point at an external memory service; failures fall back locally or show "not connected".
+Session wrap group:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `wrap.enabled` | `true` | Master switch; uses model tokens |
+| `wrap.explicit` | `true` | Enqueue after phrases like "wrap up" / "switch session" |
+| `wrap.idle` | `false` | Enqueue after `wrap.idleMinutes` with no open turn (background spend; opt-in) |
+| `wrap.disposed` | `false` | Enqueue when a session is closed/archived (opt-in) |
+| `wrap.idleMinutes` | `10` | Idle threshold |
+| `wrap.maxItems` | `8` | Maximum candidates/proposals per run |
+| `wrap.autoAccept` | `false` | Bypass shadow review (not recommended) |
+| `wrap.maxRunsPerDay` | `6` | Automatic triggers per day; explicit/manual are not capped |
+| `wrap.report` | `true` | Write a Markdown report without raw conversation |
+| `wrap.model` | `''` | Override the model id; provider still comes from the default selection |
+
+The backend defaults to `local` (`$DSH_HOME/whale-memory/memory.db`). `http`/`hybrid` can point at an external memory service; failures fall back locally or show "not connected". Session wrap requires local or hybrid storage.
 
 ## Data, privacy and security
 
 - No outbound requests by default. Only when `backend.mode` is set to `http`/`hybrid` does the plugin send `/stats /recent /search /recall /write` to the configured URL.
-- Memories and rules stay on this machine; the rules repository never pushes and never fetches.
+- Memories and rules stay on this machine; the rules repository never pushes and never fetches. Wrap spool files hold raw material briefly (0600, default 24h TTL, excluded from backups); reports/status/logs/job payloads never contain raw conversation.
 - The panel/API is loopback-only by default; write endpoints require JSON and same-origin, rejecting cross-site simple requests.
 - Logs record keys, numbers, commits and traces, not rule bodies or credentials.
 

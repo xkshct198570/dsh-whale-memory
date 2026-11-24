@@ -11,10 +11,12 @@ import { createBackend } from './src/core/backend.js'
 import { Config } from './src/host/config.js'
 import { installSearchFeed } from './src/host/search-feed.js'
 import { installIdentitySource } from './src/host/identity-source.js'
-import { resolveIdentity } from './src/host/identity.js'
+import { deriveWorkspace, resolveIdentity } from './src/host/identity.js'
 import { installConfigMigration } from './src/host/config-migration.js'
 import { installReflectScheduler } from './src/core/reflect.js'
 import { installKeeper } from './src/core/keeper.js'
+import { installSessionCapture } from './src/host/session-capture.js'
+import { installSessionWrap } from './src/host/session-wrap.js'
 import { installOutboxWatchdog } from './src/core/hybrid.js'
 import { defaultRuleRoot, listRules } from './src/core/rule-store.js'
 // 命名空间导入：仓库锁/事务恢复按 R8 契约在 task-1 落地，插件必须在已落地/未落地两种
@@ -354,7 +356,29 @@ export function apply(ctx, config) {
     getIdentityCfg, getIdentityHint, getHostUserId,
   })
 
-  const handler = createRoutes({ config, backend: backendProxy, getIdentityCfg, getIdentityHint, getHostUserId, identityState, migration, ctx, reflect, log })
+  // 会话收尾（Session Wrap）：采集器 → 服务编排（keeper `wrap` job）。
+  // captureRef 是回指：服务成功后要推进采集缓冲；采集器触发时调用服务 onTrigger。
+  const captureRef = { current: null }
+  const wrap = installSessionWrap(ctx, {
+    backend: backendProxy, config, keeper, log, captureRef,
+    getLlm: () => ctx.get('llm'),
+    getSelection: () => ctx.get('agentDefaultModel')?.currentSelection?.(),
+  })
+  // http 后端没有本地 run 台账：不装采集器，避免把会话正文留在内存（面板仍会显示不支持）。
+  if (wrap.supported) {
+    captureRef.current = installSessionCapture(ctx, {
+      config, log,
+      getIdentity: (header) => resolveIdentity(
+        getIdentityCfg(), getIdentityHint(), getHostUserId(), deriveWorkspace(header),
+      ),
+      onTrigger: wrap.onTrigger,
+      canTriggerAuto: wrap.canAutoTrigger,
+    })
+  }
+  const handler = createRoutes({
+    config, backend: backendProxy, getIdentityCfg, getIdentityHint, getHostUserId, identityState,
+    migration, ctx, reflect, wrap, log,
+  })
 
   ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: PREFIX, handler }), 'whale-memory: routes')
 

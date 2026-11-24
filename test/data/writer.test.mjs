@@ -432,7 +432,8 @@ test('review：accept 落节点并改审计为 ADD；reject 改 REJECT；找不�
   const node = db.prepare('SELECT * FROM nodes WHERE id=?').get(accepted.id)
   assert.equal(node.text, candidate.after_text)
   assert.equal(node.source, 'self')
-  assert.equal(node.origin, 'shadow-review')
+  // 契约变更（R12）：accept 保留候选原始 origin，不再统一改写 shadow-review，便于回查来源。
+  assert.equal(node.origin, 'unit')
   assert.equal(node.status, 'active')
   assert.equal(node.user_id, 'u1')
   assert.equal(node.workspace, 'web')
@@ -581,7 +582,8 @@ test('shadow 载荷：accept 还原 source/memory_type/tags/expired_at', (t) => 
   assert.equal(node.memory_type, 'episodic')
   assert.deepEqual(JSON.parse(node.tags), ['网页', '摘要'])
   assert.equal(Number(node.expired_at), expires, 'TTL 必须随载荷还原')
-  assert.equal(node.origin, 'shadow-review')
+  // 契约变更（R12）：候选原始 origin 保真落库。
+  assert.equal(node.origin, 'unit')
   assert.equal(node.user_id, 'u1')
   assert.equal(node.workspace, 'web')
 })
@@ -1114,4 +1116,54 @@ test('keeper 不接管 write job；写队列 drain 才是唯一消费者（数�
   assert.equal(drained.processed, 1)
   assert.equal(db.prepare('SELECT state FROM jobs WHERE id=?').get(jobId).state, 'done')
   assert.equal(Number(db.prepare('SELECT count(*) AS n FROM nodes').get().n), 1, '遗留事件必须真正落库')
+})
+
+// ---------------------------------------------------------------------------
+// Session Wrap 接缝（R12）：单条强制 shadow + 候选 accept 保留原始 origin
+// ---------------------------------------------------------------------------
+
+test('forceShadow：全局 auto 下单条事件仍落 CANDIDATE；未标记的照旧落库', (t) => {
+  const db = freshDb(t)
+  const cfg = auto()
+  // 同一批配置下：普通事件直接 ADD；带 __forceShadow 的事件必须只留候选。
+  const direct = processEvent(db, event('全局 auto 下的普通事实'), cfg)
+  assert.equal(direct.action, 'ADD')
+  const forced = processEvent(db, event('会话收尾的候选事实', {
+    origin: 'session-wrap', __forceShadow: true,
+  }), cfg)
+  assert.equal(forced.action, 'CANDIDATE')
+  const candidate = db.prepare("SELECT * FROM writes WHERE action='CANDIDATE' ORDER BY id DESC LIMIT 1").get()
+  assert.equal(JSON.parse(candidate.payload).origin, 'session-wrap')
+  const nodeCount = Number(db.prepare('SELECT count(*) AS n FROM nodes').get().n)
+  assert.equal(nodeCount, 1, '强制 shadow 不得写节点')
+})
+
+test('shadow accept：origin 从候选载荷保真落库（不再一律改写 shadow-review）', (t) => {
+  const db = freshDb(t)
+  const shadow = { write: { reviewMode: 'shadow' } }
+  const q = createWriteQueue({ store: storeOf(db), config: shadow })
+  t.after(() => q.dispose())
+
+  const res = processEvent(db, event('对话收尾提炼的教训', {
+    origin: 'session-wrap', level: 'important', memory_type: 'procedural',
+  }), shadow)
+  assert.equal(res.action, 'CANDIDATE')
+  const candidate = db.prepare("SELECT * FROM writes WHERE action='CANDIDATE' ORDER BY id DESC LIMIT 1").get()
+  const accepted = q.review(candidate.id, 'accept')
+  assert.equal(accepted.ok, true)
+  const node = db.prepare('SELECT * FROM nodes WHERE id=?').get(accepted.id)
+  assert.equal(node.origin, 'session-wrap', '候选来源必须可回查')
+  assert.equal(node.level, 'important')
+  assert.equal(node.memory_type, 'procedural')
+
+  // 旧候选（载荷无 origin）仍回落 shadow-review，不制造空 origin。
+  const legacy = processEvent(db, event('旧候选来源缺失', { origin: '' }), shadow)
+  assert.equal(legacy.action, 'CANDIDATE')
+  const legacyRow = db.prepare("SELECT * FROM writes WHERE action='CANDIDATE' ORDER BY id DESC LIMIT 1").get()
+  assert.notEqual(legacyRow.id, candidate.id, '必须取到旧候选那一行')
+  const legacyAccepted = q.review(legacyRow.id, 'accept')
+  assert.equal(legacyAccepted.ok, true)
+  const legacyNode = db.prepare('SELECT id,text,origin FROM nodes WHERE id=?').get(legacyAccepted.id)
+  assert.equal(legacyNode.origin, 'shadow-review',
+    `legacyRow.payload=${legacyRow.payload} accepted=${JSON.stringify(legacyAccepted)} node=${JSON.stringify(legacyNode)}`)
 })

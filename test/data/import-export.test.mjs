@@ -266,17 +266,17 @@ test('ensureSchema：v1 库补 writes.payload 并升到 v2；重复执行幂等�
     assert.deepEqual(ensureSchema(db), { version: SCHEMA_VERSION, deduped: 0, uniqueIndex: true })
     const columnsAfter = db.prepare('PRAGMA table_info(writes)').all().map((c) => c.name)
     assert.ok(columnsAfter.includes('payload'))
-    assert.equal(String(db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value), '4')
+    assert.equal(String(db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value), String(SCHEMA_VERSION))
 
     // 迁移后可正常写入载荷（列可读写）
     db.prepare(`INSERT INTO writes (ts,action,payload) VALUES (?,?,?)`).run(now(), 'CANDIDATE', '{"shadowOf":"ADD"}')
     assert.equal(String(db.prepare('SELECT payload FROM writes ORDER BY id DESC LIMIT 1').get().payload), '{"shadowOf":"ADD"}')
 
     // 幂等：再跑一次不报错、版本不变
-    assert.deepEqual(ensureSchema(db), { version: 4, deduped: 0, uniqueIndex: true })
+    assert.deepEqual(ensureSchema(db), { version: SCHEMA_VERSION, deduped: 0, uniqueIndex: true })
 
     // 高版本仍拒绝（只增不减）
-    db.prepare("UPDATE meta SET value='5' WHERE key='schema_version'").run()
+    db.prepare("UPDATE meta SET value='6' WHERE key='schema_version'").run()
     assert.throws(() => ensureSchema(db), /schema_incompatible/)
   } finally {
     db.close()
