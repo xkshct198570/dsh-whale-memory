@@ -366,14 +366,15 @@ gate('E10', () => {
 // ---------------------------------------------------------------------------
 gate('E11', () => {
   const r = []
-  const routesPath = 'src/host/routes.js'
+  const routesPath = 'src/host/routes/router.js'
   if (!isFile(routesPath)) return [`${routesPath} 不存在`]
   const routes = read(routesPath)
-  if (!/isLoopback\(/.test(routes)) r.push('routes.js 未做回环判定 isLoopback()')
-  if (!/not_loopback/.test(routes)) r.push('routes.js 缺 not_loopback 错误码')
-  if (!/403/.test(routes)) r.push('routes.js 非回环未返回 403')
-  if (!/bool\([^)]*allowRemote[^)]*,\s*false\s*\)/.test(routes)) {
-    r.push('routes.js 的 allowRemote 必须默认 false（bool(..., false)）')
+  if (!/isLoopback\(/.test(routes)) r.push('routes/router.js 未做回环判定 isLoopback()')
+  if (!/not_loopback/.test(routes)) r.push('routes/router.js 缺 not_loopback 错误码')
+  if (!/403/.test(routes)) r.push('routes/router.js 非回环未返回 403')
+  // 要求 dispatch 运行时闸本身默认 false（不只靠 boundHosts 的第二处 false 满足正则）。
+  if (!/const allowRemote = bool\(config\?\.panel\?\.allowRemote,\s*false\)/.test(routes)) {
+    r.push('routes/router.js 的 request-time allowRemote 必须默认 false（const allowRemote = bool(..., false)）')
   }
   const configSrc = isFile('src/host/config.js') ? read('src/host/config.js') : ''
   if (!/allowRemote:\s*z\.boolean\(\)\.default\(false\)/.test(configSrc)) {
