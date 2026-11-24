@@ -1,0 +1,97 @@
+{
+  "format": 1,
+  "title": {
+    "en": "xkshct198570 DSH plugins",
+    "zh": "xkshct198570 DSH 插件"
+  },
+  "description": {
+    "en": "Whale Memory and Persona Routing Hub for DeepSeek Harness.",
+    "zh": "DeepSeek Harness 的小鲸鱼记忆中枢与人设路由中枢。"
+  },
+  "metadata": {},
+  "plugins": [
+    {
+      "name": "dsh-whale-memory",
+      "title": {
+        "en": "Whale Memory",
+        "zh": "小鲸鱼记忆中枢"
+      },
+      "description": {
+        "en": "Local long-term memory and rule source for DSH: SQLite recall injection, write audit, six-tab panel; rules in a local git Markdown repository with proposal/plan/apply and tombstone numbering. No external service by default.",
+        "zh": "DSH 本地长期记忆与规则真源：SQLite 召回注入、写入审计、六页签面板；规则以本地 git Markdown 仓为真源，提案/plan/apply 与墓碑编号。默认不依赖外部服务。"
+      },
+      "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCIgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0IiByb2xlPSJpbWciIGFyaWEtbGFiZWw9IldoYWxlIG1lbW9yeSI+CiAgPHJlY3QgeD0iMiIgeT0iMiIgd2lkdGg9IjYwIiBoZWlnaHQ9IjYwIiByeD0iMTQiIGZpbGw9IiMwZjE3MmEiLz4KICA8ZyBzdHJva2U9IiMzOGJkZjgiIHN0cm9rZS13aWR0aD0iMi40IiBmaWxsPSJub25lIiBvcGFjaXR5PSIwLjg1Ij4KICAgIDxwYXRoIGQ9Ik0yMCAyMiBMNDQgMjIgTTIwIDIyIEwyMCA0NCBNNDQgMjIgTDQ0IDQ0IE0yMCA0NCBMNDQgNDQiLz4KICAgIDxwYXRoIGQ9Ik0yMCAyMiBMNDQgNDQiIG9wYWNpdHk9IjAuMzUiLz4KICA8L2c+CiAgPGcgZmlsbD0iI2UyZThmMCI+CiAgICA8Y2lyY2xlIGN4PSIyMCIgY3k9IjIyIiByPSI1Ii8+CiAgICA8Y2lyY2xlIGN4PSI0NCIgY3k9IjIyIiByPSI1Ii8+CiAgICA8Y2lyY2xlIGN4PSIyMCIgY3k9IjQ0IiByPSI1Ii8+CiAgICA8Y2lyY2xlIGN4PSI0NCIgY3k9IjQ0IiByPSI1Ii8+CiAgPC9nPgogIDxjaXJjbGUgY3g9IjMyIiBjeT0iMzMiIHI9IjMuMiIgZmlsbD0iIzM4YmRmOCIvPgo8L3N2Zz4K",
+      "author": "xkshct198570",
+      "homepage": "https://github.com/xkshct198570/dsh-whale-memory",
+      "repository": {
+        "url": "https://github.com/xkshct198570/dsh-whale-memory"
+      },
+      "metadata": {
+        "keywords": [
+          "dsh",
+          "deepseek-harness",
+          "memory",
+          "sqlite",
+          "rules"
+        ],
+        "labels": [],
+        "sortKeys": {}
+      },
+      "versions": [
+        {
+          "version": "0.6.3",
+          "publishTimestamp": 1795500678,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/xkshct198570/dsh-whale-memory.git",
+            "commit": "753b88c4f26316aa6606807c46e5ed13802b39b6"
+          },
+          "engines": {
+            "dsh": ">=0.2.2-rc.5 <0.3.0-0"
+          }
+        }
+      ]
+    },
+    {
+      "name": "dsh-persona-hub",
+      "title": {
+        "en": "Persona Routing Hub",
+        "zh": "人设路由中枢"
+      },
+      "description": {
+        "en": "One persona asset set for the DSH web client and bot subjects: subject → channel → target routing, panel editing, hot reload, optional memory-hub identity hint and a cross-process config mirror. Local text only.",
+        "zh": "网页端与各机器人共用一套角色资产：主体→通道→目标号路由、面板编辑、热重载、可选记忆身份提示与跨进程配置镜像；只读本地文本。"
+      },
+      "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCIgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0IiByb2xlPSJpbWciIGFyaWEtbGFiZWw9IlBlcnNvbmEgaHViIj4KICA8cmVjdCB4PSIyIiB5PSIyIiB3aWR0aD0iNjAiIGhlaWdodD0iNjAiIHJ4PSIxNCIgZmlsbD0iIzFlMWI0YiIvPgogIDxjaXJjbGUgY3g9IjI0IiBjeT0iMjYiIHI9IjciIGZpbGw9IiNlMmU4ZjAiLz4KICA8Y2lyY2xlIGN4PSI0MiIgY3k9IjMwIiByPSI3IiBmaWxsPSIjYTViNGZjIi8+CiAgPHBhdGggZD0iTTE0IDQ2IFEyNCAzNiAzNCA0NiIgc3Ryb2tlPSIjZTJlOGYwIiBzdHJva2Utd2lkdGg9IjMiIGZpbGw9Im5vbmUiLz4KICA8cGF0aCBkPSJNMzIgNTAgUTQyIDQwIDUyIDUwIiBzdHJva2U9IiNhNWI0ZmMiIHN0cm9rZS13aWR0aD0iMyIgZmlsbD0ibm9uZSIvPgo8L3N2Zz4K",
+      "author": "xkshct198570",
+      "homepage": "https://github.com/xkshct198570/dsh-persona-hub",
+      "repository": {
+        "url": "https://github.com/xkshct198570/dsh-persona-hub"
+      },
+      "metadata": {
+        "keywords": [
+          "dsh",
+          "deepseek-harness",
+          "persona",
+          "routing"
+        ],
+        "labels": [],
+        "sortKeys": {}
+      },
+      "versions": [
+        {
+          "version": "0.5.2",
+          "publishTimestamp": 1795500670,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/xkshct198570/dsh-persona-hub.git",
+            "commit": "efde82d70e3202e10a3ed3ce59012844cd935f15"
+          },
+          "engines": {
+            "dsh": ">=0.2.2-rc.5 <0.3.0-0"
+          }
+        }
+      ]
+    }
+  ]
+}
