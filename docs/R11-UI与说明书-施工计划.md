@@ -5,9 +5,10 @@
 
 ## 1. 未完成步骤
 
-1. **市场 PR**：`awesome-dsh-plugin/awesome-dsh-plugin#18412` 已开（两条 entry）；等 CI/维护者评审。合并后 README 由上游生成，不手改。
-2. **可选：live 重启**：加载本轮 host 修复（allowRemote peer 闸、写队列、错误码等）；client 可热更，host 不重启仍是旧代码。
-3. **可选优化（有实测再合，不做不算欠账）**：面板规则健康入口；`computeMetrics` 5–10s 缓存（受 stats 即时性测试约束，需先量化面板轮询开销）；worker 按 dbPath 复用连接。
+1. **Session Wrap 施工（下一会话）**：方案已定稿，见 `docs/Session-Wrap-架构书-v1-2026-11-24.md` / `docs/Session-Wrap-施工计划-v1-2026-11-24.md`。按 W1→W6 施工；本轮代码未动。
+2. **市场 PR**：`awesome-dsh-plugin/awesome-dsh-plugin#18412` 已开（两条 entry）；等 CI/维护者评审。合并后 README 由上游生成，不手改。
+3. **可选：live 重启**：加载本轮 host 修复（allowRemote peer 闸、写队列、错误码等）；client 可热更，host 不重启仍是旧代码。
+4. **可选优化（有实测再合，不做不算欠账）**：面板规则健康入口；`computeMetrics` 5–10s 缓存（受 stats 即时性测试约束，需先量化面板轮询开销）；worker 按 dbPath 复用连接。
 
 ## 2. 验收依据（已实测）
 
