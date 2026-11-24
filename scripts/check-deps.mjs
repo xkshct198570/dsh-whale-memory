@@ -203,7 +203,6 @@ function main() {
   const files = scanFiles()
   const fileSet = new Set(files)
   const fails = []
-  const warnings = []
   const edges = []
   const graph = new Map()
 
@@ -219,8 +218,8 @@ function main() {
     for (const spec of specs) {
       const dep = resolveSpec(file, spec, migrations)
       if (!dep) {
-        // 不静默（铁律 22）：相对路径解析不到就报出来，但不判失败（可能指向非源码产物）。
-        if (spec.startsWith('.')) warnings.push(`无法解析 ${file} 的 ${spec}`)
+        // 相对 import 解析不到就是依赖图缺口（拼错/漏文件/指向未跟踪产物）：必须红，不能 warn 放行。
+        if (spec.startsWith('.')) fails.push(`无法解析相对 import：${file} → ${spec}（目标不存在）`)
         continue
       }
       edges.push({ file, dep })
@@ -242,7 +241,6 @@ function main() {
   const cycles = findCycles(graph)
   for (const cycle of cycles) fails.push(`循环依赖：${cycle.join(' → ')}`)
 
-  for (const line of warnings) console.error(`[check-deps] warn: ${line}`)
   if (fails.length > 0) {
     for (const line of fails) console.error(`[check-deps] FAIL: ${line}`)
     process.exit(1)
