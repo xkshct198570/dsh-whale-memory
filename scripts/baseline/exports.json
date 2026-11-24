@@ -1,0 +1,12 @@
+{
+  "node": null,
+  "acorn": [
+    "Config",
+    "apply",
+    "createBackendProxy",
+    "createWhaleMemoryService",
+    "inject",
+    "runRulesSelfHeal"
+  ],
+  "errors": []
+}

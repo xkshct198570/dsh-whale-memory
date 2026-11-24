@@ -388,8 +388,10 @@ gate('E11', () => {
 gate('E12', () => {
   const r = []
   const scripts = pkg.scripts || {}
-  for (const key of ['prepare', 'prepack', 'postinstall']) {
-    if (key in scripts) r.push(`scripts 不得含 ${key}（市场安装会执行生命周期脚本）`)
+  // prepare/postinstall 等是市场安装/发布会执行的钩子，必须为空；prepack 只在开发者 npm pack/publish
+  // 时执行，不是安装期脚本，允许用于发布前强制 build --check（P1 起产物由源重建）。
+  for (const key of ['prepare', 'preinstall', 'install', 'postinstall', 'prepublish', 'prepublishOnly']) {
+    if (key in scripts) r.push(`scripts 不得含 ${key}（市场安装/发布会执行生命周期脚本）`)
   }
   return r
 })
@@ -584,7 +586,7 @@ gate('E16', () => {
   try {
     execFileSync(process.execPath, [join(root, 'scripts/manual-build.mjs'), '--check'], { stdio: 'pipe' })
   } catch {
-    reasons.push('client 说明书生成块与 docs/MANUAL.*.md 不一致（运行 node scripts/manual-build.mjs --write）')
+    reasons.push('generated/manual.js 说明书生成块与 docs/MANUAL.*.md 不一致（运行 node scripts/manual-build.mjs --write）')
   }
   return reasons
 })

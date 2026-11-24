@@ -1,0 +1,92 @@
+[
+  {
+    "method": "GET",
+    "path": "/whale-memory/api/version",
+    "status": 200,
+    "ok": true,
+    "keys": [
+      "baseUrl",
+      "expected",
+      "match",
+      "mode",
+      "ok",
+      "outbox",
+      "protocol",
+      "protocolStatus"
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/whale-memory/api/stats",
+    "status": 200,
+    "ok": true,
+    "keys": [
+      "backend",
+      "identity",
+      "migration",
+      "offline",
+      "ok",
+      "stats"
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/whale-memory/api/config",
+    "status": 200,
+    "ok": true,
+    "keys": [
+      "config",
+      "ok",
+      "runtimeIdentity"
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/whale-memory/api/nodes?limit=1",
+    "status": 200,
+    "ok": true,
+    "keys": [
+      "items",
+      "ok",
+      "total"
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/whale-memory/api/recalls",
+    "status": 200,
+    "ok": true,
+    "keys": [
+      "items",
+      "ok"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/whale-memory/api/search",
+    "status": 200,
+    "ok": true,
+    "keys": [
+      "below_min_n",
+      "count",
+      "elapsed_ms",
+      "hits",
+      "ok",
+      "trace_id"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/whale-memory/api/recall-test",
+    "status": 200,
+    "ok": true,
+    "keys": [
+      "count",
+      "elapsed_ms",
+      "hits",
+      "mode",
+      "ok",
+      "trace_id"
+    ]
+  }
+]
