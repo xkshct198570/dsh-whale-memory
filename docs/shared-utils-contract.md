@@ -8,6 +8,7 @@
 | 配置取值与 volatile 合并 | `src/shared/config-values.js` | 69 | value、bool、num、isVolatileRef、mergePreservingVolatile（5 个） | `index.js` + host 7 文件 + core 7 文件（backend/hybrid/keeper/reflect/rule-plan/rule-proposal/writer） |
 | 内存闸门（`/proc/meminfo` 可注入，读不到回落） | `src/shared/memory-guard.js` | 62 | FREE_FLOOR、RSS_CEIL、availableBytes、memoryPressure（4 个） | core backend/keeper/reflect + host search-feed |
 | Ref 树递归解包 | `src/shared/resolve-refs.js` | 22 | resolveRefsDeep（1 个） | host routes、config-migration |
+| 本地日期戳 | `src/shared/day-stamp.js` | 12 | dayStamp（1 个） | host session-wrap/report、core keeper/handlers |
 | HTTP 工具集（本插件专用） | `src/host/http-kit.js` | 226 | clamp、Host/Origin 白名单、loopback、readJson/sendJson 等（10 个） | host routes、rules-routes |
 
 - 依赖方向：`src/shared/**` 只依赖 Node 内建，不 import host/core；core 直接 import shared，不再反向 import host。

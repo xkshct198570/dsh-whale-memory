@@ -12,6 +12,7 @@ import { bool, num, value } from '../../shared/config-values.js'
 import { METRIC_DEFS, computeMetrics, writeMetricsRows } from '../metrics.js'
 import { parseTags, rebuildTagEdges, upsertEdge } from '../relations.js'
 import { toSeconds } from './util.js'
+import { dayStamp } from '../../shared/day-stamp.js'
 
 /** vector 每次最多处理的 pending 条数。 */
 const VECTOR_BATCH = 32
@@ -413,13 +414,6 @@ export function installDefaultHandlers(keeper, deps) {
     writeFileSync(path, markdown, 'utf8')
     return { path, nodes: stats.nodes, active: stats.active, edges: stats.edges, metrics_day: metrics.day }
   })
-}
-
-/** 本地日期戳 YYYY-MM-DD（日报文件名口径）。 */
-function dayStamp(seconds) {
-  const d = new Date(toSeconds(seconds) * 1000)
-  const p = (n) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
 }
 
 /**
