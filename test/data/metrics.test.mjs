@@ -330,3 +330,15 @@ test('stats：metrics/series/recent_failures 与既有 totals/health 键并存',
     assert.equal(st.health.jobs.failed, 7)
   } finally { backend.dispose() }
 })
+
+test('creative/intent0 召回不进零注入率分母（按设计 0 预算不是检索失败）', () => {
+  const { db } = freshDb()
+  try {
+    insertRecall(db, { ts: NOW + 60, hitIds: ['n1'], injected: 1, chars: 10, source: 'hook' })
+    insertRecall(db, { ts: NOW + 120, hitIds: [], injected: 0, chars: 0, source: 'intent0' })
+    const m = computeMetrics(db, { day: DAY, now: NOW + 200 })
+    assert.equal(m.values.zero_injection_rate, 0, 'intent0 不得被当成零命中')
+    assert.equal(m.series.at(-1).recalls, 1, 'series 分母也不含 intent0')
+    assert.equal(m.series.at(-1).zeroHit, 0)
+  } finally { closeDb(db) }
+})

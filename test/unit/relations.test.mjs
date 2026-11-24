@@ -155,3 +155,20 @@ test('邻居注记：跨工作区不互写（隔离面）', () => {
     assert.equal(String(row.context_note), '')
   } finally { closeDb(db) }
 })
+
+test('扩散 cap 截断前按 conf 排序：高置信邻居不得被扫描顺序丢掉', (t) => {
+  const db = freshDb()
+  t.after(() => closeDb(db))
+  const seed = node(db, { text: '扩散种子', tags: ['x'] })
+  const top = node(db, { text: '最高置信邻居', tags: ['x'] })
+  upsertEdge(db, { fromId: seed, toId: top, etype: 'topic', source: 'reflect', conf: 1.0, weight: 1 })
+  for (let i = 0; i < 30; i += 1) {
+    const other = node(db, { text: `普通邻居 ${i}`, tags: ['x'] })
+    upsertEdge(db, { fromId: seed, toId: other, etype: 'topic', source: 'reflect', conf: 0.7, weight: 0.7 })
+  }
+  const out = expandOneHop(db, { seeds: [{ id: seed }], identity: ident, minConf: 0.6, cap: 20 })
+  assert.equal(out.length, 20)
+  assert.ok(out.some((row) => row.id === top), 'conf=1.0 的邻居必须在 cap 内')
+  const again = expandOneHop(db, { seeds: [{ id: seed }], identity: ident, minConf: 0.6, cap: 20 })
+  assert.deepEqual(again.map((row) => row.id), out.map((row) => row.id), '同查询结果顺序必须稳定')
+})

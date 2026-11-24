@@ -15,6 +15,7 @@ import { openDb, closeDb, now } from '../../src/core/db.js'
 import { bigrams, contentHash } from '../../src/core/tokenize.js'
 import { Config } from '../../src/host/config.js'
 import { createBackend } from '../../src/core/backend.js'
+import { createKeeper } from '../../src/core/keeper.js'
 import {
   contradiction, createWriteQueue, decideWrite, findCandidates, privacyCheck, processEvent,
   recordWrite, slotsOf, timeOverlap,
@@ -1089,4 +1090,28 @@ test('忽略规则：命中正则不落节点只记 REJECT/ignored；坏正则�
   // 非法正则只跳过该条：一条写错的规则不能挡住全部写入。
   const ok = processEvent(db, event('今天天气是晴'), auto({ ignorePatterns: ['(['] }))
   assert.equal(ok.action, 'ADD')
+})
+
+
+test('keeper 不接管 write job；写队列 drain 才是唯一消费者（数据丢失回归）', async (t) => {
+  const db = freshDb(t)
+  const store = { withDb: (fn) => fn(db), dbFile: join(tmpdir(), 'unused.db') }
+  // 模拟崩溃遗留：一条 queued 写 job 已在库里，但没有内存 waiter。
+  const event = { text: '崩溃遗留写入', identity: IDENT, source: 'owner', traceId: 't-crash' }
+  const jobId = Number(db.prepare(`INSERT INTO jobs (kind,state,attempts,payload,created_at,updated_at)
+    VALUES ('write','queued',0,?,?,?)`).run(JSON.stringify(event), now(), now()).lastInsertRowid)
+
+  const keeper = createKeeper({ store, config: {}, pressure: () => ({ stress: false }), nowFn: () => now() })
+  t.after(() => keeper.dispose())
+  const r = await keeper.tick()
+  assert.deepEqual(r, { ran: [], skipped: 'no_job' }, 'keeper 必须跳过 write job')
+  assert.equal(db.prepare('SELECT state FROM jobs WHERE id=?').get(jobId).state, 'queued')
+  assert.equal(Number(db.prepare('SELECT count(*) AS n FROM nodes').get().n), 0)
+
+  const q = createWriteQueue({ store, config: { write: { reviewMode: 'auto' } } })
+  t.after(() => q.dispose())
+  const drained = await q.drain()
+  assert.equal(drained.processed, 1)
+  assert.equal(db.prepare('SELECT state FROM jobs WHERE id=?').get(jobId).state, 'done')
+  assert.equal(Number(db.prepare('SELECT count(*) AS n FROM nodes').get().n), 1, '遗留事件必须真正落库')
 })

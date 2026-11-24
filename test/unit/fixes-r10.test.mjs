@@ -321,6 +321,11 @@ test('A3：expectedUpdatedAt 不一致拒绝，一致才落库', async (t) => {
     identity: ident, expectedUpdatedAt: Number(row.updated_at),
   })
   assert.equal(ok.ok, true, JSON.stringify(ok))
+  assert.ok(Number(ok.updated_at) > Number(row.updated_at), '保存必须回传新版本，客户端才能刷新 CAS 基线')
+  const second = await backend.updateNode(row.id, { text: 'CAS 再改一次' }, {
+    identity: ident, expectedUpdatedAt: Number(ok.updated_at),
+  })
+  assert.equal(second.ok, true, '同抽屉连续保存不得因旧版本 409')
 })
 
 test('A6/A7：导入失败批 cursor 回退；进度写小 meta，jobs.payload 不重写', async (t) => {

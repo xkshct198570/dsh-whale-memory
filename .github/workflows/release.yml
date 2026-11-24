@@ -1,0 +1,39 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies (lockfile frozen)
+        run: npm ci --no-audit --no-fund
+      - name: Static gates
+        run: node scripts/check.mjs
+      - name: i18n keys
+        run: node scripts/i18n-check.mjs
+      - name: Manual generated block
+        run: node scripts/manual-build.mjs --check
+      - name: Tests
+        run: npm test
+      - name: Pack release asset (stable filename for /latest/download)
+        run: |
+          npm pack
+          mv dsh-whale-memory-*.tgz dsh-whale-memory.tgz
+          sha256sum dsh-whale-memory.tgz | tee SHA256SUMS.txt
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dsh-whale-memory.tgz SHA256SUMS.txt \
+            --title "$GITHUB_REF_NAME" --generate-notes

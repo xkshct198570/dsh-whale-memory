@@ -16,7 +16,7 @@ Local long-term memory for DeepSeek Harness sessions: recall before each turn, a
 - Search `dsh-whale-memory` in the Plugins market (once listed);
 - or install the release tarball: `dsh plugin --profile <profile> add <dsh-whale-memory.tgz>`;
 - for local development use `link:<repository-directory>`.
-- Requires DSH `>=0.2.2-rc.5 <0.3.0`, Node `>=22.5`.
+- Requires DSH `>=0.2.2-rc.5 <0.3.0`, Node `>=22.13.0`.
 
 ## Use
 

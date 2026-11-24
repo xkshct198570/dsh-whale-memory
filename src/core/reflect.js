@@ -55,14 +55,20 @@ async function collectLlmText(llm, selection, prompt, modelOverride) {
 }
 
 /**
- * @param {{ backend:any, llm:any, selection:any, config:any, log?:Function }} deps
+ * @param {{ backend:any, llm:any, selection:any, config:any,
+ *   identity?:{userId:string,roleId:string,workspace:string}, log?:Function }} deps
+ *   identity 缺省为空三元组（只处理共享分区）；调度器必须传当前分区，不能把
+ *   别人的 episodic 喂给模型再把结果写回共享分区。
  */
-export async function runReflect({ backend, llm, selection, config, log = () => {} }) {
+export async function runReflect({ backend, llm, selection, config, identity = null, log = () => {} }) {
   try {
     if (!llm || typeof llm.stream !== 'function') return { ok: false, reason: 'llm_unavailable' }
     if (!selection?.provider || (!selection?.model && !config?.reflect?.model)) return { ok: false, reason: 'no_model' }
     if (memoryPressure().stress) return { ok: false, reason: 'memory_pressure' }
-    const items = await backend.listEpisodic(20)
+    const ident = identity && typeof identity === 'object'
+      ? { userId: String(identity.userId || ''), roleId: String(identity.roleId || ''), workspace: String(identity.workspace || '') }
+      : { userId: '', roleId: '', workspace: '' }
+    const items = await backend.listEpisodic(20, { identity: ident })
     if (!items || items.length === 0) return { ok: true, added: 0, reason: 'no_material' }
     const maxItems = num(config?.reflect?.maxItems, 8)
     const prompt = buildReflectPrompt(items, { maxItems })
@@ -73,7 +79,7 @@ export async function runReflect({ backend, llm, selection, config, log = () => 
     for (const item of parsed) {
       const r = await backend.write({
         text: item.text, level: 'important', memory_type: item.type, source: 'self',
-        tags: ['reflect'], origin: 'reflect', identity: { userId: '', roleId: '', workspace: '' },
+        tags: ['reflect'], origin: 'reflect', identity: ident,
       })
       if (r?.ok && !r.duplicate) added += 1
     }
@@ -93,12 +99,28 @@ export async function runReflect({ backend, llm, selection, config, log = () => 
  * 「何时该反思」→ 入队；真正执行由 keeper 的 reflect handler 串行跑（OOM 盲区之四）。
  * 未传 keeper 时保留原来的直跑路径（单测/诊断用）。
  */
-export function installReflectScheduler(ctx, { backend, config, getLlm, getSelection, log = () => {}, keeper = null }) {
+export function installReflectScheduler(ctx, {
+  backend, config, getLlm, getSelection, getIdentity, log = () => {}, keeper = null,
+}) {
   let lastActivity = Date.now()
   let running = false
   let lastRunDay = ''
   let runsToday = 0
-  const run = () => runReflect({ backend, llm: getLlm?.(), selection: getSelection?.(), config, log })
+  /** 当前分区身份：调度器在每次执行时现取（进程内 userId/role 可能随登录/角色切换变化）。 */
+  const identityNow = () => {
+    try {
+      const got = typeof getIdentity === 'function' ? getIdentity() : null
+      if (got && got.ok === false) return null
+      const ident = got?.identity || got
+      if (!ident || typeof ident !== 'object') return null
+      return { userId: String(ident.userId || ''), roleId: String(ident.roleId || ''), workspace: String(ident.workspace || '') }
+    } catch { return null }
+  }
+  const run = () => {
+    const identity = identityNow()
+    if (!identity) return Promise.resolve({ ok: false, reason: 'identity_required' })
+    return runReflect({ backend, llm: getLlm?.(), selection: getSelection?.(), config, identity, log })
+  }
 
   if (keeper && typeof keeper.register === 'function') {
     try { keeper.register('reflect', () => run()) } catch (err) {

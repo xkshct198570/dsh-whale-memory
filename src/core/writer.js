@@ -33,6 +33,11 @@ import { buildJudgePrompt, mapCandidates, parseJudgeOutput } from './judge.js'
 const MASK = '[已脱敏]'
 /** 每批任务数（写连接上保持短事务，避免长阻塞）。 */
 const BATCH = 20
+/** 写 job 自身重试上限与退避（与 keeper 的 1m→5m→30m 同口径；写队列是唯一 owner）。 */
+const WRITE_MAX_ATTEMPTS = 4
+const WRITE_BACKOFF_SECONDS = [0, 60, 300, 1800]
+/** 写队列只负责自己的 queued/到期重试，30s 扫一次足够，不抢 keeper 的 10min 语义。 */
+const WRITE_RETRY_TICK_MS = 30_000
 /** 判定器候选上限：只问最新的 N 条（提示词体积/token 成本的硬闸门，候选再多也只截最新）。 */
 const JUDGE_CANDIDATE_LIMIT = 12
 /** 判定器模型硬超时：单条超 2s 即回落规则，不拖住整批写入。 */
@@ -1306,7 +1311,8 @@ export function createWriteQueue({ store, config, log = () => {}, getLlm = null,
   const liveConfig = () => (typeof cfg === 'function' ? cfg() : cfg)
   const onDb = (fn) => store.withDb(fn)
 
-  // 崩溃补偿：上一次进程死在 running 的 write job 重新排队（attempts 保留，便于观察重试次数）
+  // 崩溃补偿：上一次进程死在 running 的 write job 重新排队（attempts 保留，便于观察重试次数）。
+  // 队列是 write job 的唯一消费者；启动补偿由 index.js 初始化时调 drainWrites 触发。
   try {
     onDb((db) => db.prepare("UPDATE jobs SET state='queued', updated_at=? WHERE kind='write' AND state='running'").run(now()))
   } catch (err) {
@@ -1320,6 +1326,7 @@ export function createWriteQueue({ store, config, log = () => {}, getLlm = null,
   let draining = null
   let closed = false
   let waitSweeper = null
+  let retryTimer = null
   /** 单条等待上限：超过即结算 TIMEOUT（面板写入不能无限悬挂）。 */
   const WAIT_TIMEOUT_MS = 120_000
 
@@ -1417,8 +1424,9 @@ export function createWriteQueue({ store, config, log = () => {}, getLlm = null,
       let batch
       try {
         batch = onDb((db) => db.prepare(
-          "SELECT id,payload FROM jobs WHERE kind='write' AND state='queued' ORDER BY id LIMIT " + BATCH,
-        ).all())
+          "SELECT id,payload,attempts FROM jobs WHERE kind='write' AND state='queued'"
+          + " AND (next_at IS NULL OR next_at <= ?) ORDER BY next_at IS NOT NULL, next_at, id LIMIT " + BATCH,
+        ).all(now()))
       } catch (err) {
         log(`[whale-memory] write queue read failed: ${err?.message || err}`)
         break
@@ -1451,18 +1459,28 @@ export function createWriteQueue({ store, config, log = () => {}, getLlm = null,
           }
           const payload = JSON.stringify({
             ...event,
-            result: { action: result.action, id: result.id ?? null, ...(result.judge ? { judge: result.judge } : {}) },
+            result: {
+              action: result.action, id: result.id ?? null, reason: result.reason ?? '',
+              ...(result.judge ? { judge: result.judge } : {}),
+            },
           })
           onDb((db) => db.prepare("UPDATE jobs SET state='done', payload=?, last_error=NULL, updated_at=? WHERE id=?")
             .run(payload, now(), jobId))
         } catch (err) {
-          const reason = String(err?.message || err)
+          const reason = String(err?.message || err).slice(0, 300)
           result = { ok: false, action: 'FAILED', reason }
           try {
-            onDb((db) => db.prepare("UPDATE jobs SET state='failed', last_error=?, updated_at=? WHERE id=?")
-              .run(reason, now(), jobId))
+            const attempts = Math.max(0, Number(job.attempts || 0)) + 1
+            if (attempts < WRITE_MAX_ATTEMPTS) {
+              const delay = WRITE_BACKOFF_SECONDS[Math.min(attempts, WRITE_BACKOFF_SECONDS.length - 1)]
+              onDb((db) => db.prepare(`UPDATE jobs SET state='queued', attempts=?, last_error=?, next_at=?, updated_at=?
+                WHERE id=? AND state='running'`).run(attempts, reason, now() + delay, now(), jobId))
+            } else {
+              onDb((db) => db.prepare(`UPDATE jobs SET state='failed', attempts=?, last_error=?, next_at=NULL, updated_at=?
+                WHERE id=? AND state='running'`).run(attempts, reason, now(), jobId))
+            }
           } catch (inner) {
-            log(`[whale-memory] write queue mark failed: ${inner?.message || inner}`)
+            log(`[whale-memory] write queue retry/fail update failed: ${inner?.message || inner}`)
           }
         }
         processed += 1
@@ -1483,6 +1501,25 @@ export function createWriteQueue({ store, config, log = () => {}, getLlm = null,
     }
     return { processed }
   }
+
+  /** 到期重试的兜底扫描：只处理自身 queued 行，不依赖 keeper。 */
+  function ensureRetryTimer() {
+    if (retryTimer || closed) return
+    retryTimer = setInterval(() => {
+      if (closed) return
+      try {
+        const due = Number(onDb((db) => db.prepare(
+          "SELECT count(*) AS n FROM jobs WHERE kind='write' AND state='queued' AND (next_at IS NULL OR next_at <= ?)",
+        ).get(now())?.n || 0))
+        if (due > 0) drain().catch((err) => log(`[whale-memory] write queue retry drain failed: ${err?.message || err}`))
+      } catch (err) {
+        log(`[whale-memory] write queue retry scan failed: ${err?.message || err}`)
+      }
+    }, WRITE_RETRY_TICK_MS)
+    if (typeof retryTimer.unref === 'function') retryTimer.unref()
+  }
+
+  ensureRetryTimer()
 
   /** 单飞：并发 drain 返回同一个 Promise。 */
   function drain() {
@@ -1577,6 +1614,7 @@ export function createWriteQueue({ store, config, log = () => {}, getLlm = null,
   function dispose() {
     closed = true
     if (waitSweeper) { clearInterval(waitSweeper); waitSweeper = null }
+    if (retryTimer) { clearInterval(retryTimer); retryTimer = null }
     for (const resolve of waiters.values()) resolve({ ok: false, action: 'REJECT', reason: 'queue_disposed' })
     waiters.clear()
     waitSince.clear()

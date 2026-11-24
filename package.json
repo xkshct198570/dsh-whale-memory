@@ -23,7 +23,12 @@
     "lib/client.js",
     "cordis.patch.yml",
     "locale/*.json",
-    "docs",
+    "docs/DETAIL.en.md",
+    "docs/DETAIL.ja.md",
+    "docs/DETAIL.zh.md",
+    "docs/MANUAL.zh.md",
+    "docs/MIGRATION.md",
+    "docs/preview.svg",
     "icon.svg",
     "README.md",
     "README.zh.md",
@@ -31,7 +36,7 @@
     "CHANGELOG.md"
   ],
   "engines": {
-    "node": ">=22.5",
+    "node": ">=22.13.0",
     "dsh": ">=0.2.2-rc.5 <0.3.0-0"
   },
   "keywords": [
@@ -79,5 +84,13 @@
     "@deepseek-ai/cordis": "^4.1.0",
     "@deepseek-ai/cordis-plugin-timer": "^1.2.0"
   },
-  "author": "大肥鱼"
+  "author": "大肥鱼",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xkshct198570/dsh-whale-memory.git"
+  },
+  "homepage": "https://github.com/xkshct198570/dsh-whale-memory#readme",
+  "bugs": {
+    "url": "https://github.com/xkshct198570/dsh-whale-memory/issues"
+  }
 }

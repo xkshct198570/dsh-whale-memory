@@ -11,6 +11,7 @@ import { createBackend } from './src/core/backend.js'
 import { Config } from './src/host/config.js'
 import { installSearchFeed } from './src/host/search-feed.js'
 import { installIdentitySource } from './src/host/identity-source.js'
+import { resolveIdentity } from './src/host/identity.js'
 import { installConfigMigration } from './src/host/config-migration.js'
 import { installReflectScheduler } from './src/core/reflect.js'
 import { installKeeper } from './src/core/keeper.js'
@@ -147,6 +148,11 @@ export async function runRulesSelfHeal({ config, backend, log = () => {}, store 
   if (typeof store.recoverPendingTxn === 'function') {
     try {
       result.recovered = store.recoverPendingTxn(dir, { log })
+      if (result.recovered?.skipped === 'repo_locked') {
+        // 另一个进程正在写规则仓：不抢着播种/镜像/渲染，避免把在飞事务的状态固化。
+        log('[whale-memory] rules txn recovery skipped: repo locked by another process')
+        return { ...result, skipped: 'repo_locked' }
+      }
       if (result.recovered && result.recovered.recovered) {
         log(`[whale-memory] rules txn recovered id=${result.recovered.id || '-'}`)
       }
@@ -291,10 +297,22 @@ export function apply(ctx, config) {
 
   // S4 后台调度：jobs 状态机 + 单飞 + 启动补偿 + 水位闸门；反思/巩固/日报都走它。
   const keeper = installKeeper(ctx, { store: backendProxy, config, log })
-  keeper.register('write', async () => {
-    if (typeof backendProxy.drainWrites !== 'function') return { skipped: 'writer_unavailable' }
-    return await backendProxy.drainWrites()
-  })
+  // write job 的唯一消费者是写队列（构造/重试都在 writer 内）；keeper 只做启动补偿：
+  // 进程重启后遗留的 queued 写 job 要被续跑，不能等下一次用户写入才处理。
+  ctx.effect(() => {
+    const timer = setTimeout(() => {
+      try {
+        const task = backendProxy.drainWrites?.()
+        if (task && typeof task.then === 'function') {
+          task.catch((err) => log(`[whale-memory] write queue startup drain fail-open: ${err?.message || err}`))
+        }
+      } catch (err) {
+        log(`[whale-memory] write queue startup drain fail-open: ${err?.message || err}`)
+      }
+    }, 800)
+    if (typeof timer.unref === 'function') timer.unref()
+    return () => clearTimeout(timer)
+  }, 'whale-memory: write queue recovery')
   // 大导入的崩溃续跑：jobs 里 cursor 已 durable，恢复器把 running 复位 queued 后由这里接着跑。
   keeper.register('import', async (payload, api) => {
     if (typeof backendProxy.resumeImportJob !== 'function') return { skipped: 'import_unavailable' }
@@ -308,6 +326,8 @@ export function apply(ctx, config) {
     backend: backendProxy, config, keeper,
     getLlm: () => ctx.get('llm'),
     getSelection: () => ctx.get('agentDefaultModel')?.currentSelection?.(),
+    // 后台反思没有会话 cwd；用当前登录/角色 hint 的分区，绝不写回共享 '' 洗白私有事实。
+    getIdentity: () => resolveIdentity(getIdentityCfg(), getIdentityHint(), getHostUserId(), ''),
     log,
   })
 
@@ -329,7 +349,10 @@ export function apply(ctx, config) {
     return () => { for (const t of timers) clearInterval(t) }
   }, 'whale-memory: keeper schedule')
 
-  installSearchFeed(ctx, { backend: backendProxy, config, log })
+  installSearchFeed(ctx, {
+    backend: backendProxy, config, log,
+    getIdentityCfg, getIdentityHint, getHostUserId,
+  })
 
   const handler = createRoutes({ config, backend: backendProxy, getIdentityCfg, getIdentityHint, getHostUserId, identityState, migration, ctx, reflect, log })
 

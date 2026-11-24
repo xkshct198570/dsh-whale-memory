@@ -5,7 +5,7 @@
 Local-first long-term memory for DeepSeek Harness sessions: recall relevant memories before each turn, review and edit them in a six-tab panel, and keep rules in a local git Markdown repository where the database is only a search mirror.
 
 > Current version **0.6.3** (R11: first-run recommendations, collapsible settings groups, offline manual, rewritten core rules): local SQLite memory store, automatic recall, six-tab panel, write auditing and adoption signals, optional two-way sync/outbox, metrics and daily reports, and legacy migration auditing. Rule source of truth: `~/.dsh/rules` (proposals, plan/apply, tombstone numbering, health check).
-> Requirements: DSH `>=0.2.2-rc.5 <0.3.0`, Node `>=22.5` (built-in SQLite).
+> Requirements: DSH `>=0.2.2-rc.5 <0.3.0`, Node `>=22.13.0` (built-in SQLite).
 
 ## Install
 
@@ -80,12 +80,12 @@ The backend defaults to `local` (`$DSH_HOME/whale-memory/memory.db`). `http`/`hy
 
 ```bash
 cd dsh-whale-memory
-npm test                    # 808 tests (807 pass / 1 skip)
+npm test                    # full layered suite（unit/contract/hook/data/worker/lifecycle/sync/client/integration）
 node scripts/check.mjs      # contract gate
 node scripts/i18n-check.mjs # zh/en/ja locale keys
 ```
 
-Clean DSH install proof: `node ~/ops/dsh-plugin-clean-install-test.mjs` (temporary `DSH_HOME`, whale/persona/both).
+Clean-install smoke (does not touch your live profile): create a temporary `DSH_HOME`, bootstrap a fresh `web` profile, install this package, then boot on `--port 0` and check `/whale-memory/api/rules` + `/rules/health`. The repository's CI runs the same static gates and full test suite on every push.
 
 ## Migration and failure handling
 

@@ -16,7 +16,7 @@
 - 插件市场搜索 `dsh-whale-memory`（上架后）；
 - 或 Release：`dsh plugin --profile <profile> add <dsh-whale-memory.tgz>`；
 - 本机开发可用 `link:<本仓目录>`。
-- 需要 DSH `>=0.2.2-rc.5 <0.3.0`、Node `>=22.5`。
+- 需要 DSH `>=0.2.2-rc.5 <0.3.0`、Node `>=22.13.0`。
 
 ## 使用
 

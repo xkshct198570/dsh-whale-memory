@@ -190,3 +190,19 @@ test('search：动态 import search.js，只读库出结果（schema 就绪时�
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('stats：真实 schema 的 status 列优先，archived/stale 不得算 active', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'whale-worker-status-'))
+  const dbPath = join(dir, 'nodes.db')
+  const db = new DatabaseSync(dbPath)
+  db.exec("CREATE TABLE nodes (id TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'active')")
+  db.exec("INSERT INTO nodes VALUES ('a','active'), ('b','archived'), ('c','stale'), ('d','superseded')")
+  db.close()
+  const client = new DbWorkerClient()
+  try {
+    assert.deepEqual(await client.stats(dbPath), { nodes: 4, active: 1 })
+  } finally {
+    client.dispose()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

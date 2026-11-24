@@ -323,6 +323,9 @@ gate('E9', () => {
   const files = pkg.files || []
   for (const detail of ['docs/DETAIL.en.md', 'docs/DETAIL.zh.md']) r.push(...detailProblems(detail))
   for (const need of REQUIRED_FILES) if (!files.includes(need)) r.push(`files 必含 ${need}`)
+  for (const need of REQUIRED_DOC_FILES) {
+    if (!files.includes('docs') && !files.includes(need)) r.push(`files 必含 ${need}（或整目录 docs）`)
+  }
   for (const banned of BANNED_FILES) if (files.includes(banned)) r.push(`files 不得含 ${banned}`)
   for (const entry of files) {
     if (entry.startsWith('/') || entry.includes('..')) r.push(`files 条目必须是包内相对路径：${entry}`)
@@ -394,7 +397,9 @@ gate('E12', () => {
 // ---------------------------------------------------------------------------
 // E13 files 精确 + 构建产物入库
 // ---------------------------------------------------------------------------
-const REQUIRED_FILES = ['index.js', 'src/host', 'src/shared', 'src/core', 'lib/client.js', 'cordis.patch.yml', 'locale/*.json', 'docs', 'icon.svg', 'README.md', 'LICENSE', 'CHANGELOG.md']
+const REQUIRED_FILES = ['index.js', 'src/host', 'src/shared', 'src/core', 'lib/client.js', 'cordis.patch.yml', 'locale/*.json', 'icon.svg', 'README.md', 'LICENSE', 'CHANGELOG.md']
+/** 文档可以整目录打包，也可以显式列文件；两者都算 docs 已发布。 */
+const REQUIRED_DOC_FILES = ['docs/DETAIL.en.md', 'docs/DETAIL.zh.md', 'docs/preview.svg']
 const BANNED_FILES = ['test', 'test/', 'scripts', 'scripts/', 'node_modules', 'node_modules/', 'src/client', 'src/client/']
 
 gate('E13', () => {
@@ -402,6 +407,9 @@ gate('E13', () => {
   const files = pkg.files || []
   if (files.length === 0) return ['files 为空（打包会漏文件）']
   for (const need of REQUIRED_FILES) if (!files.includes(need)) r.push(`files 必含 ${need}`)
+  for (const need of REQUIRED_DOC_FILES) {
+    if (!files.includes('docs') && !files.includes(need)) r.push(`files 必含 ${need}（或整目录 docs）`)
+  }
   for (const banned of BANNED_FILES) if (files.includes(banned)) r.push(`files 不得含 ${banned}`)
   for (const entry of files) {
     if (entry.startsWith('/') || entry.includes('..')) r.push(`files 条目必须是包内相对路径：${entry}`)

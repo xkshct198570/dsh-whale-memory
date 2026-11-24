@@ -75,9 +75,18 @@ function summaryOf(value) {
 
 /**
  * @param {any} ctx
- * @param {{ backend:any, config:any, log?:Function }} deps
+ * @param {{ backend:any, config:any, getIdentityCfg?:Function, getIdentityHint?:Function,
+ *   getHostUserId?:Function, log?:Function }} deps
+ *   身份三分量必须与 hook/routes 同源：只传 Config 时 auto 模式会落成 userId='local'，
+ *   召回侧却按宿主登录 id 读，两条链路永不命中同一分区。
  */
-export function installSearchFeed(ctx, { backend, config, log = () => {} }) {
+export function installSearchFeed(ctx, {
+  backend, config,
+  getIdentityCfg = () => config?.identity,
+  getIdentityHint = () => null,
+  getHostUserId = () => '',
+  log = () => {},
+}) {
   const handler = (exec, result) => {
     try {
       if (!bool(config?.write?.enabled, true) || !bool(config?.write?.searchFeed, false)) return
@@ -90,7 +99,12 @@ export function installSearchFeed(ctx, { backend, config, log = () => {} }) {
       let text = `搜索「${query}」：${summary}`
       if (text.length > MAX_CHARS) text = text.slice(0, MAX_CHARS - 1) + '…'
       const ttl = num(config?.write?.searchTtlHours, 24)
-      const ident = resolveIdentity(config?.identity)
+      const ident = resolveIdentity(
+        getIdentityCfg(),
+        typeof getIdentityHint === 'function' ? getIdentityHint() : null,
+        typeof getHostUserId === 'function' ? String(getHostUserId() || '') : '',
+        '',
+      )
       if (!ident.ok) return
       // 同查询 + 本地日期 → 同一个带 #key 的 origin（跨进程稳定）。
       // 去重依赖后端契约（backend/writer 侧，不在本文件）：同身份已有相同 origin 的 active 节点时

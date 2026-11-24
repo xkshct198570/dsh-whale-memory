@@ -243,10 +243,18 @@ export class HybridBackend {
     }
   }
 
-  /** 采纳回写回到上次 recall 的同一侧；远端实现没有该接口时退回本地（返回 ok:false，不抛）。 */
+  /**
+   * 采纳回写必须回到上次 recall 的同一侧。
+   *
+   * 远端没有 markRecallUsed 时**不得**回退本地：recallId 是远端审计行 id，
+   * 写进本地 recalls 的 used 列只会随机污染本地同号行。返回显式不可用，由 hook
+   * 记一条日志（采纳信号是观测数据，宁缺毋滥）。
+   */
   markRecallUsed(recallId, used = true) {
-    if (this._lastRecall === 'http' && typeof this.http?.markRecallUsed === 'function') {
-      return this.http.markRecallUsed(recallId, used)
+    if (this._lastRecall === 'http') {
+      if (typeof this.http?.markRecallUsed === 'function') return this.http.markRecallUsed(recallId, used)
+      this.log('[whale-memory] adoption mark skipped: remote backend has no markRecallUsed')
+      return { ok: false, updated: 0, error: 'mark_unavailable' }
     }
     return this.local.markRecallUsed(recallId, used)
   }

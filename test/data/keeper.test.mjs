@@ -9,7 +9,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { openDb, closeDb, now } from '../../src/core/db.js'
 import {
-  JOB_KINDS, archiveScope, backoffSeconds, createKeeper, installKeeper,
+  JOB_KINDS, archiveScope, backoffSeconds, convergeDuplicateHashes, createKeeper, installKeeper,
 } from '../../src/core/keeper.js'
 import { bigrams, contentHash } from '../../src/core/tokenize.js'
 import { Config } from '../../src/host/config.js'
@@ -40,16 +40,16 @@ function fresh({ config = {}, pressure, log, intervalMs = 600_000 } = {}) {
 let seq = 0
 function node(db, {
   text, tags = [], status = 'active', expiredAt = null, updatedAt = now(),
-  source = 'owner', userId = '', roleId = '', workspace = '',
+  source = 'owner', userId = '', roleId = '', workspace = '', origin = 'test',
 }) {
   seq += 1
   const id = `k${Date.now()}_${seq}`
   db.prepare(`INSERT INTO nodes
     (id,text,text_hash,text_bigrams,level,memory_type,source,status,role_id,user_id,workspace,tags,
      context_note,weight,hits,vector_state,origin,trace_id,expired_at,created_at,updated_at)
-    VALUES (?,?,?,?,'normal','semantic',?,?,?,?,?,?, '',1,0,'none','test','',?,?,?)`).run(
+    VALUES (?,?,?,?,'normal','semantic',?,?,?,?,?,?, '',1,0,'none',?,'',?,?,?)`).run(
     id, text, contentHash(text), bigrams(text), source, status, roleId, userId, workspace,
-    JSON.stringify(tags), expiredAt, updatedAt, updatedAt,
+    JSON.stringify(tags), origin, expiredAt, updatedAt, updatedAt,
   )
   return id
 }
@@ -75,18 +75,18 @@ test('契约：JOB_KINDS 七种（含 import）；backoffSeconds 0/60/300/1800',
 test('queued → running → done；enqueue 校验 kind', async () => {
   const f = fresh()
   const calls = []
-  f.keeper.register('write', async (payload, api) => {
+  f.keeper.register('import', async (payload, api) => {
     calls.push(payload)
     assert.equal(typeof api.now(), 'number')
     api.log('inside handler')
     return { ok: true }
   })
   try {
-    const id = f.keeper.enqueue('write', { text: '甲' })
+    const id = f.keeper.enqueue('import', { text: '甲' })
     assert.equal(typeof id, 'number')
     assert.equal(jobRow(f.db, id).state, 'queued')
     const r = await f.keeper.tick()
-    assert.deepEqual(r, { ran: ['write'] })
+    assert.deepEqual(r, { ran: ['import'] })
     const row = jobRow(f.db, id)
     assert.equal(row.state, 'done')
     assert.equal(Number(row.attempts), 0)
@@ -103,24 +103,24 @@ test('queued → running → done；enqueue 校验 kind', async () => {
       ['attempts', 'id', 'kind', 'last_error', 'next_at', 'state'])
 
     assert.throws(() => f.keeper.enqueue('bogus'), /unknown_kind/)
-    assert.throws(() => f.keeper.register('write', () => {}), /duplicate_handler/)
+    assert.throws(() => f.keeper.register('import', () => {}), /duplicate_handler/)
   } finally { f.close() }
 })
 
 test('失败退避：第 1 次 +60，第 2 次 +300，未到期不跑', async () => {
   const f = fresh()
   let calls = 0
-  f.keeper.register('write', async () => { calls += 1; throw new Error('boom') })
+  f.keeper.register('import', async () => { calls += 1; throw new Error('boom') })
   try {
-    const id = f.keeper.enqueue('write', {})
+    const id = f.keeper.enqueue('import', {})
     const r1 = await f.keeper.tick()
-    assert.deepEqual(r1, { ran: ['write'] })
+    assert.deepEqual(r1, { ran: ['import'] })
     let row = jobRow(f.db, id)
     assert.equal(row.state, 'queued')
     assert.equal(Number(row.attempts), 1)
     assert.equal(Number(row.next_at), f.clock + 60)
     assert.match(row.last_error, /boom/)
-    assert.match(f.keeper.status().lastError, /write: boom/)
+    assert.match(f.keeper.status().lastError, /import: boom/)
 
     f.advance(59)
     assert.deepEqual(await f.keeper.tick(), { ran: [], skipped: 'no_job' })
@@ -142,9 +142,9 @@ test('失败退避：第 1 次 +60，第 2 次 +300，未到期不跑', async ()
 test('4 次失败落 failed：前三次按 60/300/1800 重排（§8.1 1m→5m→30m）', async () => {
   const f = fresh()
   let calls = 0
-  f.keeper.register('write', async () => { calls += 1; throw new Error('always') })
+  f.keeper.register('import', async () => { calls += 1; throw new Error('always') })
   try {
-    const id = f.keeper.enqueue('write', {})
+    const id = f.keeper.enqueue('import', {})
     await f.keeper.tick()
     let row = jobRow(f.db, id)
     assert.equal(row.state, 'queued')
@@ -199,10 +199,10 @@ test('done 永不复跑（启动补偿也不碰）', async () => {
 test('同 kind 单飞：已有 running 时 claim changes=0，跳过不再起一个', async () => {
   const f = fresh()
   let calls = 0
-  f.keeper.register('write', async () => { calls += 1; return { ok: true } })
+  f.keeper.register('import', async () => { calls += 1; return { ok: true } })
   try {
-    const first = f.keeper.enqueue('write', {})
-    const second = f.keeper.enqueue('write', {})
+    const first = f.keeper.enqueue('import', {})
+    const second = f.keeper.enqueue('import', {})
     f.db.prepare("UPDATE jobs SET state='running' WHERE id=?").run(first)
     const r = await f.keeper.tick()
     assert.deepEqual(r, { ran: [], skipped: 'same_kind_running' })
@@ -223,23 +223,23 @@ test('全局并发=1：一个 job 跑着时第二个 tick 让路，两个 kind �
   const calls = []
   let release
   const gate = new Promise((resolve) => { release = resolve })
-  f.keeper.register('write', async () => { calls.push('write'); await gate; return { ok: true } })
+  f.keeper.register('import', async () => { calls.push('import'); await gate; return { ok: true } })
   f.keeper.register('reflect', async () => { calls.push('reflect'); return { ok: true } })
   try {
-    f.keeper.enqueue('write', {})
+    f.keeper.enqueue('import', {})
     f.keeper.enqueue('reflect', {})
     const p1 = f.keeper.tick()
     const second = await f.keeper.tick()
     assert.deepEqual(second, { ran: [], skipped: 'busy' })
-    assert.deepEqual(calls, ['write'])
+    assert.deepEqual(calls, ['import'])
     release()
-    assert.deepEqual(await p1, { ran: ['write'] })
+    assert.deepEqual(await p1, { ran: ['import'] })
     assert.equal(jobCount(f.db, "state='done'"), 1)
     assert.equal(jobCount(f.db, "state='queued'"), 1)
 
     const rest = await f.keeper.drain({ max: 5 })
     assert.deepEqual(rest, { ran: ['reflect'], failed: 0 })
-    assert.deepEqual(calls, ['write', 'reflect'])
+    assert.deepEqual(calls, ['import', 'reflect'])
     assert.equal(jobCount(f.db, "state='done'"), 2)
   } finally { f.close() }
 })
@@ -248,11 +248,11 @@ test('启动补偿：先 queued 到期，再 failed(attempts<4) 重置回 queued
   const f = fresh()
   const order = []
   f.keeper.register('reflect', async () => { order.push('reflect'); return { ok: true } })
-  f.keeper.register('write', async () => { order.push('write'); return { ok: true } })
+  f.keeper.register('import', async () => { order.push('import'); return { ok: true } })
   try {
     const q = f.keeper.enqueue('reflect', {})
     const failedId = f.db.prepare(`INSERT INTO jobs (kind,state,attempts,payload,created_at,updated_at)
-      VALUES ('write','failed',2,'{}',?,?)`).run(f.clock, f.clock).lastInsertRowid
+      VALUES ('import','failed',2,'{}',?,?)`).run(f.clock, f.clock).lastInsertRowid
     const r1 = await f.keeper.tick()
     assert.deepEqual(r1, { ran: ['reflect'] })
     assert.deepEqual(order, ['reflect'])
@@ -260,8 +260,8 @@ test('启动补偿：先 queued 到期，再 failed(attempts<4) 重置回 queued
     assert.equal(jobRow(f.db, failedId).state, 'failed', '本轮先轮不到 failed')
 
     const r2 = await f.keeper.tick()
-    assert.deepEqual(r2, { ran: ['write'] })
-    assert.deepEqual(order, ['reflect', 'write'])
+    assert.deepEqual(r2, { ran: ['import'] })
+    assert.deepEqual(order, ['reflect', 'import'])
     const compensated = jobRow(f.db, failedId)
     assert.equal(compensated.state, 'done')
     // 补偿是重置回 queued 再跑，不额外加 attempt
@@ -282,9 +282,9 @@ test('水位闸门：stress → defer，next_at=+600，日志只打一次', asyn
     nowFn: () => f.clock,
     intervalMs: 600_000,
   })
-  keeper.register('write', async () => { calls += 1; return { ok: true } })
+  keeper.register('import', async () => { calls += 1; return { ok: true } })
   try {
-    const id = keeper.enqueue('write', {})
+    const id = keeper.enqueue('import', {})
     const r1 = await keeper.tick()
     assert.deepEqual(r1, { ran: [], deferred: 'memory_pressure' })
     assert.equal(calls, 0)
@@ -300,7 +300,7 @@ test('水位闸门：stress → defer，next_at=+600，日志只打一次', asyn
 
     stress = false
     f.advance(600)
-    assert.deepEqual(await keeper.tick(), { ran: ['write'] })
+    assert.deepEqual(await keeper.tick(), { ran: ['import'] })
     assert.equal(calls, 1)
     assert.equal(jobRow(f.db, id).state, 'done')
   } finally { keeper.dispose(); f.close() }
@@ -309,9 +309,9 @@ test('水位闸门：stress → defer，next_at=+600，日志只打一次', asyn
 test('dispose 后 tick 空转，job 留在队列', async () => {
   const f = fresh()
   let calls = 0
-  f.keeper.register('write', async () => { calls += 1; return { ok: true } })
+  f.keeper.register('import', async () => { calls += 1; return { ok: true } })
   try {
-    const id = f.keeper.enqueue('write', {})
+    const id = f.keeper.enqueue('import', {})
     f.keeper.dispose()
     assert.deepEqual(await f.keeper.tick(), { ran: [], skipped: 'disposed' })
     assert.deepEqual(await f.keeper.drain({ max: 3 }), { ran: [], failed: 0 })
@@ -641,10 +641,12 @@ test('installKeeper：默认 handlers 可用，ctx.effect 卸载即 dispose', as
   try {
     assert.equal(effects.length, 1)
     assert.equal(effects[0].label, 'whale-memory: keeper')
-    keeper.enqueue('write', {})
-    // write 没有默认 handler → 失败可重试（visible，不静默）
+    // write 由写队列独占，keeper 不得入队/接管
+    assert.throws(() => keeper.enqueue('write', {}), /reserved_kind/)
+    // 未注册的 kind → 失败可重试（visible，不静默）
+    keeper.enqueue('reflect', {})
     const r = await keeper.tick()
-    assert.deepEqual(r, { ran: ['write'] })
+    assert.deepEqual(r, { ran: ['reflect'] })
     assert.equal(keeper.status().jobs[0].state, 'queued')
     assert.match(keeper.status().lastError, /no_handler/)
 
@@ -653,4 +655,16 @@ test('installKeeper：默认 handlers 可用，ctx.effect 卸载即 dispose', as
     dispose()
     assert.deepEqual(await keeper.tick(), { ran: [], skipped: 'disposed' })
   } finally { f.close() }
+})
+
+
+test('巩固去重不归档规则镜像：用户同文事实不得被 mirror 挤掉', (t) => {
+  const f = fresh()
+  t.after(() => f.close())
+  const user = node(f.db, { text: '删除 AI 报告前先提炼结论', source: 'self' })
+  const mirror = node(f.db, { text: '删除 AI 报告前先提炼结论', source: 'owner', origin: 'rule:iron-rule-17' })
+  const out = convergeDuplicateHashes(f.db, { nowSec: f.clock })
+  assert.equal(out.merged, 0, 'mirror 参与去重会误归档用户事实')
+  assert.equal(f.db.prepare('SELECT status FROM nodes WHERE id=?').get(user).status, 'active')
+  assert.equal(f.db.prepare('SELECT status FROM nodes WHERE id=?').get(mirror).status, 'active')
 })

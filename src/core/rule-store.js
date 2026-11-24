@@ -196,14 +196,17 @@ function splitTopLevel(inner) {
   const out = []
   let buf = ''
   let quote = ''
+  let escapes = 0
   for (let i = 0; i < inner.length; i += 1) {
     const ch = inner[i]
     if (quote) {
       buf += ch
-      if (ch === quote && inner[i - 1] !== '\\') quote = ''
+      if (quote === '"' && ch === '\\') { escapes += 1; continue }
+      if (ch === quote && escapes % 2 === 0) quote = ''
+      escapes = 0
       continue
     }
-    if (ch === '"' || ch === "'") { quote = ch; buf += ch; continue }
+    if (ch === '"' || ch === "'") { quote = ch; buf += ch; escapes = 0; continue }
     if (ch === ',') { out.push(buf.trim()); buf = ''; continue }
     buf += ch
   }
@@ -904,6 +907,12 @@ export function writeRule(root, input, opts = {}) {
 
     const serialized = serializeRuleDocument(normalized)
     if (!serialized.ok) return { ok: false, error: 'serialize_failed', detail: serialized.error }
+    // 写入器不得产出自己读不回的文件：序列化后立即按解析器复读一次，
+    // 失败就拒绝落盘（否则文件占号但面板/注入/AGENTS 全部看不见）。
+    const roundTrip = parseRuleDocument(serialized.text)
+    if (!roundTrip.ok) {
+      return { ok: false, error: 'serialize_unreadable', detail: roundTrip.error }
+    }
 
     const target = rulePath(base, normalized.front)
     const oldFile = findRuleFile(base, normalized.front.key)
@@ -2534,9 +2543,19 @@ export function recoverPendingTxn(root, opts = {}) {
   const base = baseDir(root)
   const ids = listTxns(base, { fs })
   if (!ids.length) return { recovered: false, failed: false, ids: [], processed: [] }
+  // 恢复会改动规则文件/manifest：必须与写入口同一把仓库锁。另一个进程正在 apply
+  // （txn 已写、文件写到一半）时抢不到锁就跳过本轮，绝不把在飞事务回滚掉。
+  const lock = acquireRepoLock(base, {
+    fs, timeoutMs: Number.isFinite(opts.lockTimeoutMs) ? Number(opts.lockTimeoutMs) : 250,
+  })
+  if (!lock.ok) {
+    log(`[whale-memory] txn recovery skipped: ${lock.error || 'repo_locked'}`)
+    return { recovered: false, failed: false, ids, processed: [], skipped: 'repo_locked' }
+  }
   const processed = []
   let recovered = false
   let failed = false
+  try {
   for (const id of ids) {
     const txn = readTxn(base, id, { fs })
     if (!txn) {
@@ -2609,6 +2628,9 @@ export function recoverPendingTxn(root, opts = {}) {
     })
   }
   return { recovered, failed, id: processed[0]?.id, ids: processed.map((item) => item.id), processed }
+  } finally {
+    lock.release?.()
+  }
 }
 
 // ---------------------------------------------------------------------------

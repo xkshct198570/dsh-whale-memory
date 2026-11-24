@@ -236,7 +236,8 @@ export function expandOneHop(db, { seeds = [], identity = {}, minConf = 0.6, cap
       AND e.etype IN ('topic','reference') AND e.conf >= ?
       AND n.status = 'active'
       -- 规则镜像只服务面板检索：扩散路径同样不得把它带回对话上下文（R8-08）。
-      AND n.origin NOT LIKE 'rule:%'${where}
+      AND (n.origin IS NULL OR n.origin NOT LIKE 'rule:%')${where}
+    ORDER BY e.conf DESC, e.id
     LIMIT ?`
   let rows
   try {

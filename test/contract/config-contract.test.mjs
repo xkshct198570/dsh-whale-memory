@@ -184,8 +184,8 @@ test('GET /config：回显全部组，值解 Ref 且含文档字段', async () =
     assert.equal(body.config.embed.enabled, false)
     assert.equal(body.config.panel.pollMs, 60000)
     assert.equal(body.config.advanced.traceId, '')
-    // 0=关闭注入的文档冲突标注
-    assert.match(body.notes.recall_charBudget, /0 = 关闭注入/)
+    // 冲突标注已从 API 删除：只保留真实契约，不把内部文档冲突暴露给调用方。
+    assert.equal(body.notes, undefined)
   } finally { await close() }
 })
 

@@ -66,3 +66,17 @@ test('R9-14：AGENTS 管理块旧于规则 → health warnings=agents_block_stal
   assert.equal(warning.file, agentsPath)
   assert.equal(dirname(agentsPath), home)
 })
+
+test('requireGit=true 且 git 不可用 → health 必须红（git_required_unmet）', (t) => {
+  const { rulesDir } = freshRoot(t)
+  assert.equal(writeRule(rulesDir, { front: ruleFront('rule-a', 1), text: '必须保留审计日志。' }, { git: false }).ok, true)
+  const payload = rulesHealthPayload({
+    root: rulesDir,
+    config: { rules: { dir: rulesDir, requireGit: true } },
+    detect: () => ({ available: false, version: '', checkedAt: Date.now(), error: 'git_unavailable' }),
+  })
+  assert.equal(payload.ok, false, '写闸不满足时巡检不能报绿')
+  assert.ok(payload.failures.some((item) => item.code === 'git_required_unmet'), JSON.stringify(payload.failures))
+  assert.equal(payload.git.required, true)
+  assert.equal(payload.git.available, false)
+})

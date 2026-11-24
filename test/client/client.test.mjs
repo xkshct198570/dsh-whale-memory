@@ -616,7 +616,8 @@ test('R10：设置只提交脏叶子；提案 apply/reject 用同步 ref 闸防�
 
 test('WP1 首启推荐：只在全默认配置出现，应用只提交差异，同步以 dry-run 起步', () => {
   assert.ok(CLIENT.includes('function configIsDefaults(cfg)'), '缺少首启默认值判定')
-  assert.match(CLIENT, /if \(key === 'sync\.bridgeUrl'\) continue/, 'profile 注入的桥地址不应算作用户改动')
+  assert.match(CLIENT, /key === 'sync\.bridgeUrl' \|\| key === 'panel\.tab'/, '桥地址/上次页签不应算作用户改动')
+  assert.match(CLIENT, /const current = field === undefined \? cfg\[group\]/, 'dataDir 顶层键必须参与首启判定（否则推荐卡永不出现）')
   assert.match(CLIENT, /const firstRunSeenRef = useRef\(readFirstRunSeen\(\)\)/, '缺少首启已读标记')
   assert.match(CLIENT, /if \(load\.status !== 'ok' \|\| firstRunSeenRef\.current\) return/, '已处理过仍会弹')
   assert.match(CLIENT, /if \(!configIsDefaults\(serverRef\.current\)\) return/, '已有配置也会弹 / 会覆盖')

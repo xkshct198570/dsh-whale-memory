@@ -110,18 +110,21 @@ export function isLocalOrigin(origin) {
  * （历史缺陷：恶意页面可触发 purge）。这里在读取 body / 产生任何副作用之前拒绝。
  *
  * @param {{method?:string,headers?:object}} req
+ * @param {{boundHosts?:string[]}} [opts] allowRemote 读请求时额外放行的绑定地址
  * @returns {{status:number,error:string}|null} null=放行
  */
-export function writeRequestProblem(req) {
+export function writeRequestProblem(req, opts = {}) {
   const rawType = String(req?.headers?.['content-type'] ?? '')
   const mediaType = rawType.split(';')[0].trim().toLowerCase()
   if (mediaType !== 'application/json') {
     return { status: 415, error: 'unsupported_media_type' }
   }
+  const boundHosts = Array.isArray(opts.boundHosts) ? opts.boundHosts : []
   const host = req?.headers?.host
-  if (!isLocalHostName(host)) return { status: 403, error: 'cross_origin_denied' }
+  // Host 只作附加校验，永远不是认证：真正的写权限由调用方的 peer/端点判定。
+  if (!isAllowedHostName(host, boundHosts)) return { status: 403, error: 'cross_origin_denied' }
   const origin = req?.headers?.origin
-  if (origin !== undefined && !isLocalOrigin(origin)) {
+  if (origin !== undefined && !isAllowedOrigin(origin, boundHosts)) {
     return { status: 403, error: 'cross_origin_denied' }
   }
   return null
@@ -166,7 +169,11 @@ export async function readJson(req, maxBytes = 64 * 1024, opts = {}) {
   let size = 0
   for await (const chunk of req) {
     size += chunk.length
-    if (size > maxBytes) return { ok: false, status: 413, error: 'payload_too_large' }
+    if (size > maxBytes) {
+      // 排空剩余字节：否则 keep-alive 连接里残留的 body 会污染下一次请求。
+      req?.resume?.()
+      return { ok: false, status: 413, error: 'payload_too_large' }
+    }
     chunks.push(chunk)
   }
   if (!size) {
@@ -181,9 +188,39 @@ export async function readJson(req, maxBytes = 64 * 1024, opts = {}) {
   }
 }
 
-/** @param {unknown} value */
+/**
+ * 整数参数收敛：缺省/空串/非数字一律回落 fallback，再夹到 [min,max]。
+ *
+ * 为什么必须先把 null/'' 判掉：`Number(null) === 0` 是有限数，会让 fallback 变成
+ * 永远走不到的死代码（列表端点不带 limit 时被夹成 1，而不是声明的默认条数）。
+ *
+ * @param {unknown} value 原始参数（URLSearchParams.get / body 字段）
+ * @param {number} min @param {number} max @param {number} fallback
+ * @returns {number}
+ */
 export function clamp(value, min, max, fallback) {
-  const n = Number(value)
+  if (value === null || value === undefined) return fallback
+  const raw = typeof value === 'string' ? value.trim() : value
+  if (raw === '') return fallback
+  const n = Number(raw)
   if (!Number.isFinite(n)) return fallback
   return Math.min(max, Math.max(min, Math.trunc(n)))
+}
+
+/**
+ * Origin 白名单：本机名恒放行；allowRemote 时额外放行 webServer 绑定地址。
+ * 空 Origin 是 curl/非浏览器客户端，放行；`null`（file://）拒绝。
+ *
+ * @param {unknown} origin @param {string[]} [boundHosts]
+ * @returns {boolean}
+ */
+export function isAllowedOrigin(origin, boundHosts = []) {
+  const raw = String(origin ?? '').trim()
+  if (!raw) return true
+  if (raw.toLowerCase() === 'null') return false
+  let parsed
+  try { parsed = new URL(raw) } catch { return false }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false
+  if (parsed.username || parsed.password) return false
+  return isAllowedHostName(parsed.host, boundHosts)
 }

@@ -21,7 +21,8 @@
  */
 import { existsSync } from 'node:fs'
 import * as nodeFs from 'node:fs'
-import { join, resolve } from 'node:path'
+
+import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   acquireRepoLock,
@@ -41,6 +42,14 @@ import {
   writeRule,
   MANIFEST_FILE,
 } from './rule-store.js'
+
+/** 目录 fsync（删文件后让目录项持久化）；平台不支持时静默跳过。 */
+function fsyncDir(dir, fs = nodeFs) {
+  let fd = null
+  try { fd = fs.openSync(dir, 'r'); fs.fsyncSync(fd) } catch { /* 非 POSIX 或权限不足 */ } finally {
+    if (fd !== null) { try { fs.closeSync(fd) } catch { /* already closed */ } }
+  }
+}
 
 /** 播种标记（规则仓内，与 manifest.json 同层；不进 git，见 `ensureRuleGitignore`）。 */
 export const SEED_MARKER = '.seeded.json'
@@ -555,6 +564,7 @@ export async function restoreDefaultRule({ root = '', key = '', git = true, exec
       try {
         tombBackup = { path: tombPath, content: fs.readFileSync(tombPath) }
         fs.unlinkSync(tombPath)
+        try { fsyncDir(dirname(tombPath), fs) } catch { /* 目录 fsync 失败不改变已删除事实 */ }
       } catch (err) {
         log(`[whale-memory] restore default tombstone remove failed: ${err?.message || err}`)
         tombBackup = null
@@ -586,8 +596,11 @@ export async function restoreDefaultRule({ root = '', key = '', git = true, exec
     if (!manifest.ok) return { ok: false, error: 'manifest_failed', detail: manifest.error }
     let commit = null
     if (git) {
+      const commitPaths = [relativePath(base, written.path), MANIFEST_FILE]
+      // 墓碑的删除也必须进本次提交：否则工作树删了、HEAD 还跟踪，换机/checkout 后墓碑复活。
+      if (tombBackup) commitPaths.push(relativePath(base, tombPath))
       commit = commitOnce(base, `rule: restore default ${k}`, {
-        exec, paths: [relativePath(base, written.path), MANIFEST_FILE],
+        exec, paths: commitPaths,
       })
       if (commit && !commit.ok) log(`[whale-memory] restore default commit skipped: ${commit.error || 'git_unavailable'}`)
     }

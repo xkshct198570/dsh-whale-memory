@@ -47,7 +47,8 @@ const DEFAULT_CONFIG = {
 }
 
 /** 载入 client bundle，返回 apply() 后注册的两个 slot 组件。 */
-function loadSlots() {
+function loadSlots(configOverride = null) {
+  const config = configOverride ? { ...DEFAULT_CONFIG, ...configOverride } : DEFAULT_CONFIG
   let factory = null
   const sandbox = {
     console,
@@ -59,7 +60,7 @@ function loadSlots() {
     URL,
     fetch: async (url) => {
       const body = String(url).endsWith('/config')
-        ? { ok: true, config: DEFAULT_CONFIG }
+        ? { ok: true, config }
         : { ok: true, items: [], series: [], stats: {} }
       return { ok: true, status: 200, json: async () => body }
     },
@@ -112,18 +113,20 @@ function loadSlots() {
     if (typeof node.type === 'function') return renderNode(node.type({ ...node.props, children: node.children }))
     return { type: String(node.type), children: node.children.map(renderNode) }
   }
-  const mount = async (Component, props) => {
-    // 固定跑几轮让 effect 里的异步加载/轮询落地；本用例只关心"渲染是否抛错"，
-    // 不追求 React 的真实收敛语义（面板有轮询，天然会反复 setState）。
-    for (let round = 0; round < 8; round += 1) {
+  const mount = async (Component, props, rounds = 8) => {
+    // 固定跑几轮让 effect 里的异步加载/轮询落地；返回最后一轮渲染树，
+    // 供测试断言"页签真的渲染出内容"而不是只断言源码字符串。
+    let tree = null
+    for (let round = 0; round < rounds; round += 1) {
       cursor = 0
       dirty = false
       effects = []
-      renderNode(React.createElement(Component, props))
+      tree = renderNode(React.createElement(Component, props))
       for (const { fn } of effects) fn()
       await new Promise((resolve) => setTimeout(resolve, 0))
-      if (!dirty) return
+      if (!dirty) return tree
     }
+    return tree
   }
 
   const slots = {}
@@ -140,10 +143,37 @@ function loadSlots() {
   return { slots, mount }
 }
 
+/** 渲染树 → 纯文本（只用于断言关键文案是否真的出现）。 */
+function treeText(node) {
+  if (node === null || node === undefined || node === false) return ''
+  if (typeof node === 'string' || typeof node === 'number') return String(node)
+  if (Array.isArray(node)) return node.map(treeText).join('')
+  if (node.text !== undefined) return String(node.text)
+  return (node.children || []).map(treeText).join('')
+}
+
 test('面板渲染冒烟：settings.section 与 main 都能无异常渲染（防白屏）', async () => {
   const { slots, mount } = loadSlots()
   assert.equal(typeof slots['settings.section'], 'function', '缺少 settings.section 组件')
   assert.equal(typeof slots.main, 'function', '缺少 main 面板组件')
   await mount(slots['settings.section'], { t: (key) => key })
   await mount(slots.main, { t: (key) => key, locale: 'zh' })
+})
+
+test('六页签逐个执行组件函数：任一页签白屏/ReferenceError 都会红', async () => {
+  const tabs = ['overview', 'memory', 'rules', 'recall', 'writes', 'settings']
+  for (const tab of tabs) {
+    const { slots, mount } = loadSlots({ panel: { ...DEFAULT_CONFIG.panel, tab } })
+    const tree = await mount(slots.main, { t: (key) => key, locale: 'zh' }, 1)
+    assert.ok(tree, `${tab} 页签未产出渲染树`)
+    const text = treeText(tree)
+    assert.ok(text.length > 0, `${tab} 页签渲染为空`)
+  }
+})
+
+test('全默认配置下首启推荐卡真实出现（configIsDefaults 回归）', async () => {
+  const { slots, mount } = loadSlots({ panel: { ...DEFAULT_CONFIG.panel, tab: 'settings' } })
+  const tree = await mount(slots.main, { t: (key) => key, locale: 'zh' })
+  const text = treeText(tree)
+  assert.match(text, /settings\.firstRunTitle/, '默认配置应出现首启推荐卡')
 })

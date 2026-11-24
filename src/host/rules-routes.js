@@ -401,6 +401,12 @@ export function rulesHealthPayload({ root = '', config = {}, detect = detectGit 
     if (last) lastRecovery = JSON.parse(last)
   } catch { /* 没有恢复记录 */ }
 
+  // requireGit 是写闸：可用性不满足时所有写入口 403，巡检不能报绿。
+  const git = gitView({ config, detect })
+  if (git.required === true && git.available !== true) {
+    push('git_required_unmet', { git })
+  }
+
   // 黄灯（非红）：不影响 ok，但必须让面板/交接看得到——这些是「规则静默消失」的预兆。
   const warnings = []
   try {
@@ -467,7 +473,7 @@ export function rulesHealthPayload({ root = '', config = {}, detect = detectGit 
       tombstones: tombstones.length,
       nextNumber: manifest ? Number(manifest.nextNumber) : null,
     },
-    git: gitView({ config, detect }),
+    git,
     checkedAt: Date.now(),
   }
 }

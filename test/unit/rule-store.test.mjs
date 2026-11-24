@@ -731,3 +731,24 @@ test('revertRule：rev 不存在 → rev_not_found；文件保持当前版本', 
   assert.equal(missing.error, 'rev_not_found')
   assert.equal(readRule(root, 'rule-1').rule.front.version, 1)
 })
+
+test('序列化/解析往返：数组元素以反斜杠结尾（Windows 路径）也必须可读回', (t) => {
+  const root = freshRoot(t)
+  const front = {
+    ...frontOf({ key: 'rule-win-path' }),
+    conditions: ['只写入 C:\\Program Files\\', '只允许周五'],
+    exceptions: ['临时目录 C:\\Temp\\'],
+  }
+  const normalized = normalizeRuleDoc(front, '必须只写入指定目录。')
+  const serialized = serializeRuleDocument(normalized)
+  assert.equal(serialized.ok, true, serialized.error)
+  const parsed = parseRuleDocument(serialized.text)
+  assert.equal(parsed.ok, true, `序列化器写出了自己解析不了的文件：${parsed.error}`)
+  assert.deepEqual(parsed.front.conditions, front.conditions)
+  assert.deepEqual(parsed.front.exceptions, front.exceptions)
+
+  const written = writeRule(root, { front, text: '必须只写入指定目录。' }, { git: false })
+  assert.equal(written.ok, true, written.error)
+  assert.equal(readRule(root, 'rule-win-path').ok, true, 'writeRule 后必须能被 readRule 读回')
+  assert.equal(listRules(root).errors.length, 0)
+})

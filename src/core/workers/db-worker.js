@@ -173,7 +173,8 @@ function opStats(msg) {
     if (cols.size === 0) return { op: 'stats', result: { nodes: 0, active: 0 } }
     const nodes = countRows(db, '')
     const where = []
-    if (cols.has('active')) where.push('active = 1')
+    if (cols.has('status')) where.push("status = 'active'")
+    else if (cols.has('active')) where.push('active = 1')
     else if (cols.has('state')) where.push("state = 'active'")
     else if (cols.has('superseded_by')) where.push('superseded_by IS NULL')
     if (cols.has('deleted_at')) where.push('deleted_at IS NULL')

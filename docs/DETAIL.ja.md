@@ -16,7 +16,7 @@ DeepSeek Harness のセッション向けのローカル長期記憶です。毎
 - Plugins マーケットで `dsh-whale-memory` を検索します（掲載後）。
 - またはリリースの tarball をインストールします：`dsh plugin --profile <profile> add <dsh-whale-memory.tgz>`
 - ローカル開発では `link:<repository-directory>` を使います。
-- DSH `>=0.2.2-rc.5 <0.3.0`、Node `>=22.5` が必要です。
+- DSH `>=0.2.2-rc.5 <0.3.0`、Node `>=22.13.0` が必要です。
 
 ## 使い方
 

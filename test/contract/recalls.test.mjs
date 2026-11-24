@@ -56,7 +56,7 @@ test('零命中：仍落一行 recalls（injected=0 / hit_ids="[]" / chars=0 / u
   } finally { b.dispose() }
 })
 
-test('预算 0（creative 意图）也落行；source 由调用方传入并截 32 字符', async () => {
+test('预算 0（creative 意图）落行且标记 intent0；普通检索 source 截 32', async () => {
   const b = fresh()
   try {
     const r = await b.recall({ query: '帮我画一张海报', maxHits: 5, identity: ident, source: 's'.repeat(40) })
@@ -71,8 +71,12 @@ test('预算 0（creative 意图）也落行；source 由调用方传入并截 3
     assert.equal(Number(row.injected), 0)
     assert.equal(Number(row.chars), 0)
     assert.equal(Number(row.used), 0)
-    assert.equal(row.source, 's'.repeat(32), 'source 截断到 32')
+    assert.equal(row.source, 'intent0', '按设计 0 预算不能伪装成用户来源的零命中')
     assert.ok(Number.isFinite(Number(row.elapsed_ms)))
+
+    // 非 0 预算路径仍按调用方 source 截断（口径未被 intent0 改掉）。
+    await b.recall({ query: '端口规则', maxHits: 3, identity: ident, source: 's'.repeat(40) })
+    assert.equal(recallRows(b).at(-1).source, 's'.repeat(32))
   } finally { b.dispose() }
 })
 
@@ -136,14 +140,14 @@ test('recalls 过滤：zero / unused / source / since / limit 与键集合', asy
     b.withDb((db) => db.prepare('UPDATE recalls SET ts=? WHERE id=?').run(Math.floor(Date.now() / 1000) - 86400, a))
 
     const zero = await b.recalls(100, { filter: 'zero' })
-    assert.deepEqual(zero.items.map((item) => item.id).sort(ascending), [a, e].sort(ascending))
+    assert.deepEqual(zero.items.map((item) => item.id).sort(ascending), [a], 'intent0 不算零命中')
     assert.ok(zero.items.every((item) => item.hit_ids === '[]'))
 
     const unused = await b.recalls(100, { filter: 'unused' })
     assert.deepEqual(unused.items.map((item) => item.id), [bb], 'unused=已注入且未采纳，C 已采纳、D 未注入都要排除')
 
     const bySource = await b.recalls(100, { source: 'panel-test' })
-    assert.deepEqual(bySource.items.map((item) => item.id).sort(ascending), [bb, c, e].sort(ascending))
+    assert.deepEqual(bySource.items.map((item) => item.id).sort(ascending), [bb, c].sort(ascending), 'intent0 不再冒用 panel-test')
 
     const combined = await b.recalls(100, { source: 'hook', filter: 'zero' })
     assert.deepEqual(combined.items.map((item) => item.id), [a])
@@ -224,4 +228,18 @@ test('GET /recalls：source/since/filter/limit 透传，非法值忽略而不是
   } finally {
     await new Promise((resolve) => server.close(resolve))
   }
+})
+
+test('listEpisodic 按身份过滤：反思素材不得混入别人的私有 episodic', async () => {
+  const b = fresh()
+  try {
+    await b.write({ text: 'u1 的私有经历', memory_type: 'episodic', source: 'self', identity: ident })
+    await b.write({ text: 'u2 的私有经历', memory_type: 'episodic', source: 'self', identity: { userId: 'u2', roleId: '', workspace: 'web' } })
+    await b.write({ text: '共享经历', memory_type: 'episodic', source: 'self', identity: { userId: '', roleId: '', workspace: '' } })
+    const mine = await b.listEpisodic(20, { identity: ident })
+    const texts = mine.map((row) => row.text)
+    assert.ok(texts.includes('u1 的私有经历'))
+    assert.ok(texts.includes('共享经历'), '共享分区可见（历史兼容口径）')
+    assert.equal(texts.includes('u2 的私有经历'), false, '跨用户 episodic 泄漏')
+  } finally { b.dispose() }
 })

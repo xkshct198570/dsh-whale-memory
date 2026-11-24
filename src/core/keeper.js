@@ -22,8 +22,10 @@ import { bool, num, value } from '../host/config-values.js'
 import { METRIC_DEFS, computeMetrics, writeMetricsRows } from './metrics.js'
 import { parseTags, rebuildTagEdges, upsertEdge } from './relations.js'
 
-/** 允许的作业类型（enqueue/register 校验用；与 schema jobs.kind 语义一致）。 */
+/** 允许的作业类型（schema jobs.kind 语义；write 由写队列独占，keeper 不调度）。 */
 export const JOB_KINDS = ['consolidate', 'reflect', 'write', 'vector', 'archive', 'report', 'import']
+/** keeper 不得接管的 kind：write 的排队/重试/崩溃续跑全在 writer 的写队列里。 */
+export const KEEPER_RESERVED_KINDS = Object.freeze(['write'])
 
 /** 失败重试退避（秒）：§8.1 的 1m→5m→30m；attempts=0 是首跑不等，3 起封顶 30m。 */
 const BACKOFF_SECONDS = [0, 60, 300, 1800]
@@ -115,14 +117,14 @@ export function createKeeper({
   function pickAndClaim() {
     return store.withDb((db) => {
       const queued = db.prepare(`SELECT * FROM jobs
-        WHERE state='queued' AND (next_at IS NULL OR next_at <= ?)
+        WHERE state='queued' AND kind <> 'write' AND (next_at IS NULL OR next_at <= ?)
         ORDER BY next_at IS NOT NULL, next_at, id LIMIT ?`).all(dbNow(), CANDIDATE_LIMIT)
       for (const row of queued) {
         if (claim(db, row.id)) return { job: row }
       }
       let blocked = queued.length > 0
 
-      const failed = db.prepare(`SELECT * FROM jobs WHERE state='failed' AND attempts < ?
+      const failed = db.prepare(`SELECT * FROM jobs WHERE state='failed' AND kind <> 'write' AND attempts < ?
         ORDER BY id LIMIT ?`).all(MAX_ATTEMPTS, CANDIDATE_LIMIT)
       for (const row of failed) {
         const reset = db.prepare(`UPDATE jobs SET state='queued', next_at=NULL, updated_at=?
@@ -229,6 +231,7 @@ export function createKeeper({
     register(kind, handler) {
       const key = String(kind || '')
       if (!JOB_KINDS.includes(key)) throw new Error(`unknown_kind: ${key}`)
+      if (KEEPER_RESERVED_KINDS.includes(key)) throw new Error(`reserved_kind: ${key} owned by write queue`)
       if (typeof handler !== 'function') throw new TypeError('register: handler required')
       if (handlers.has(key)) throw new Error(`duplicate_handler: ${key}`)
       handlers.set(key, handler)
@@ -239,6 +242,7 @@ export function createKeeper({
     enqueue(kind, payload = {}, { nextAt } = {}) {
       const key = String(kind || '')
       if (!JOB_KINDS.includes(key)) throw new Error(`unknown_kind: ${key}`)
+      if (KEEPER_RESERVED_KINDS.includes(key)) throw new Error(`reserved_kind: ${key} owned by write queue`)
       let text = '{}'
       try { text = JSON.stringify(payload ?? {}) } catch { text = '{}' }
       const next = nextAt === undefined || nextAt === null || nextAt === '' ? null : toSeconds(nextAt)
@@ -359,8 +363,11 @@ export function createKeeper({
  */
 export function convergeDuplicateHashes(db, { batch = DEDUPE_BATCH, maxNodes = 5000, nowSec = Date.now() / 1000 } = {}) {
   const limit = Math.max(1, Math.floor(Number(batch) || DEDUPE_BATCH))
+  // 规则镜像不参与「用户事实去重」：mirror 的 source=owner 会让它挤掉用户同文事实。
+  // 口径与 v4 唯一索引、writer.findDup 一致（origin='rule:*' 豁免）。
   const rows = db.prepare(`SELECT id, text_hash, source, created_at, user_id, role_id, workspace
-    FROM nodes WHERE status='active' ORDER BY created_at, id LIMIT ?`).all(Math.max(1, Number(maxNodes) || 5000))
+    FROM nodes WHERE status='active' AND (origin IS NULL OR origin NOT LIKE 'rule:%')
+    ORDER BY created_at, id LIMIT ?`).all(Math.max(1, Number(maxNodes) || 5000))
   const groups = new Map()
   for (const row of rows) {
     const hash = String(row.text_hash || '')
@@ -391,7 +398,7 @@ export function convergeDuplicateHashes(db, { batch = DEDUPE_BATCH, maxNodes = 5
   db.exec('BEGIN IMMEDIATE')
   let merged = 0
   try {
-    const archive = db.prepare("UPDATE nodes SET status='archived', updated_at=? WHERE id=? AND status='active'")
+    const archive = db.prepare("UPDATE nodes SET status='archived', updated_at=? WHERE id=? AND status='active' AND (origin IS NULL OR origin NOT LIKE 'rule:%')")
     const audit = db.prepare(`INSERT INTO writes (ts,trace_id,action,node_id,reason,mode,user_id,role_id,workspace)
       VALUES (?,?,'CONSOLIDATE',?,'dedupe_hash','auto',?,?,?)`)
     for (const row of doomed) {

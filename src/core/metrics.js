@@ -62,7 +62,7 @@ const SERIES_SQL = `SELECT count(*) AS recalls,
   sum(CASE WHEN injected = 1 AND used = 1 THEN 1 ELSE 0 END) AS adopted,
   sum(CASE WHEN hit_ids IN ('[]','') THEN 1 ELSE 0 END) AS zeroHit,
   avg(CASE WHEN injected = 1 THEN chars END) AS avgChars
-  FROM recalls WHERE ts >= ? AND ts < ?`
+  FROM recalls WHERE ts >= ? AND ts < ? AND source <> 'intent0'`
 
 const pad2 = (n) => String(n).padStart(2, '0')
 

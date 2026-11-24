@@ -109,7 +109,10 @@ export function validateRefine(proposal, parsed, { root = '' } = {}) {
   const front = {
     key: textOf(draft.key),
     type: textOf(draft.type),
-    number: Number.isInteger(Number(draft.number)) ? Number(draft.number) : null,
+    // 与 normalizeRuleDoc 同口径：编号只属于 iron-rule 且必须正整数；Number(null)===0
+    // 会被 validateRule 判成 number_not_allowed/invalid_number，让普通候选的润色恒失败。
+    number: textOf(draft.type) === 'iron-rule' && Number.isInteger(Number(draft.number)) && Number(draft.number) > 0
+      ? Number(draft.number) : null,
     priority: textOf(draft.priority) || 'P1',
     scope: textOf(draft.scope) || 'global',
     role: textOf(draft.role),

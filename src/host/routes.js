@@ -193,8 +193,29 @@ export function createRoutes({
     } catch { return [] }
   }
 
+  /**
+   * allowRemote 下非回环 peer 仍可用的「读语义」端点。
+   *
+   * 为什么按端点而不是按 HTTP 方法：/search 与 /recall-test 是纯检索（不写库、不调模型），
+   * 但浏览器只能发 POST；若按方法一律当写请求，远端面板的检索页会全 403。
+   * 反过来 /export 虽为 GET，却是整库原文下载，远端默认不给。
+   */
+  const REMOTE_READ_POST = new Set([`${PREFIX}/search`, `${PREFIX}/recall-test`])
+  const REMOTE_READ_DENY_GET = new Set([`${PREFIX}/export`])
+  const remoteReadable = (method, path) => {
+    const m = String(method || '').toUpperCase()
+    if (m === 'GET') return !REMOTE_READ_DENY_GET.has(path)
+    if (m === 'POST') return REMOTE_READ_POST.has(path)
+    return false
+  }
+
   /** 主分发（内部）：抛错由下面的 handle 统一兜底成 502 JSON。 */
   const dispatch = async (req, res) => {
+    const addr = req.socket?.remoteAddress
+    // 每次请求读实时配置：面板改了 allowRemote 必须立刻生效，不能闭包快照。
+    const allowRemote = bool(config?.panel?.allowRemote, false)
+    const peerLoopback = isLoopback(addr)
+
     // Host 闸覆盖所有方法（含 GET）：DNS rebinding 页面可带畸形/外部 Host 同源 GET
     // 走规则全文、整库导出与详情正文，必须在任何路由/身份解析之前拒绝。
     // allowRemote 时额外放行 webServer 绑定地址（审计 P1-13：旧实现 Host 闸先于
@@ -203,23 +224,30 @@ export function createRoutes({
       return sendJson(res, 403, { ok: false, error: 'cross_origin_denied' })
     }
 
-    // 每次请求读实时配置：面板改了 allowRemote 必须立刻生效，不能闭包快照。
-    const addr = req.socket?.remoteAddress
-    if (!bool(config?.panel?.allowRemote, false) && !isLoopback(addr)) {
+    // peer 是硬闸，Host 只是附加校验：Host 头由客户端填写，伪造 127.0.0.1 不能换来写权限。
+    if (!peerLoopback && !allowRemote) {
       return sendJson(res, 403, { ok: false, error: 'not_loopback' })
-    }
-
-    // 写接口安全闸（R8-09）：在所有端点分发之前拦下跨源/非 JSON 简单请求，
-    // 保证拒绝发生在读 body、建规则仓、写库等任何副作用之前。
-    if (isWriteMethod(req.method)) {
-      const problem = writeRequestProblem(req)
-      if (problem) return sendJson(res, problem.status, { ok: false, error: problem.error })
     }
 
     const traceId = traceIdOf(req)
 
     let path = ''
     try { path = new URL(req.url || '/', 'http://127.0.0.1').pathname } catch { path = '' }
+
+    // allowRemote 只放开读语义端点；写/管理端点（config/import/sync/reflect/rules 写）
+    // 一律要求回环 peer。远端即使伪造 Host 也过不了这一关。
+    if (!peerLoopback && !remoteReadable(req.method, path)) {
+      return sendJson(res, 403, { ok: false, error: 'read_only_remote' })
+    }
+
+    // 写接口安全闸（R8-09）：在所有端点分发之前拦下跨源/非 JSON 简单请求，
+    // 保证拒绝发生在读 body、建规则仓、写库等任何副作用之前。
+    // 远端只可能走 /search 这类只读 POST；Host/Origin 白名单允许绑定地址，
+    // 但仍要求 JSON（text/plain 简单请求进不来）。
+    if (isWriteMethod(req.method)) {
+      const problem = writeRequestProblem(req, { boundHosts: peerLoopback ? [] : boundHosts() })
+      if (problem) return sendJson(res, problem.status, { ok: false, error: problem.error })
+    }
 
     const ident = resolveIdentity(
       getIdentityCfg(),
@@ -244,8 +272,15 @@ export function createRoutes({
       runtimeWorkspaceSource: identityState?.lastRecall?.workspaceSource || null,
     })
 
+    /**
+     * 身份覆盖只对回环 peer 开放：allowRemote 下同网段客户端不能按 userId/workspace
+     * 翻别人的分区，也不能通过 POST body 绕开 GET 参数的限制。
+     */
+    const canOverrideIdentity = peerLoopback
+
     /** 请求显式带 workspace（string，含空串）时覆盖 Config；不带就沿用 handle 顶部身份。 */
     const withRequestWorkspace = (workspace) => {
+      if (!canOverrideIdentity) return ident
       if (typeof workspace !== 'string') return ident
       const baseHint = typeof getIdentityHint === 'function' ? (getIdentityHint() || {}) : {}
       const hint = { ...baseHint, workspace: workspace.trim().slice(0, 64) }
@@ -265,6 +300,7 @@ export function createRoutes({
      * 有时要"看另一个分区"；这里只做覆盖，不做授权判断——回环闸门已经在上面拦过。
      */
     const requestIdentity = (source) => {
+      if (!canOverrideIdentity) return { ok: true, identity }
       if (!source || typeof source !== 'object') return { ok: true, identity }
       const override = {}
       for (const [key, max] of [['userId', 128], ['roleId', 64], ['workspace', 64]]) {
@@ -288,7 +324,7 @@ export function createRoutes({
      * 非回环请求一律不允许覆盖身份：allowRemote 只暴露“当前身份视图”，
      * 否则同网段任何客户端都能按 userId/workspace 翻别人的分区。
      */
-    const identityParams = (params) => (isLoopback(addr) ? {
+    const identityParams = (params) => (canOverrideIdentity ? {
       userId: params.get('userId') ?? undefined,
       roleId: params.get('roleId') ?? undefined,
       workspace: params.get('workspace') ?? undefined,
@@ -595,7 +631,11 @@ export function createRoutes({
 
     // 单节点详情 / 编辑归档
     if (path.startsWith(`${PREFIX}/nodes/`)) {
-      const id = decodeURIComponent(path.slice(`${PREFIX}/nodes/`.length))
+      let id = ''
+      try { id = decodeURIComponent(path.slice(`${PREFIX}/nodes/`.length)) } catch {
+        return sendJson(res, 400, { ok: false, error: 'invalid_id' })
+      }
+      if (!id) return sendJson(res, 400, { ok: false, error: 'invalid_id' })
       if (req.method === 'GET') {
         if (typeof backend.getNode !== 'function') return sendJson(res, 502, { ok: false, error: 'backend_unavailable' })
         const params = new URL(req.url, 'http://127.0.0.1').searchParams
@@ -728,8 +768,6 @@ export function createRoutes({
         ok: true,
         config: echoConfig(config),
         runtimeIdentity: identityView(),
-        // 文档 §4 S11 写 0=不限制，代码里 0=关闭注入；以代码为准，冲突待文档侧修正。
-        notes: { recall_charBudget: '0 = 关闭注入（与文档 §4 S11 的 0=不限制 冲突，以代码为准）' },
       })
     }
 

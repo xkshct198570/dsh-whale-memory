@@ -8,7 +8,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createProposal, readProposal } from '../../src/core/rule-proposal.js'
-import { parseRefineReply, refineProposal } from '../../src/core/rule-refine.js'
+import { parseRefineReply, refineProposal, validateRefine } from '../../src/core/rule-refine.js'
 
 function freshRoot(t) {
   const root = mkdtempSync(join(tmpdir(), 'whale-refine-'))
@@ -83,3 +83,16 @@ test('提炼：候选已被裁定（rejected）后模型回包不得覆盖状态
   assert.equal(readProposal({ rulesDir: root, config: {}, id: made.proposal.id }).proposal.status, 'rejected')
 })
 
+
+
+test('validateRefine：普通 rule 的 number=null 不得被强转成 0（死开关回归）', (t) => {
+  const root = freshRoot(t)
+  const parsed = { text: '每次提交前必须先跑测试。', conditions: [], exceptions: [] }
+  const draft = {
+    key: 'rule-x', type: 'rule', number: null, priority: 'P1', scope: 'global', role: '',
+    modality: 'must', action: '', object: '', conditions: [], exceptions: [],
+  }
+  const out = validateRefine({ draft, text: parsed.text, relation: { relation: 'new' } }, parsed, { root })
+  assert.equal(out.ok, true, `rule number=null 被误判：${JSON.stringify(out.detail)}`)
+  assert.equal('number' in out.patch, false, '润色不发布身份字段')
+})

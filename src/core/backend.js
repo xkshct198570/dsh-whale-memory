@@ -613,8 +613,11 @@ export class LocalBackend {
       maxHits: q?.maxHits ?? 5,
       charBudget: q?.charBudget,
     })
+    // 预算 0 是「按设计不检索」，不是「检索了但零命中」：source=intent0 与命中率指标区分开，
+    // 避免画图链路把 zero_injection_rate 永久拉红。
+    const intentZero = budget.maxHits <= 0 || budget.charBudget <= 0
     // 调用方标来源（hook / panel-test / search...）；截 32 与 writes.source 口径一致。
-    const source = String(q?.source || 'hook').slice(0, 32)
+    const source = String(intentZero ? 'intent0' : (q?.source || 'hook')).slice(0, 32)
     /**
      * 落审计行。hit_ids 记录的是**检索命中集合**（并非最终注入集合）：只有把"命中了
      * 但被预算裁掉/丢弃"也留下来，日报才能列出"命中但未注入"的低分候选。
@@ -644,7 +647,7 @@ export class LocalBackend {
       }
     }
 
-    if (budget.maxHits <= 0 || budget.charBudget <= 0) {
+    if (intentZero) {
       audit({})
       return { ok: true, prefix: '', chars: 0, hits: 0, intent: budget.intent }
     }
@@ -757,11 +760,21 @@ export class LocalBackend {
     }
   }
 
-  /** 反思素材：最近 episodic（只读）。 */
-  async listEpisodic(limit = 20) {
+  /**
+   * 反思素材：最近 episodic（只读）。
+   *
+   * 身份过滤不可省：反思会把素材交给模型再写回；不按分区取会把别人的私有 episodic
+   * 混进来，写回时又落共享分区，等于把私有事实洗成公开记忆。
+   *
+   * @param {number} [limit]
+   * @param {{ identity?: Identity }} [opts]
+   */
+  async listEpisodic(limit = 20, opts = {}) {
     const db = this._db()
-    const rows = db.prepare("SELECT id,text,created_at,tags FROM nodes WHERE status='active' AND memory_type='episodic' ORDER BY created_at DESC LIMIT ?")
-      .all(Math.max(1, Math.min(50, Number(limit) || 20)))
+    const where = whereOf(opts?.identity)
+    const rows = db.prepare(`SELECT id,text,created_at,tags FROM nodes${where.sql}
+      ${where.sql ? 'AND' : 'WHERE'} status='active' AND memory_type='episodic'
+      ORDER BY created_at DESC LIMIT ?`).all(...where.params, Math.max(1, Math.min(50, Number(limit) || 20)))
     return rows
   }
 
@@ -1026,7 +1039,7 @@ export class LocalBackend {
       if (levelChanged) audit('EDIT', 'level', row.level, level, 'manual_level')
       if (tagsChanged) audit('EDIT', 'tags', row.tags, tags, 'manual_tags')
       if (pointerChanged) audit('EDIT', 'superseded_by', row.superseded_by ?? '', nextPointer ?? '', 'manual_supersede')
-        return { ok: true, id: target }
+        return { ok: true, id: target, updated_at: ts }
       })
     } catch (err) {
       // 编辑后的正文与另一活跃行撞车：回明确错误码，不把 SQLite 约束文案透给面板。
@@ -1105,7 +1118,10 @@ export class LocalBackend {
     if (source) extra.push(['source = ?', [source]])
     const since = Number(opts?.since)
     if (Number.isFinite(since)) extra.push(['ts >= ?', [since]])
-    if (opts?.filter === 'zero') extra.push(["hit_ids IN ('[]','')", []])
+    if (opts?.filter === 'zero') {
+      extra.push(["hit_ids IN ('[]','')", []])
+      extra.push(["source <> 'intent0'", []])
+    }
     else if (opts?.filter === 'unused') extra.push(['injected = 1 AND used = 0', []])
     const where = whereOf(opts?.identity, extra)
     const sql = `SELECT id,ts,trace_id,query,hit_ids,chars,injected,used,elapsed_ms,source
