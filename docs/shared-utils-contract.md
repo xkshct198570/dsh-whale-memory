@@ -29,20 +29,28 @@
 同一工具连续两次出现“同一语义变更必须在两仓/两插件各改一遍”，才立 P7 抽包。
 单次改动合并进各自版本，不构成 drift；判据以改动记录（提交 + 改到哪些文件）为准，不凭印象。
 
-## 4. check-shared-drift 现状职责
+## 4. 差异审计（P6b 已实现）
 
-`node scripts/check-shared-drift.mjs [--check]`（缺省 --check）：
+```bash
+node scripts/check-shared-drift.mjs --peer ~/dsh-persona-hub-refactor
+```
 
-- 只读列出现状：`src/host/http-kit.js`、`src/shared/config-values.js` 的行数与导出符号（acorn 解析），随后打印 `[shared-drift] ok（未建跨插件共享包；P6 填充 API/行为差异审计）`，exit 0。
-- 不写文件、不判差异、不比对另一插件；未知参数 exit 2；任一被盘点文件缺失 exit 1（不静默跳过）。
-- P6 在此脚本上补 API/行为差异审计，不在当前阶段提前猜差异。
+- 判据：工具副本的**行数、导出名集合、公共导出参数个数**；实现体差异不计 drift（两插件各有裁剪）。
+- 输出：每个工具一行「本仓 ↔ 对侧」，再列差异（对侧缺/多导出、公共导出参数个数不同）。
+- fail-closed：给了 `--peer` 但目录/文件读不到 → exit 1；没给 `--peer` → 打印 `跨仓差异：skipped（未提供 --peer）` 并 exit 0（pretest 走这个模式，不静默跳过）。
+- 本闸只审计不判红：判红按 §3「连续两次必须两仓同改」才立 P7。
 
-## 5. 下一步
+当前差异（2026-11-25 实测，`--peer ~/dsh-persona-hub-refactor`）：
 
-**P4（本仓）**：routes/client 拆分（`rules-routes` 分组 + 写闸评估；client 只做 CSS 抽取/渲染冒烟，不重排字节）。P1/P2/P3a–P3e 已收口：rule-store 8、rule-reconcile 4、rule-proposal 5、writer 6、backend 6 子模块 + `workers/index.js` 门面（tag `p3a-done`…`p3e-done`，门面均纯 re-export；`check-deps` 白名单空）。跨插件抽包仍按 §3 判据，P6 前不做。
+| 工具 | 本仓 | 对侧（人设） | 差异 |
+| --- | --- | --- | --- |
+| config-values | `src/shared/config-values.js` 69 行 / 5 导出 | `src/host/config-values.js` 66 行 / 5 导出 | 本仓多 `num`，对侧多 `isEnabled` |
+| http-kit | `src/host/http-kit.js` 226 行 / 10 导出 | `src/host/http-kit.js` 135 行 / 9 导出 | 对侧缺 `clamp/isAllowedHostName/isLocalHostName/isWriteMethod/writeRequestProblem`，多 `checkWriteGate/isAllowedHost/isJsonContentType/isLocalHostHeader`；公共导出 `readJson` 参数个数 3 vs 2 |
 
-**P6（跨插件）**：
+结论：两仓是「同语义不同裁剪」，不是同一份代码的分叉；人设侧 P5 未动这两个副本（已核对），暂不构成 §3 的 drift。
 
-1. 导出对照表：两插件各自工具文件的导出名、签名、默认值、错误语义逐项对齐。
-2. 行为差异用例：同一输入（loopback 判定、Host/Origin 白名单、配置取值与易变字段合并）在两边跑出结果并记录差异。
-3. 决策与交付：抽包 / 保留副本+契约测试 / 收编进 `src/shared` 三者择一，附发布顺序与回滚方案；差异清单与决策写入本文件正文，不留 TODO 占位。
+## 5. 下一步（P6 剩余）
+
+1. 行为差异用例：同一输入（loopback 判定、Host/Origin 白名单、配置取值与易变字段合并）在两边跑出结果并记录差异（当前只有静态签名审计）。
+2. 决策与交付：抽包 / 保留副本+契约测试 / 收编进 `src/shared` 三者择一，附发布顺序与回滚方案；结论写回本文件正文。
+3. 判据仍按 §3：同一工具连续两次「必须两仓同改」才立 P7；单次改动不构成 drift。
