@@ -30,9 +30,8 @@
  * Why 单独成文件：路由文件已 35K，再塞规则读写会继续膨胀；把 payload 纯函数独立出来
  * 还能脱 HTTP 做契约测试（不起真服务器）。
  */
-import { RULES_PREFIX, textOf, summaryBudgetOf, resolveRulesRoot, writeGuard, sendMethodNotAllowed, statusForError } from './rules-routes/shared.js'
-import { readJson, sendJson, isWriteMethod, writeRequestProblem } from './http-kit.js'
-import { value } from '../shared/config-values.js'
+import { textOf } from './rules-routes/shared.js'
+import { sendJson, isWriteMethod, writeRequestProblem } from './http-kit.js'
 import { detectGit } from './git-detector.js'
 export { RULES_PREFIX, resolveRulesRoot } from './rules-routes/shared.js'
 import { handleListHealth, handleRuleDetail } from './rules-routes/list-health.js'
@@ -43,67 +42,16 @@ import { handleEditRevert } from './rules-routes/edit-revert.js'
 export { revertPayload, ruleDiffPayload, ruleVersionsPayload, updatePayload } from './rules-routes/edit-revert.js'
 import { handleCreateDelete } from './rules-routes/create-delete.js'
 export { createPayload, deletePayload } from './rules-routes/create-delete.js'
-import { isValidRuleKey, listRules } from '../core/rule-store.js'
-import { importLegacyRule, mirrorRules, mirrorStatus } from '../core/rule-mirror.js'
-import { agentsPathOf, renderAgentsDigest } from '../core/rule-render.js'
+import { handleImportLegacy } from './rules-routes/import-legacy.js'
+export { importLegacyPayload } from './rules-routes/import-legacy.js'
+import { handleRenderMirror } from './rules-routes/render-mirror.js'
+export { rebuildMirrorPayload, renderAgentsPayload } from './rules-routes/render-mirror.js'
 
-/**
- * 手动重渲染 AGENTS 摘要块（幂等；缺标记返回 no_markers，绝不追加）。
- * @param {{root?:string,config?:any,log?:Function}} args
- * @returns {object}
- */
-export function renderAgentsPayload({ root = '', config = {}, log = () => {} } = {}) {
-  if (value(config?.rules?.enabled, true) === false) return { ok: false, error: 'rules_disabled' }
-  // 架构书 §4.1：rules.renderAgents=false 时自愈与手动渲染都跳过（手动重渲染不得绕过开关）。
-  if (value(config?.rules?.renderAgents, true) === false) return { ok: false, error: 'render_disabled' }
-  const dir = root || resolveRulesRoot(config)
-  const result = renderAgentsDigest({ rules: dir, agentsPath: agentsPathOf(dir), log, budgetChars: summaryBudgetOf(config) })
-  return { ok: Boolean(result.ok), dir, code: textOf(result.code), changed: Boolean(result.changed), count: Number(result.count) || 0 }
-}
 
-/**
- * 重建镜像（管理动作）。
- * @param {{root?:string,config?:any,backend?:any,detect?:Function,log?:Function}} args
- * @returns {object}
- */
-export function rebuildMirrorPayload({ root = '', config = {}, backend, detect = detectGit, log = () => {} } = {}) {
-  const guard = writeGuard(config, detect)
-  if (!guard.ok) return { ok: false, error: guard.error, git: guard.git }
-  const dir = root || resolveRulesRoot(config)
-  const list = listRules(dir)
-  const mirror = mirrorRules({ backend, rules: list.rules, log })
-  if (!mirror.ok) return { ok: false, error: mirror.error }
-  const status = mirrorStatus({ backend, rules: list.rules })
-  return { ok: true, dir, mirror, status }
-}
 
-/**
- * 迁移旧铁律（管理动作，幂等）。
- * @param {{root?:string,config?:any,backend?:any,key?:string,number?:number,
- *   detect?:Function,log?:Function}} args
- * @returns {object}
- */
-export function importLegacyPayload({
-  root = '', config = {}, backend, key = '', number = null, detect = detectGit, log = () => {},
-} = {}) {
-  const guard = writeGuard(config, detect)
-  if (!guard.ok) return { ok: false, error: guard.error, git: guard.git }
-  const dir = root || resolveRulesRoot(config)
-  const imported = importLegacyRule({ backend, key, number, root: dir, gitRequired: guard.required })
-  if (!imported.ok) return imported
-  let mirror = null
-  if (config?.rules?.mirrorAuto !== false && imported.skipped === false) {
-    const list = listRules(dir)
-    mirror = mirrorRules({ backend, rules: list.rules, log })
-  }
-  // count/imported 供面板显示「导入 N 条 / 已存在跳过」；0/1 是本次动作的真实增量。
-  return {
-    ...imported,
-    count: imported.skipped ? 0 : 1,
-    imported: imported.skipped ? 0 : 1,
-    ...(mirror ? { mirror } : {}),
-  }
-}
+
+
+
 /**
  * 规则路由入口：命中返回 true，未命中返回 false（交给 routes.js 继续/404）。
  *
@@ -131,9 +79,6 @@ export async function handleRules({
     }
     return payload
   }
-  const rebuildPath = `${RULES_PREFIX}/rules/rebuild-mirror`
-  const importPath = `${RULES_PREFIX}/rules/import-legacy`
-  const renderPath = `${RULES_PREFIX}/rules/render-agents`
 
   if (await handleListHealth({ req, res, path: p, config, detect })) return true
 
@@ -147,53 +92,9 @@ export async function handleRules({
 
   if (await handleCreateDelete({ req, res, path: p, config, backend, detect, log, git, afterWrite })) return true
 
-  if (p === renderPath) {
-    if (req.method !== 'POST') { sendMethodNotAllowed(res, 'POST'); return true }
-    const body = await readJson(req, 64 * 1024, { allowEmpty: true })
-    if (!body.ok) { sendJson(res, body.status, { ok: false, error: body.error }); return true }
-    const payload = afterWrite(renderAgentsPayload({ config, log }))
-    // no_markers/duplicate_markers 是幂等「没动」，200 带 ok:false；闸门类错误才按 403。
-    sendJson(res, payload.error ? statusForError(textOf(payload.error)) : 200, payload)
-    return true
-  }
+  if (await handleRenderMirror({ req, res, path: p, config, backend, detect, log, afterWrite })) return true
 
-  if (p === rebuildPath) {
-    if (req.method !== 'POST') { sendMethodNotAllowed(res, 'POST'); return true }
-    // 无载荷动作：空 body 合法（allowEmpty），但 413/坏 JSON 必须当场拒绝，不能静默继续。
-    const body = await readJson(req, 64 * 1024, { allowEmpty: true })
-    if (!body.ok) { sendJson(res, body.status, { ok: false, error: body.error }); return true }
-    const payload = rebuildMirrorPayload({ config, backend, detect, log })
-    sendJson(res, payload.ok ? 200 : statusForError(textOf(payload.error)), payload)
-    return true
-  }
-
-  if (p === importPath) {
-    if (req.method !== 'POST') { sendMethodNotAllowed(res, 'POST'); return true }
-    const body = await readJson(req)
-    if (!body.ok) {
-      sendJson(res, body.status, { ok: false, error: body.error })
-      return true
-    }
-    const rawKey = textOf(body.value?.key).trim()
-    // 非法 key 不再静默截断：422 让调用方知道是参数问题；未给 key 时按旧铁律节点推导。
-    if (rawKey && !isValidRuleKey(rawKey.slice(0, 64))) {
-      sendJson(res, 422, { ok: false, error: 'invalid_key' })
-      return true
-    }
-    const key = rawKey.slice(0, 64)
-    const rawNumber = Number(body.value?.number)
-    const payload = afterWrite(importLegacyPayload({
-      config,
-      backend,
-      key,
-      number: Number.isInteger(rawNumber) && rawNumber > 0 ? rawNumber : null,
-      detect,
-      log,
-    }))
-    // 404=节点不存在、409=重复、422=未通过校验；不再把管理动作一律按 403 报。
-    sendJson(res, payload.ok ? 200 : statusForError(textOf(payload.error)), payload)
-    return true
-  }
+  if (await handleImportLegacy({ req, res, path: p, config, backend, detect, log, afterWrite })) return true
 
   if (handleRuleDetail({ req, res, path: p, config, detect })) return true
   return false
