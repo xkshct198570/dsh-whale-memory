@@ -1,6 +1,6 @@
 # 会话收尾 v2（Session Wrap v2）· 架构书 v1
 
-> 状态：设计稿（2026-11-26，未施工）。基线：鲸忆 0.6.7（main `e06750a`，tag `v0.6.7`）／人设 0.5.3／DSH 0.2.2-rc.5／Node ≥22.13。
+> 状态：设计稿（2026-11-26，未施工）。基线：鲸忆 0.6.10（本地未推；已推最新 `v0.6.8`→`4fc892c`）／人设 0.5.3／DSH 0.2.2-rc.5／Node ≥22.13。
 > 施工计划：`Session-Wrap-v2-施工计划-v1-2026-11-26.md`。上一版：`Session-Wrap-架构书-v1-2026-11-24.md`（W1–W6 已落地）。
 > 触发背景（2026-11-26 01:2x，厂长）：面板点「立即收尾」无反应；希望可选“收尾哪一段会话”、有“自动收尾”勾选；并确认收尾语义＝总结本轮踩坑/经验→归纳提炼→能进铁律的提案、不能的进记忆库，且表述去歧义。
 
@@ -118,7 +118,7 @@ op 语义（与 `writes.action` 对齐）：
 
 | 端点 | 方法 | 请求 | 响应 | 说明 |
 |:--|:--|:--|:--|:--|
-| `/wrap` | POST | `{sessionId?, trigger?}` | **202** `{ok,queued:true,runId,sessionId,position?,existing}`；409 仅硬错误（无材料/未启用/后端不支持） | 点击即入队：正在跑/有其他会话在跑时不再 409；同 material 幂等返回 existing；`turn_in_progress` 不再作为拒绝（排队到 turn 结束后执行） |
+| `/wrap` | POST | `{sessionId?, trigger?}` | 缺省=旧行为；sessionId 支持 S1；**S1b 队列语义以 `下一会话创造模式总纲-架构书-v1-2026-11-26.md` §5 为唯一真源**（202/200/409 矩阵、幂等、内存队列） | 本文不重复队列契约，改动只改总纲 §5 |
 | `/wrap/sessions` | GET | — | `{ok,items:[{sessionId,lastActivity,materialTurns,open,skipAuto,lastRunId,lastRunState}],auto:{enabled,idleMinutes}}` | 不含正文/标题；按 lastActivity 倒序；远端读拒绝 |
 | `/wrap/session` | PATCH | `{sessionId,skipAuto}` | `{ok,skipAuto}` | 持久化到 `wrap_session_prefs`；仅 owner 身份 |
 | `/wrap/status` | GET | — | 增加 `sessions[]`、`auto`、`lastFeedback` | 兼容旧字段 |
@@ -130,8 +130,7 @@ op 语义（与 `writes.action` 对齐）：
 |:--|:--|:--|
 | `turn_in_progress` | 目标会话正在回复/工具中 | 当前会话正在回复，等它结束或换一个会话 |
 | `no_material` | 没有可收尾材料 | 这个会话还没有可收尾的对话 |
-| `busy_queue_full` | 全局队列已满（同会话 1 条 + 全局上限） | 已排队 N 条，稍后自动开始 |
-| ~~`busy_wrap`~~ | ~~已有收尾在跑~~ | **删除该拒绝语义**：改为入队并显示“已排队，请稍等/正在重试 N/4” |
+| `session_queue_full` / `busy_queue_full` | 见总纲 §5.2 矩阵 | 按矩阵文案：队列满是 **409**，绝不写“已排队”；`busy_wrap` 已删除 |
 | `wrap_disabled` | 总开关/自动开关关 | 收尾功能已关闭 |
 | `same_material` | 同一材料已收尾过 | 这段已经收尾过了（有新对话才会重跑） |
 | `capture_unavailable` | 采集器未就绪 | 采集器未就绪，稍后再试 |
@@ -157,13 +156,12 @@ CREATE TABLE IF NOT EXISTS wrap_session_prefs (
 - 成本与模型：自动触发默认关，卡片勾选时显示“会花模型 token”；`wrap.provider`/`wrap.model` 可把收尾切到非推理/低成本模型（0.6.7 已落地，本机配 `deepseek-account/deepseek-flash`）；`maxItems`/`maxMaterialChars`/`timeoutMs` 沿用；Reconcile 仅在有候选时调用一次，邻居 topK≤5、单条邻居截断 200 字。
 - 峰时抑制（借鉴 meow-memory 的 dream）：可选 `wrap.autoSuppressWindows`（默认空数组，不默认启用），命中窗口只跳过自动触发，手动不受影响。
 - 幂等：同会话同材料 hash 只跑一次；进程崩溃后 keeper 续跑；per-session skip 持久化。
-- **队列与进度（厂长 2026-11-26 令）**：点击=入队不是报忙；同会话最多 1 条排队、同材料复用 existing run；卡片显示 `排队中（第 N）/运行中：采集→蒸馏→分流→报告/失败：重试 1/4`；进度条按 run.phase+job.state 推进；空闲自动收尾走同一队列；`/wrap/status` 增 `queued{count,position,phase,attempts,maxAttempts}`。
+- **队列与进度（S1b）**：契约、状态码/幂等/内存队列/status 字段以**总纲 §5** 为唯一真源；本文不再展开。S1b 只做 202 入队＋排队/进度＋`GET /wrap/sessions`；PATCH/schema v6/keeper 重试归 S2。
 
 ## 7. 面板 UX
 
 - 收尾卡片：`会话` 下拉（只列有材料的捕获会话，显示 `最后活动 · 轮数 · 进行中/已跳过`）＋ `立即收尾` 按钮＋ `自动收尾` 勾选（右侧说明“空闲 10 分钟 · 会花 token”）＋ 上次结果行。
-- 反馈（重设计）：点击→“已排队，请稍等”＋按钮转圈＋**进度条/阶段点**（排队→采集→蒸馏→分流→报告），不出现“已有任务在跑，稍后再试”；失败→按 §5.2 中文一句话＋“重试 1/4”可见；禁用时 tooltip 说明原因（加载中/未启用/后端不支持）。
-- 排队去重：同 material 再点返回同一 run（卡片不新增第二条）；不同 material 排队最多 1 条，超出给“已排队 N 条”。
+- 反馈/排队文案：**以总纲 §5.4 文案矩阵为准**；本文字段只列布局（进度点位置、按钮区、失败行）。
 - 状态行：`StateBadge`（running/ok/warn/error 底色），不再用普通文字；原始错误码只放 `title`。
 - 指标行：4 个等宽 `StatTile`（标签 11px 上、值 18px 下、左对齐），窄屏 2×2；不再把 `Row` 塞进 `metaGrid`（现版标签/值被 `space-between` 拉散，截图可见）。
 - 会话下拉每行有“跳过自动收尾”开关（写 `/wrap/session`），并标注进行中不可手动收尾。

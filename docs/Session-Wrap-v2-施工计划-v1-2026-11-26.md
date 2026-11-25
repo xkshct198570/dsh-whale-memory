@@ -35,12 +35,11 @@
 
 回滚点：S1 单 commit，面板回旧卡片即可。
 
-## S1b · 点击即排队＋进度（并入 S1 交付，先行可独立验收）
+## S1b · 点击即排队＋进度
 
-- `POST /wrap`：正在跑/`turn_in_progress`/其他会话在跑都返回 **202 入队**（不再 `busy_wrap`）；同 material 幂等 `existing:true`；全局/会话队列上限给 `busy_queue_full`。
-- `/wrap/status`：增 `queued{count,position,phase,attempts,maxAttempts}`；`latest.retrying` 暴露“重试 N/4”。
-- 卡片：点击后按钮转圈＋“已排队，请稍等”＋阶段进度（排队→采集→蒸馏→分流→报告）；失败显示重试计数；移除 busy_wrap 文案。
-- 判据：运行中点按钮 → 202 且 UI 出现排队/进度（不是红字报忙）；同材料连点两次只产生 1 个 run；排队到 turn 结束后真正开跑。
+- 契约与逐条验收：**`下一会话创造模式总纲-架构书-v1-2026-11-26.md` §5（唯一真源）**；会话级排期：`下一会话创造模式施工计划-v1-2026-11-26.md` S1b。
+- 范围：202 入队＋内存队列/position＋status 队列字段＋进度/文案＋`GET /wrap/sessions`；**不含** PATCH、schema v6、per-session skip、keeper 自动重试、每日上限（S2）。
+- 本文件不重复状态码/幂等/文案矩阵，避免与总纲冲突。
 
 ## S2 · 自动开关＋per-session skip
 
