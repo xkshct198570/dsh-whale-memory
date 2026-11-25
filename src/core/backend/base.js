@@ -58,3 +58,31 @@ export function whereOf(identity, extra = []) {
   }
   return { sql: parts.length ? ` WHERE ${parts.join(' AND ')}` : '', params }
 }
+
+/**
+ * 原型装配：把各域方法对象装到类的 prototype 上，描述符与 class 方法一致。
+ *
+ * why 不用 Object.assign：它只搬值不搬描述符——getter 会退化成字段、方法变成可枚举，
+ * 原型对拍与 for-in 行为都会变；这里按描述符装并强制 `enumerable:false`。
+ * why 装载前查重：同名成员若被后装域覆盖就是静默丢方法，必须当场抛错（禁止静默失败）。
+ *
+ * @param {Function} Cls 目标类（其 prototype 承载底座成员）
+ * @param {...object} methodSets 每个域的方法对象（键=方法名）
+ * @returns {Function} 入参 Cls
+ */
+export function installMethods(Cls, ...methodSets) {
+  const proto = Cls && Cls.prototype
+  if (!proto || typeof proto !== 'object') throw new TypeError('installMethods: Class required')
+  for (const methods of methodSets) {
+    const descriptors = Object.getOwnPropertyDescriptors(methods)
+    for (const key of Object.keys(descriptors)) {
+      if (key === 'constructor') continue
+      if (Object.prototype.hasOwnProperty.call(proto, key)) {
+        throw new Error(`installMethods: duplicate member ${key}`)
+      }
+      descriptors[key].enumerable = false
+    }
+    Object.defineProperties(proto, descriptors)
+  }
+  return Cls
+}
