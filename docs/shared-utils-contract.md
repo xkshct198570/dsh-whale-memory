@@ -15,6 +15,8 @@
 - **P2a 已清零 6 条 `core → host` 边**（backend/keeper/reflect 各两条）；`scripts/decouple-baseline.json` 现为 `allowedEdges: []`、`pathMigrations: {}`。
 - 原先散在 core 的 Ref 解包副本（writer/hybrid/backend/rule-plan/rule-proposal 的 `plain()/cfgValue()`）已物理删除，统一走 `shared/config-values.js`；`routes/config-migration` 的 Ref 树解包副本合并为 `shared/resolve-refs.js`。
 - 人设插件仍有自己的 `src/host/config-values.js` 与 `http-kit.js` 副本；两仓尚未共享。
+- P4 收口后 `rules-routes` 8 模块仍只 import `src/shared/**` 与 `src/host/http-kit.js`；新增的 `rules-routes/shared.js` 是域内底座（前缀/错误映射/写闸/view），**不是跨插件共享层**，本契约的 API/行为与抽包判据不变。
+
 
 ## 2. 为什么本次不抽跨插件包
 
