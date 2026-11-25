@@ -52,6 +52,14 @@ async function post(path, payload) {
   return { status: res.statusCode, body: res.body ? JSON.parse(res.body) : null }
 }
 
+/** GET 并返回 {status, body}。 */
+async function get(path) {
+  const { res, done } = fakeRes()
+  await handler(fakeReq('GET', path), res)
+  await done
+  return { status: res.statusCode, body: res.body ? JSON.parse(res.body) : null }
+}
+
 before(() => {
   root = join(mkdtempSync(join(tmpdir(), 'whale-rules-cache-')), 'rules')
   nodeFs.mkdirSync(root, { recursive: true })
@@ -109,4 +117,40 @@ test('restore-default 成功后清缓存并落盘，非法 key 不清', async ()
   const bad = await post('/whale-memory/api/rules/restore-default', { key: '../etc/passwd' })
   assert.equal(bad.status, 422)
   assert.equal(cleared, 1, 'restore-default 失败不得清缓存')
+})
+
+test('update 成功后清缓存并落盘，坏字段不清', async () => {
+  cleared = 0
+  const target = join(root, 'rule-1.md')
+  const before = nodeFs.readFileSync(target, 'utf8')
+  const ok = await post('/whale-memory/api/rules/update', { key: 'rule-1', patch: { text: '必须先验证再覆盖正式库（更新）。' } })
+  assert.equal(ok.status, 200, JSON.stringify(ok.body))
+  assert.notEqual(nodeFs.readFileSync(target, 'utf8'), before, 'update 必须实际改文件')
+  assert.ok(nodeFs.readFileSync(target, 'utf8').includes('（更新）'), 'update 必须真落盘正文')
+  assert.equal(cleared, 1, 'update 成功后必须清召回缓存')
+  const bad = await post('/whale-memory/api/rules/update', { key: 'rule-1', patch: { nope: 1 } })
+  assert.equal(bad.status, 400, JSON.stringify(bad.body))
+  assert.equal(cleared, 1, 'update 失败不得清缓存')
+})
+
+test('revert 成功后清缓存并落盘，空 rev 不清', async () => {
+  cleared = 0
+  const detail = await get('/whale-memory/api/rules/rule-1')
+  assert.equal(detail.status, 200, JSON.stringify(detail.body))
+  const preText = detail.body.rule.text
+  const upd = await post('/whale-memory/api/rules/update', { key: 'rule-1', patch: { text: '必须先验证再覆盖正式库（回滚前）。' } })
+  assert.equal(upd.status, 200, JSON.stringify(upd.body))
+  const versions = await get('/whale-memory/api/rules/versions?key=rule-1')
+  assert.equal(versions.status, 200, JSON.stringify(versions.body))
+  const history = versions.body.versions.find((item) => item.kind === 'history')
+  assert.ok(history?.rev, 'update 必须产生历史版本供回滚')
+  cleared = 0
+  const rev = await post('/whale-memory/api/rules/revert', { key: 'rule-1', rev: history.rev })
+  assert.equal(rev.status, 200, JSON.stringify(rev.body))
+  assert.equal(rev.body.rule.text, preText, 'revert 必须把历史正文原样写回')
+  assert.equal(cleared, 1, 'revert 成功后必须清召回缓存')
+  const empty = await post('/whale-memory/api/rules/revert', { key: 'rule-1', rev: '' })
+  assert.equal(empty.status, 400, JSON.stringify(empty.body))
+  assert.equal(empty.body.error, 'invalid_rev')
+  assert.equal(cleared, 1, '空 rev 不得清缓存')
 })
