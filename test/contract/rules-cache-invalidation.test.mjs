@@ -1,6 +1,6 @@
 /**
- * 清召回缓存契约（P4a3 复核缺口补测）：apply / restore-default 成功后必须 invalidateCache，
- * 失败与读请求不得触发。判据来自 P4a3 新 seam——afterWrite 由 handleRules 经 ctx 传给组 handler。
+ * 清召回缓存契约（P4a3 复核缺口补测，P4a4 扩到编辑/回滚）：apply / restore-default / update / revert
+ * 成功后必须 invalidateCache，失败与读请求不得触发。判据来自 afterWrite 经 handleRules 的 ctx 传给组 handler。
  */
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
