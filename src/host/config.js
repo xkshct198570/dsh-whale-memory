@@ -72,6 +72,9 @@ export const Config = z.object({
     retentionDays: z.natural().min(0).max(3650).default(180),
     maxRunsPerDay: z.natural().min(1).max(96).default(6),
     report: z.boolean().default(true).volatile(),
+    // 收尾模型可与对话模型分离：推理档模型会把预算烧在思考上（真机 textLen=0/2526、reasoning=9k+），
+    // 建议收尾走非推理/低成本模型；空=沿用当前会话选择。
+    provider: z.string().default('').volatile(),
     model: z.string().default(''),
     maxMaterialChars: z.natural().min(1000).max(50000).default(12000),
     timeoutMs: z.natural().min(5000).max(600000).default(60000),

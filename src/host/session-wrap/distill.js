@@ -15,7 +15,7 @@ export const MODEL_OUTPUT_MAX = 100_000
  * 蒸馏请求的输出预算。默认模型是推理档（reasoningEffort=high 时思考也计入 maxTokens），
  * 1800 会让 JSON 被思考吃掉、真机 4/4 次 distill_bad_json；4096 给思考+答案留余量。
  */
-export const DISTILL_MAX_TOKENS = 4096
+export const DISTILL_MAX_TOKENS = 8192
 
 /** 首次解析失败后的重试提示：只追加约束，不改素材与判据。 */
 export function distillRetryPrompt(prompt) {
@@ -27,9 +27,9 @@ export function distillRetryPrompt(prompt) {
  * `reasoningChars` 只用于诊断（推理模型把预算烧在思考上时，文本为空而思考非空）。
  */
 export async function collectModelText(llm, selection, prompt, {
-  modelOverride = '', timeoutMs = 60_000, maxTokens = DISTILL_MAX_TOKENS,
+  modelOverride = '', providerOverride = '', timeoutMs = 60_000, maxTokens = DISTILL_MAX_TOKENS,
 } = {}) {
-  const provider = selection?.provider
+  const provider = String(providerOverride || selection?.provider || '')
   const model = String(modelOverride || selection?.model || '')
   if (!provider || !model) return { ok: false, reason: 'no_model' }
   const ac = new AbortController()
@@ -81,7 +81,7 @@ export async function distillPhase({ runId, run, spool, spoolPath, cfg, withDb, 
     { maxItems: cfg.maxItems, maxChars: cfg.maxMaterialChars },
   )
   const got = await collectModelText(llm, selection, prompt, {
-    modelOverride: cfg.model, timeoutMs: cfg.timeoutMs,
+    modelOverride: cfg.model, providerOverride: cfg.provider, timeoutMs: cfg.timeoutMs,
   })
   if (!got.ok) {
     if (got.reason === 'no_model') {
@@ -94,9 +94,9 @@ export async function distillPhase({ runId, run, spool, spoolPath, cfg, withDb, 
   let parsed = parseDistillOutput(got.text)
   if (!parsed.ok) {
     // 失败可见：只记模型/长度/推理字数，不记输出正文（报告与日志无原文是硬约束）。
-    log(`[whale-memory] wrap run=${runId} distill bad_json attempt=1 model=${selection?.provider || '-'}/${String(cfg.model || selection?.model || '-')} textLen=${got.text.length} reasoning=${got.reasoningChars || 0}`)
+    log(`[whale-memory] wrap run=${runId} distill bad_json attempt=1 model=${String(cfg.provider || selection?.provider || '-')}/${String(cfg.model || selection?.model || '-')} textLen=${got.text.length} reasoning=${got.reasoningChars || 0}${(got.reasoningChars || 0) > got.text.length ? ' (reasoning dominates: 建议 wrap.provider/model 换非推理模型)' : ''}`)
     const retry = await collectModelText(llm, selection, distillRetryPrompt(prompt), {
-      modelOverride: cfg.model, timeoutMs: cfg.timeoutMs,
+      modelOverride: cfg.model, providerOverride: cfg.provider, timeoutMs: cfg.timeoutMs,
     })
     if (retry.ok) {
       parsed = parseDistillOutput(retry.text)
