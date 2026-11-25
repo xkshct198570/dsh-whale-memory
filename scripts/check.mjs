@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 上架静态门：E1–E15（计划书 §6 + R9-06 错误码单一真源）+ 禁区扫描 + waterfall 守卫。
+ * 上架静态门：E1–E17（计划书 §6 + R9-06 错误码单一真源 + E17 门面纯 re-export 与导出面）+ 禁区扫描 + waterfall 守卫。
  *
  * 为什么要有这一份：市场安装失败大多不是功能问题，而是 manifest/导出/文件清单/
  * 文档产物这类机械问题；这里把可机检的部分前置，让每次改动当场红，而不是到 S5
@@ -37,11 +37,11 @@ function flattenLocale(node, prefix = '') {
 }
 const isFile = (p) => existsSync(join(root, p)) && statSync(join(root, p)).isFile()
 const isDir = (p) => existsSync(join(root, p)) && statSync(join(root, p)).isDirectory()
-const isNonEmptyDir = (p) => isDir(p) && readdirSync(join(root, p)).some((x) => x !== '.gitkeep')
 
 /** 一个 gate = 一个 E 项；返回原因数组（空数组=通过）。抛错也算失败。 */
 const gates = []
 const gate = (id, fn) => gates.push([id, fn])
+gates.push(['E17', async () => (await import('./gate-facade-exports.mjs')).checkFacadeExports(root)])
 
 // ---------------------------------------------------------------------------
 // 公共解析
@@ -591,6 +591,7 @@ gate('E16', () => {
   return reasons
 })
 
+
 // ---------------------------------------------------------------------------
 for (const [id, fn] of gates) {
   try {
@@ -605,5 +606,5 @@ if (failed) {
   console.error(`[gate] FAILED：${failed} 项未过（见上）`)
   process.exitCode = 1
 } else {
-  console.log(`[gate] OK ${pkg.name}@${pkg.version}：E1–E16 全通过（禁区/waterfall 守卫也过）`)
+  console.log(`[gate] OK ${pkg.name}@${pkg.version}：E1–E17 全通过（禁区/waterfall 守卫也过）`)
 }
