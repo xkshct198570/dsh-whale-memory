@@ -35,6 +35,13 @@
 
 回滚点：S1 单 commit，面板回旧卡片即可。
 
+## S1b · 点击即排队＋进度（并入 S1 交付，先行可独立验收）
+
+- `POST /wrap`：正在跑/`turn_in_progress`/其他会话在跑都返回 **202 入队**（不再 `busy_wrap`）；同 material 幂等 `existing:true`；全局/会话队列上限给 `busy_queue_full`。
+- `/wrap/status`：增 `queued{count,position,phase,attempts,maxAttempts}`；`latest.retrying` 暴露“重试 N/4”。
+- 卡片：点击后按钮转圈＋“已排队，请稍等”＋阶段进度（排队→采集→蒸馏→分流→报告）；失败显示重试计数；移除 busy_wrap 文案。
+- 判据：运行中点按钮 → 202 且 UI 出现排队/进度（不是红字报忙）；同材料连点两次只产生 1 个 run；排队到 turn 结束后真正开跑。
+
 ## S2 · 自动开关＋per-session skip
 
 改动：
