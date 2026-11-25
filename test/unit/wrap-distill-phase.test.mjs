@@ -96,6 +96,17 @@ test('蒸馏：cfg.provider 必须传到 llm（0.6.8 防回归）', async () => 
   assert.equal(seen[0].model, 'x')
 })
 
+test('蒸馏：text-delta 与 block-end 同时出现时不得拼两遍（0.6.10 回归）', async () => {
+  const seen = []
+  const payload = '{"summary":"s","items":[]}'
+  const llm = scriptedLlm([[
+    { type: 'text-delta', text: payload },
+    { type: 'block-end', block: { type: 'text', text: payload } },
+  ]], seen)
+  const got = await collectModelText(llm, { provider: 'p', model: 'm' }, 'prompt', {})
+  assert.equal(got.text, payload, '不能出现 payload+payload')
+})
+
 test('重试提示：要求第一个字符是 JSON 对象，且不含代码围栏', () => {
   const prompt = distillRetryPrompt('原始提示词')
   assert.match(prompt, /原始提示词/)

@@ -37,7 +37,11 @@ export async function collectModelText(llm, selection, prompt, {
   const ac = new AbortController()
   const timer = setTimeout(() => { try { ac.abort() } catch { /* noop */ } }, Math.max(1000, Number(timeoutMs) || 60_000))
   if (typeof timer.unref === 'function') timer.unref()
-  let text = ''
+  // 适配器会同时发 text-delta（增量）与 block-end（整块文本）：两者相加会把 JSON 拼两遍，
+  // parse 时「首个 { 到末个 }」跨两段 → 坏 JSON（真机 01:59：正文 2804 字符≈1.4k 的两倍）。
+  // 口径：有增量用增量，只有整块（无增量）才用整块。
+  let streamed = ''
+  let blocked = ''
   let reasoningChars = 0
   try {
     const iterable = llm.stream({
@@ -45,11 +49,12 @@ export async function collectModelText(llm, selection, prompt, {
       messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
     })
     for await (const chunk of iterable) {
-      if (text.length >= MODEL_OUTPUT_MAX) break
-      if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') text += chunk.text
-      else if (chunk?.type === 'block-end' && chunk.block?.type === 'text') text += String(chunk.block.text || '')
+      if (streamed.length + blocked.length >= MODEL_OUTPUT_MAX) break
+      if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') streamed += chunk.text
+      else if (chunk?.type === 'block-end' && chunk.block?.type === 'text') blocked += String(chunk.block.text || '')
       else if (chunk?.type === 'reasoning-delta' && typeof chunk.text === 'string') reasoningChars += chunk.text.length
     }
+    const text = streamed || blocked
     return { ok: true, text: text.slice(0, MODEL_OUTPUT_MAX), reasoningChars }
   } catch (err) {
     // AbortError 在不同适配器里形状不同：以 signal 为判据，不靠 message 字符串。

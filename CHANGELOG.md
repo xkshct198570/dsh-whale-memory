@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.10 — 2026-11-26（收尾正文双写修复；本地未推）
+
+- 修复：`collectModelText` 同时累加 `text-delta` 与 `block-end.text`，正文被拼两遍（真机 run6：textLen 2804 ≈ JSON 1400 的两倍），`parseDistillOutput` 取“首个 { 到末个 }”跨两段 → 恒 `bad_json`。口径改为“有增量用增量，无增量才用整块”。
+- 回归：新增“delta+block-end 不得拼两遍”用例；全量 1049（1048 pass / 1 skip / 0 fail）。
+- 佐证：同一素材用同模型单跑一次，输出是合法 JSON（3 条 items），说明模型没问题、问题在采集。
+
 ## 0.6.9 — 2026-11-26（收尾输出预算 32768；未推 GitHub）
 
 - 修复：蒸馏输出预算 8192 → 32768。真机证据（deepseek-account/deepseek-flash）：reasoning 12,752–17,334 字符 + 正文 4,140–4,718 字符，8192 仍被思考截断 → `bad_json`。
