@@ -23,15 +23,9 @@ import { bool, value } from '../shared/config-values.js'
 import { createWriteQueue, isActiveHashConflict, recordEvolution, recordWrite, withTx } from './writer.js'
 import { DbWorkerClient } from './workers/client.js'
 import { HybridBackend } from './hybrid.js'
+import { NODE_EXPORT_FIELDS, identityFilter, whereOf } from './backend/base.js'
 
-/** @typedef {{ userId: string, roleId: string, workspace: string }} Identity */
-
-const NODE_EXPORT_FIELDS = [
-  'id', 'role_id', 'user_id', 'workspace', 'text', 'level', 'memory_type', 'source', 'status',
-  'tags', 'context_note', 'weight', 'pinned', 'hits', 'last_hit_at', 'vector_state',
-  'created_at', 'updated_at', 'valid_at', 'invalid_at', 'expired_at', 'superseded_by',
-  'origin', 'trace_id', 'text_hash',
-]
+/** @typedef {import('./backend/base.js').Identity} Identity */
 
 /** 导入字段白名单（非法枚举回落默认，避免把 export 的脏值写进 CHECK 约束）。 */
 const NODE_STATUS = new Set(['active', 'archived', 'superseded', 'stale'])
@@ -91,54 +85,6 @@ function hitIdsCount(raw) {
   } catch {
     return 0
   }
-}
-
-/**
- * 导出身份过滤：与 search 同口径 `(列='' OR 列=?)`，空身份字段不过滤。
- * 为什么导出也要过滤：导出文件会被拿去推送/外传，不带身份条件等于跨分区泄漏。
- *
- * @param {{ userId?: unknown, roleId?: unknown, workspace?: unknown } | null | undefined} identity
- * @returns {{ sql: string, params: string[] }}
- */
-function identityFilter(identity) {
-  const clauses = []
-  const params = []
-  for (const [col, raw] of [
-    ['user_id', identity?.userId],
-    ['role_id', identity?.roleId],
-    ['workspace', identity?.workspace],
-  ]) {
-    const value = typeof raw === 'string' ? raw : String(raw ?? '')
-    if (!value) continue
-    clauses.push(`(${col} = '' OR ${col} = ?)`)
-    params.push(value)
-  }
-  return { sql: clauses.length ? ` WHERE ${clauses.join(' AND ')}` : '', params }
-}
-
-/**
- * 完整 WHERE：身份条件 + 额外条件（全部 AND）。列名属于 nodes 表本身（不做别名）。
- *
- * why 不直接拼字符串：身份条件是安全闸，额外条件（id/action/source）是业务过滤，
- * 两者混写时最容易漏参数占位，导致"查询全表"这种静默越权。
- *
- * @param {Identity|null|undefined} identity
- * @param {Array<[string, unknown[]]>} [extra] 每项 `[SQL 片段, 参数数组]`
- * @returns {{ sql: string, params: string[] }}
- */
-function whereOf(identity, extra = []) {
-  const filter = identityFilter(identity)
-  const parts = []
-  const params = []
-  if (filter.sql) {
-    parts.push(filter.sql.slice(' WHERE '.length))
-    params.push(...filter.params)
-  }
-  for (const [sql, args] of extra) {
-    parts.push(sql)
-    params.push(...(args || []))
-  }
-  return { sql: parts.length ? ` WHERE ${parts.join(' AND ')}` : '', params }
 }
 
 /** edges/evolution 的双端可见条件：两端都在可见集合内才算本分区的边/演化。
