@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.0 — 2026-11-26（Session Wrap v2：会话选择/排队/自动开关/整合）
+
+- **会话选择**：面板收尾卡新增“会话”下拉（只列有材料的采集会话，显示轮数/进行中/已跳过）；`POST /wrap {sessionId}` 指定会话收尾；`GET /wrap/sessions` 无正文/标题/cwd。
+- **点击即排队（S1b）**：运行中点「立即收尾」返回 **202 入队**（不再报 `busy_wrap`）；同材料幂等 200、同会话第二条 409 `session_queue_full`、全局满 409 `busy_queue_full`；卡片显示排队位次与阶段进度点；进程重启队列清空并以 `queue_cleared` 明确提示。
+- **自动开关与 per-session skip（S2，schema v6）**：卡片可直接勾「自动收尾」（写 `wrap.idle`，标注会花 token）；每个会话可“跳过自动收尾”（`PATCH /wrap/session`，落 `wrap_session_prefs`，重启保持）；`latest.retrying` 显示“正在重试 N/4”。
+- **整合 Reconcile（S3/S4，默认关）**：`wrap.reconcile.enabled=false` 时行为与 0.6.10 完全一致；开启后把候选与同身份既有记忆比对，产出 ADD/UPDATE/MERGE/ARCHIVE/NOOP/REVIEW 决策与改写短语义，默认只产影子候选/审计（ARCHIVE 只改状态不删行，保护面拒绝）；支持跨候选合并（同主题多条→1 条）与 level/类型/tags 校正；报告新增“整合决策”计数段（无正文），卡片报告可复制/下载 .md。
+- **身份与安全修复**：身份对象存在即三列必过滤（空串是分区而非“不过滤”，修复跨工作区列表/详情/导出）；保留期清理在身份不可判定时拒绝执行且删除前必备份；HTTP 导入强制请求身份；`/import/status` 与 `/wrap/report` 显式身份作用域；allowRemote 远端读面新增 config/writes/import-status/wrap-sessions 拒绝。
+- **数据完整性**：迁移去重与巩固收敛共用质量序（高信任行不再被顶掉）；每日配额只数 ADD/MERGE/SUPERSEDE；节点落库与 writes 审计同事务；auto MERGE 补 evolution；openDb 失败关连接；启动回收不抢 write job。
+- **门禁**：`lint-size` 接入 pretest/CI 并刷新基线；`AGENTS` 陈旧自愈加退避（不再每步重渲染）、规则 mtime 复用单次扫描；测试计数基线锁死。
+- 测试：全量 1100（1099 pass / 1 skip / 0 fail），`check.mjs` E1–E17、check-deps 0 环、pack 权限 644。
+
 ## 0.6.10 — 2026-11-26（收尾正文双写修复；本地未推）
 
 - 修复：`collectModelText` 同时累加 `text-delta` 与 `block-end.text`，正文被拼两遍（真机 run6：textLen 2804 ≈ JSON 1400 的两倍），`parseDistillOutput` 取“首个 { 到末个 }”跨两段 → 恒 `bad_json`。口径改为“有增量用增量，无增量才用整块”。

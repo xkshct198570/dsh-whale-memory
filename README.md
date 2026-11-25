@@ -4,7 +4,7 @@
 
 Local-first long-term memory for DeepSeek Harness sessions: recall relevant memories before each turn, review and edit them in a six-tab panel, and keep rules in a local git Markdown repository where the database is only a search mirror.
 
-> Current version **0.6.10** (R12: session wrap): local SQLite memory store, automatic recall, six-tab panel, write auditing and adoption signals, optional two-way sync/outbox, metrics and daily reports, and legacy migration auditing. Rule source of truth: `~/.dsh/rules` (proposals, plan/apply, tombstone numbering, health check). Session wrap distils lessons, decisions and open loops when a session ends, producing shadow candidates, rule proposals and a report without raw conversation.
+> Current version **0.7.0** (Session Wrap v2): local SQLite memory store, automatic recall, six-tab panel, write auditing and adoption signals, optional two-way sync/outbox, metrics and daily reports, and legacy migration auditing. Rule source of truth: `~/.dsh/rules` (proposals, plan/apply, tombstone numbering, health check). Session wrap distils lessons, decisions and open loops when a session ends, producing shadow candidates, rule proposals and a report without raw conversation. v2 adds session selection, click-to-queue (202 + progress), an auto-wrap switch with per-session skip, and an optional Reconcile pass (default off) that compares candidates with existing memories and only produces shadow decisions.
 > Requirements: DSH `>=0.2.2-rc.5 <0.3.0`, Node `>=22.13.0` (built-in SQLite).
 
 ## Why it is useful
@@ -12,7 +12,7 @@ Local-first long-term memory for DeepSeek Harness sessions: recall relevant memo
 - It remembers what you mentioned in passing; switch sessions and it still picks it up.
 - Rules live in local git Markdown, the database is only a search mirror — a bad edit can be rolled back.
 - Six-tab panel: view, edit and roll back memories, rules, recalls and writes.
-- Say "wrap this session up" and it turns the round into memory and rule candidates.
+- Say "wrap this session up" and it turns the round into memory and rule candidates; the panel can target a specific session, queue a click (202 + progress) and skip auto-wrap per session.
 - No network, no upload, zero dependencies — Node's built-in SQLite.
 
 ## Install

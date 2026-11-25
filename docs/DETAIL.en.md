@@ -9,7 +9,7 @@ Local long-term memory for DeepSeek Harness sessions: recall before each turn, a
 3. **Six-tab panel** — overview, memories (search/edit/archive/import/export), recall, writes & relations, rules, settings. The rules tab includes proposals, history diff/rollback, git status, and `/rules/health`.
 4. **Controlled writes** — one memory ≤500 characters; shadow review by default, so candidates enter the store only after acceptance; JSONL import/export; audits kept.
 5. **Versioned rules** — iron rules live in `~/.dsh/rules/` Markdown files. Proposal → plan/apply → one commit; purge writes a tombstone and the number is never reused. The database mirror is for the panel only and is excluded from recall.
-6. **Session wrap** — saying "wrap up" / "switch session", going idle, or closing a session distils lessons, decisions and open loops in one bounded pass. Candidates stay in shadow, rules only become proposals, and reports contain no raw conversation.
+6. **Session wrap v2** — saying "wrap up" / "switch session", going idle (card switch), or closing a session distils lessons, decisions and open loops in one bounded pass. Pick a session, click queues with 202 + progress, and each session can skip auto-wrap. An optional Reconcile pass (default off) compares candidates with existing memories and only produces shadow ADD/UPDATE/MERGE/ARCHIVE decisions. Candidates stay in shadow, rules only become proposals, and reports contain no raw conversation.
 7. **Migration** — `migrate-audit` performs read-only reconciliation and backs up before migrating relation edges; see `docs/MIGRATION.md`.
 
 ## Install
