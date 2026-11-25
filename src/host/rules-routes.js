@@ -47,7 +47,6 @@ import { isValidRuleKey, listRules } from '../core/rule-store.js'
 import { importLegacyRule, mirrorRules, mirrorStatus } from '../core/rule-mirror.js'
 import { agentsPathOf, renderAgentsDigest } from '../core/rule-render.js'
 
-
 /**
  * 手动重渲染 AGENTS 摘要块（幂等；缺标记返回 no_markers，绝不追加）。
  * @param {{root?:string,config?:any,log?:Function}} args
