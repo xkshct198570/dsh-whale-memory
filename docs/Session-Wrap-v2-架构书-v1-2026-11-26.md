@@ -1,6 +1,6 @@
 # 会话收尾 v2（Session Wrap v2）· 架构书 v1
 
-> 状态：设计稿（2026-11-26，未施工）。基线：鲸忆 0.6.6（main `26e6690`，tag `v0.6.6`）／人设 0.5.3／DSH 0.2.2-rc.5／Node ≥22.13。
+> 状态：设计稿（2026-11-26，未施工）。基线：鲸忆 0.6.7（main `e06750a`，tag `v0.6.7`）／人设 0.5.3／DSH 0.2.2-rc.5／Node ≥22.13。
 > 施工计划：`Session-Wrap-v2-施工计划-v1-2026-11-26.md`。上一版：`Session-Wrap-架构书-v1-2026-11-24.md`（W1–W6 已落地）。
 > 触发背景（2026-11-26 01:2x，厂长）：面板点「立即收尾」无反应；希望可选“收尾哪一段会话”、有“自动收尾”勾选；并确认收尾语义＝总结本轮踩坑/经验→归纳提炼→能进铁律的提案、不能的进记忆库，且表述去歧义。
 
@@ -153,7 +153,7 @@ CREATE TABLE IF NOT EXISTS wrap_session_prefs (
 - 触发源：显式意图（已有）、面板手动（可指定会话）、空闲（需勾选）、会话 dispose（已有，默认关）、可选 `/wrap` 命令（P2，非本期）。
 - 空闲判定：`now-lastActivity ≥ idleMinutes` 且该会话无 open turn、有材料、未被跳过、与上次材料 hash 不同。
 - 闸门：`wrap.enabled`、`maxRunsPerDay`（默认 6）、单会话同时最多 1 个 run、失败退避（30 分钟后才允许同会话再试）、全局 busy。
-- 成本：自动触发默认关，卡片勾选时显示“会花模型 token”；`maxItems`/`maxMaterialChars`/`timeoutMs` 沿用；Reconcile 仅在有候选时调用一次，邻居 topK≤5、单条邻居截断 200 字。
+- 成本与模型：自动触发默认关，卡片勾选时显示“会花模型 token”；`wrap.provider`/`wrap.model` 可把收尾切到非推理/低成本模型（0.6.7 已落地，本机配 `deepseek-account/deepseek-flash`）；`maxItems`/`maxMaterialChars`/`timeoutMs` 沿用；Reconcile 仅在有候选时调用一次，邻居 topK≤5、单条邻居截断 200 字。
 - 峰时抑制（借鉴 meow-memory 的 dream）：可选 `wrap.autoSuppressWindows`（默认空数组，不默认启用），命中窗口只跳过自动触发，手动不受影响。
 - 幂等：同会话同材料 hash 只跑一次；进程崩溃后 keeper 续跑；per-session skip 持久化。
 
