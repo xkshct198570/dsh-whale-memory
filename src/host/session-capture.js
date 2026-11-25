@@ -24,6 +24,7 @@ import { privacyCheck } from '../core/writer.js'
 import { detectWrapIntent } from '../core/wrap-intent.js'
 import { materialHash, normalizeMaterial } from '../core/wrap-material.js'
 import { bool, num } from '../shared/config-values.js'
+import { projectSessions } from './session-capture/sessions.js'
 
 /** 单条消息缓冲上限（码点）：一次长粘贴不应挤掉整轮对话。 */
 const MAX_MESSAGE_CHARS = 2000
@@ -360,6 +361,8 @@ export function installSessionCapture(ctx, {
     if (!rec) return { ok: false, reason: 'no_session' }
     const cfg = cfgNow()
     if (!cfg.enabled) return { ok: false, reason: 'wrap_disabled' }
+    // 指定会话手动收尾不得踩进行中的回合（S1 判据）：明确 409，而不是静默拿半轮材料。
+    if (trigger === 'manual' && rec.openTurns.size > 0) return { ok: false, reason: 'turn_in_progress' }
     return flushSnapshot(rec, trigger, opts)
   }
 
@@ -411,6 +414,14 @@ export function installSessionCapture(ctx, {
     return { triggered, skipped: skipped.length ? lastSkip.reasons : undefined }
   }
 
+  /**
+   * 面板会话列表：只暴露 id/活动时间/可收尾轮数/是否进行中；不含正文、标题、cwd。
+   * @returns {Array<object>}
+   */
+  function listSessions() {
+    return projectSessions(sessions.values())
+  }
+
   function status() {
     const list = [...sessions.values()]
     return {
@@ -449,5 +460,5 @@ export function installSessionCapture(ctx, {
   }
   if (typeof ctx.effect === 'function') ctx.effect(() => () => dispose(), 'whale-memory: session capture')
 
-  return { flush, triggerRecent, advance, status, tick, dispose }
+  return { flush, triggerRecent, advance, listSessions, status, tick, dispose }
 }

@@ -8,18 +8,26 @@ import assert from 'node:assert/strict'
 import http from 'node:http'
 import { createRoutes } from '../../src/host/routes.js'
 
-const calls = { manual: 0, status: [], report: [] }
+const calls = { manual: 0, manualArgs: [], status: [], sessions: [], report: [] }
 let manualResult = { ok: true, runId: 7, state: 'queued' }
 let reportResult = { ok: true, runId: 7, text: '# 会话收尾报告 2026-11-24' }
 
 const wrap = {
-  async manual() { calls.manual += 1; return manualResult },
+  async manual(args = {}) { calls.manual += 1; calls.manualArgs.push(args); return manualResult },
   status(args) {
     calls.status.push(args)
     return {
       ok: true, supported: true, enabled: true, runsToday: 1, maxRunsPerDay: 6,
       latest: { id: 7, state: 'done', candidates: 2, ruleProposals: 0, openLoops: 1 },
       recent: [], jobs: 0, spool: { files: 0, bytes: 0 }, lastSkip: null,
+    }
+  },
+  sessions(args) {
+    calls.sessions.push(args)
+    return {
+      ok: true,
+      items: [{ sessionId: 's1', lastActivity: 1, materialTurns: 3, open: false, skipAuto: false, lastRunId: 7, lastRunState: 'done' }],
+      auto: { enabled: false, idleMinutes: 10 },
     }
   },
   report(id) { calls.report.push(id); return reportResult },
@@ -138,4 +146,37 @@ test('未安装 wrap 服务：三类端点均 502 wrap_unavailable，不抛裸�
   } finally {
     await new Promise((resolve) => srv.close(resolve))
   }
+})
+
+test('POST /wrap：sessionId 透传给 manual（指定会话收尾）', async () => {
+  calls.manualArgs = []
+  manualResult = { ok: true, runId: 8, state: 'queued' }
+  const r = await postJson('/whale-memory/api/wrap', { trigger: 'manual', sessionId: ' s-abc ' })
+  assert.equal(r.status, 200)
+  assert.deepEqual(calls.manualArgs.at(-1), { sessionId: 's-abc' })
+})
+
+test('GET /wrap/sessions：键集合只有 id/活动/轮数/最近 run，绝无正文/标题/cwd', async () => {
+  const res = await fetch(base + '/whale-memory/api/wrap/sessions')
+  assert.equal(res.status, 200)
+  const body = await res.json()
+  assert.equal(body.ok, true)
+  assert.ok(Array.isArray(body.items))
+  const allowed = new Set([
+    'sessionId', 'lastActivity', 'materialTurns', 'open', 'turn', 'pendingIntent', 'lastTriggeredAt',
+    'hasMaterial', 'skipAuto', 'lastRunId', 'lastRunState',
+  ])
+  for (const item of body.items) {
+    for (const key of Object.keys(item)) assert.ok(allowed.has(key), `泄露字段：${key}`)
+    const raw = JSON.stringify(item)
+    for (const forbidden of ['text', 'title', 'header', 'cwd', 'message']) assert.equal(raw.includes(forbidden), false, `不得含 ${forbidden}`)
+  }
+  assert.deepEqual(body.auto, { enabled: false, idleMinutes: 10 })
+})
+
+test('GET /wrap/sessions：显式身份参数按分区过滤（透传 identity）', async () => {
+  calls.sessions = []
+  const res = await fetch(base + '/whale-memory/api/wrap/sessions?workspace=web')
+  assert.equal(res.status, 200)
+  assert.deepEqual(calls.sessions.at(-1).identity, { userId: 'u1', roleId: '', workspace: 'web' })
 })

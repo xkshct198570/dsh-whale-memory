@@ -63,15 +63,23 @@ function loadSlots(configOverride = null, extra = {}) {
     clearInterval() {},
     queueMicrotask,
     URL,
-    fetch: async (url) => {
+    fetch: async (url, opts) => {
       const path = String(url)
+      const isPost = Boolean(opts && String(opts.method || '').toUpperCase() === 'POST')
+      // 写接口用 extra.wrapPost 提供状态码/体；读接口按路径分发，未知路径回空壳（与旧行为一致）。
+      if (isPost && path.endsWith('/wrap')) {
+        const spec = extra.wrapPost || { status: 200, body: { ok: true, runId: 9, state: 'queued' } }
+        return { ok: spec.status >= 200 && spec.status < 300, status: spec.status, json: async () => spec.body }
+      }
       const body = path.endsWith('/config')
         ? { ok: true, config }
         : path.endsWith('/wrap/status') && extra.wrapStatus
           ? extra.wrapStatus
-          : path.includes('/wrap/report') && extra.wrapReport
-            ? extra.wrapReport
-            : { ok: true, items: [], series: [], stats: {} }
+          : path.includes('/wrap/sessions')
+            ? (extra.wrapSessions || { ok: true, items: [], auto: { enabled: false, idleMinutes: 10 } })
+            : path.includes('/wrap/report') && extra.wrapReport
+              ? extra.wrapReport
+              : { ok: true, items: [], series: [], stats: {} }
       return { ok: true, status: 200, json: async () => body }
     },
     document: undefined,
@@ -123,7 +131,8 @@ function loadSlots(configOverride = null, extra = {}) {
     if (typeof node === 'string' || typeof node === 'number') return { text: String(node) }
     if (Array.isArray(node)) return node.map(renderNode)
     if (typeof node.type === 'function') return renderNode(node.type({ ...node.props, children: node.children }))
-    return { type: String(node.type), children: node.children.map(renderNode) }
+    // 保留 props：S1 起断言 select/option/button 的可访问性与事件要读真实属性（不只是文本）。
+    return { type: String(node.type), props: node.props || {}, children: node.children.map(renderNode) }
   }
   const mount = async (Component, props, rounds = 8) => {
     // 固定跑几轮让 effect 里的异步加载/轮询落地；返回最后一轮渲染树，
@@ -225,4 +234,96 @@ test('Session Wrap 设置组与候选过滤：分组/开关真实渲染，收尾
   assert.match(settingsText, /settings\.groupWrap/, '设置页必须有收尾组')
   assert.match(settingsText, /settings\.wrapEnabled/, '必须有启用开关')
   assert.match(settingsText, /settings\.wrapCostNote/, '必须明确会花模型 token')
+})
+
+/** 渲染树遍历：找满足条件的节点（用于点按钮、断言 select/option 真实存在）。 */
+function walkTree(node, visit) {
+  if (!node) return
+  if (Array.isArray(node)) { for (const child of node) walkTree(child, visit); return }
+  if (typeof node !== 'object') return
+  visit(node)
+  for (const child of node.children || []) walkTree(child, visit)
+}
+
+test('S1 空态：没有收尾记录也有引导，且 409 点击失败可见（不再“什么都没发生”）', async () => {
+  const { slots, mount } = loadSlots(
+    { panel: { ...DEFAULT_CONFIG.panel, tab: 'overview' } },
+    {
+      wrapStatus: {
+        ok: true, supported: true, enabled: true, runsToday: 0, maxRunsPerDay: 6, jobs: 0,
+        latest: null, recent: [], lastSkip: null,
+        capture: { sessions: 1, material: 1 },
+      },
+      wrapSessions: { ok: true, auto: { enabled: false, idleMinutes: 10 }, items: [{ sessionId: 's1', lastActivity: 1, materialTurns: 3, open: false, hasMaterial: true }] },
+      wrapPost: { status: 409, body: { ok: false, error: 'turn_in_progress' } },
+    },
+  )
+  const tree = await mount(slots.main, { t: (key) => key, locale: 'zh', pollMs: 1 })
+  assert.match(treeText(tree), /overview\.wrapEmptyGuide/, '空态必须有引导')
+  let button = null
+  walkTree(tree, (node) => {
+    if (node.type === 'button' && node.props && node.props['aria-label'] === 'overview.wrapNow') button = node
+  })
+  const labels = []
+  walkTree(tree, (node) => { if (node.type === 'button') labels.push(node.props && node.props['aria-label']) })
+  assert.ok(button && typeof button.props.onClick === 'function', '空态也必须能点立即收尾 buttons=' + JSON.stringify(labels) + ' wrapTitle?' + treeText(tree).includes('overview.wrapTitle') + ' full=' + treeText(tree).slice(-400))
+  button.props.onClick()
+  const after = await mount(slots.main, { t: (key) => key, locale: 'zh', pollMs: 1 })
+  const text = treeText(after)
+  assert.match(text, /overview\.wrapFailed/, '409 必须出现失败行')
+  assert.match(text, /overview\.wrapErrorTurn/, '错误码必须映射成中文一句话')
+})
+
+test('S1 会话下拉：列出采集会话（轮数/状态），选中项提交 sessionId', async () => {
+  const { slots, mount } = loadSlots(
+    { panel: { ...DEFAULT_CONFIG.panel, tab: 'overview' } },
+    {
+      wrapStatus: { ok: true, supported: true, enabled: true, latest: null, recent: [], lastSkip: null },
+      wrapSessions: {
+        ok: true, auto: { enabled: false, idleMinutes: 10 },
+        items: [
+          { sessionId: 's1', lastActivity: 2, materialTurns: 3, open: false, hasMaterial: true, lastRunState: 'done' },
+          { sessionId: 's2', lastActivity: 1, materialTurns: 1, open: true, hasMaterial: true, lastRunState: '' },
+        ],
+      },
+    },
+  )
+  const tree = await mount(slots.main, { t: (key) => key, locale: 'zh', pollMs: 1 })
+  let select = null
+  const optionValues = []
+  walkTree(tree, (node) => {
+    if (node.type === 'select') select = node
+    if (node.type === 'option') optionValues.push(node.props.value)
+  })
+  assert.ok(select, '渲染树里必须真有 select')
+  assert.deepEqual(optionValues.filter(Boolean), ['s1', 's2'])
+  assert.equal(select.props['aria-label'], 'overview.wrapSessionLabel')
+})
+
+test('S1 警告与失败折叠：warnings 可见；失败默认只显示计数，不刷原始码', async () => {
+  const { slots, mount } = loadSlots(
+    { panel: { ...DEFAULT_CONFIG.panel, tab: 'overview' } },
+    {
+      wrapStatus: {
+        ok: true, supported: true, enabled: true, jobs: 0,
+        latest: {
+          id: 7, state: 'failed', trigger: 'manual', phase: 'created', attempts: 1,
+          createdAt: 1, updatedAt: 2, candidates: 0, ruleProposals: 0, openLoops: 0,
+          switchReady: { ready: true, blockers: [], warnings: ['hygiene:FTS 未对齐'] },
+          error: 'bad_json:bad_json', reportAvailable: false,
+        },
+        recent: [
+          { id: 6, state: 'failed', trigger: 'manual', createdAt: 1, updatedAt: 2, error: 'bad_json:bad_json' },
+          { id: 5, state: 'failed', trigger: 'manual', createdAt: 1, updatedAt: 2, error: 'bad_json:bad_json' },
+        ],
+        lastSkip: null,
+      },
+      wrapSessions: { ok: true, auto: { enabled: false, idleMinutes: 10 }, items: [] },
+    },
+  )
+  const tree = await mount(slots.main, { t: (key) => key, locale: 'zh', pollMs: 1 })
+  const text = treeText(tree)
+  assert.match(text, /overview\.wrapWarnings/, 'warnings 不得被 ready=true 掩盖')
+  assert.match(text, /overview\.wrapFailureCount/, '失败默认折叠成计数')
+  assert.equal(text.includes('bad_json'), false, '折叠态不得刷原始错误码')
 })

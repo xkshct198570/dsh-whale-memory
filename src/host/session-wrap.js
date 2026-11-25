@@ -182,16 +182,62 @@ export function installSessionWrap(ctx, {
     }
   }
 
-  /** 手动触发：走采集器最近有材料的会话；没有 live 会话材料时明确 409 原因。 */
-  async function manual() {
+  /**
+   * 手动触发：显式 sessionId 只收尾那一段；缺省沿用“最近有材料的会话”。
+   * 指定会话时不再用全局 busy 拦：忙闲由该会话/材料的幂等状态回答（S1b 会改成 202 排队）。
+   */
+  async function manual({ sessionId = '' } = {}) {
     if (!supported) return { ok: false, reason: 'unsupported_backend' }
     const capture = captureRef?.current
     if (!capture || typeof capture.triggerRecent !== 'function') return { ok: false, reason: 'capture_unavailable' }
     if (!wrapCfg().enabled) return { ok: false, reason: 'wrap_disabled' }
-    if (trigger.activeWrapJobs() > 0) return { ok: false, reason: 'busy_wrap' }
-    const out = await capture.triggerRecent('manual')
-    if (out?.ok) state.lastManual = { at: now(), trigger: 'manual', runId: out.runId }
+    const sid = String(sessionId || '').trim()
+    if (!sid) {
+      if (trigger.activeWrapJobs() > 0) return { ok: false, reason: 'busy_wrap' }
+      const out = await capture.triggerRecent('manual')
+      if (out?.ok) state.lastManual = { at: now(), trigger: 'manual', runId: out.runId }
+      return out
+    }
+    if (sid.length > 200) return { ok: false, reason: 'invalid_session' }
+    const out = await capture.flush(sid, 'manual', { force: true })
+    if (out?.ok) state.lastManual = { at: now(), trigger: 'manual', runId: out.runId, sessionId: sid }
     return out
+  }
+
+  /**
+   * 面板会话列表：采集器的实时缓冲 × wrap_runs 的最近一次结果。
+   * 只回 id/活动时间/轮数/进行中/最近 run 状态；不含正文、标题、cwd（跨 host 字段白名单）。
+   */
+  function sessions({ identity = null } = {}) {
+    const capture = captureRef?.current
+    const items = capture && typeof capture.listSessions === 'function' ? capture.listSessions() : []
+    const latestBySession = new Map()
+    if (supported && items.length > 0) {
+      try {
+        const scoped = identity && typeof identity === 'object'
+          ? { sql: ' WHERE user_id=? AND role_id=? AND workspace=?', params: [
+            String(identity.userId || ''), String(identity.roleId || ''), String(identity.workspace || ''),
+          ] }
+          : { sql: '', params: [] }
+        const rows = withDb((db) => db.prepare(
+          `SELECT session_id,id,state,updated_at FROM wrap_runs${scoped.sql} ORDER BY id ASC`,
+        ).all(...scoped.params))
+        for (const row of rows) latestBySession.set(String(row.session_id), row)
+      } catch { /* 读库失败：列表仍可用（最近 run 字段留空），不静默丢会话 */ }
+    }
+    return {
+      ok: true,
+      items: items.map((item) => {
+        const row = latestBySession.get(item.sessionId)
+        return {
+          ...item,
+          skipAuto: false, // S2：wrap_session_prefs 落地后回填
+          lastRunId: row ? Number(row.id) : null,
+          lastRunState: row ? String(row.state) : '',
+        }
+      }),
+      auto: { enabled: bool(config?.wrap?.idle, false), idleMinutes: num(config?.wrap?.idleMinutes, 10) },
+    }
   }
 
   /** 状态视图：只暴露计数/状态/可切会话，不返回候选正文。 */
@@ -295,7 +341,7 @@ export function installSessionWrap(ctx, {
   }
 
   return {
-    onTrigger: trigger.onTrigger, manual, status, report, sweepSpool, sweepStorage, reconcile, execute,
+    onTrigger: trigger.onTrigger, manual, status, sessions, report, sweepSpool, sweepStorage, reconcile, execute,
     canAutoTrigger, supported, dispose,
   }
 }

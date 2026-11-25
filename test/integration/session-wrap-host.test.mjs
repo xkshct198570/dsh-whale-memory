@@ -96,6 +96,22 @@ test('真宿主：显式收尾入队 run+job+spool，/wrap/status 可见；job p
     assert.equal(status.latest.state, row.state)
     assert.equal(JSON.stringify(status).includes('动库前先备份'), false, '状态接口不得泄露正文')
 
+    // S1：会话列表可读且不带正文/路径；指定不存在的会话明确 409 no_session。
+    const sessionsRes = await fetch(base + '/whale-memory/api/wrap/sessions')
+    assert.equal(sessionsRes.status, 200)
+    const sessionsBody = await sessionsRes.json()
+    assert.equal(sessionsBody.ok, true)
+    const hostItem = sessionsBody.items.find((item) => item.sessionId === 'host-s1')
+    assert.ok(hostItem, '采集中的会话必须出现在列表')
+    assert.equal(JSON.stringify(sessionsBody).includes('动库前先备份'), false, '会话列表不得泄露正文')
+    assert.equal(JSON.stringify(sessionsBody).includes(home), false, '会话列表不得泄露 cwd')
+
+    const missing = await fetch(base + '/whale-memory/api/wrap', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId: 'nope' }),
+    })
+    assert.equal(missing.status, 409)
+    assert.equal((await missing.json()).error, 'no_session')
+
     const spoolDir = join(home, 'spool', 'session-wrap')
     const names = existsSync(spoolDir) ? readdirSync(spoolDir) : []
     assert.equal(names.length, 1, `必须有一条 spool：${JSON.stringify(names)}`)

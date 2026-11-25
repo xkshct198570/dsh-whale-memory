@@ -28,6 +28,10 @@
     "responsibility": "概览页：KPI、趋势、失败作业、收尾卡"
   },
   {
+    "file": "51-wrap-card.js",
+    "responsibility": "会话收尾卡片：会话选择、状态徽标、指标块、失败折叠、报告与错误文案映射（S1）"
+  },
+  {
     "file": "60-memory.js",
     "responsibility": "记忆库页：检索、表格、新增表单、详情抽屉"
   },

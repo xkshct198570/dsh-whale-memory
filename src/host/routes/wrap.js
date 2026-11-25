@@ -14,19 +14,31 @@ export async function handleWrap({
       if (!wrap || typeof wrap.manual !== 'function') return sendJson(res, 502, { ok: false, error: 'wrap_unavailable' })
       const body = await readJson(req)
       if (!body.ok) return sendJson(res, body.status, { ok: false, error: body.error })
-      const got = await wrap.manual()
+      const sessionId = typeof body.value?.sessionId === 'string' ? body.value.sessionId.trim() : ''
+      const got = await wrap.manual({ sessionId })
       if (!got || got.ok !== true) {
         const reason = String(got?.reason || 'wrap_failed')
         const status = reason === 'unsupported_backend' ? 501
           : reason === 'wrap_disabled' || reason === 'no_material' || reason === 'turn_in_progress'
-            || reason === 'busy' || reason === 'busy_wrap' || reason === 'same_material' ? 409
-            : reason === 'identity_required' ? 400
+            || reason === 'busy' || reason === 'busy_wrap' || reason === 'same_material'
+            || reason === 'no_session' ? 409
+            : reason === 'identity_required' || reason === 'invalid_session' ? 400
               : reason === 'db_error' ? 502 : 500
         return sendJson(res, status, { ok: false, error: reason })
       }
       return sendJson(res, 200, got)
     }
 
+
+    if (path === `${PREFIX}/wrap/sessions` && req.method === 'GET') {
+      if (!wrap || typeof wrap.sessions !== 'function') return sendJson(res, 502, { ok: false, error: 'wrap_unavailable' })
+      const params = new URL(req.url, 'http://127.0.0.1').searchParams
+      const hasOverride = ['userId', 'roleId', 'workspace'].some((key) => params.get(key) !== null)
+      const idn = hasOverride ? requestIdentity(identityParams(params)) : { ok: true, identity: null }
+      if (!idn.ok) return sendJson(res, 400, { ok: false, error: idn.error })
+      const data = wrap.sessions({ identity: idn.identity })
+      return sendJson(res, data?.ok === false ? statusOf(data.error, 502) : 200, data)
+    }
 
     if (path === `${PREFIX}/wrap/status` && req.method === 'GET') {
       if (!wrap || typeof wrap.status !== 'function') return sendJson(res, 502, { ok: false, error: 'wrap_unavailable' })
