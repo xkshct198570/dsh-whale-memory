@@ -9,15 +9,12 @@ import { defaultRuleRoot, listRules } from '../../core/rule-store.js'
 import { mirrorRules } from '../../core/rule-mirror.js'
 import { agentsPathOf, renderAgentsDigest, titleOfRule } from '../../core/rule-render.js'
 
-
 /** 与 routes.js 同一个前缀；写死字面量避免 routes ↔ rules-routes 循环 import。 */
 export const RULES_PREFIX = '/whale-memory/api'
-
 
 export function textOf(value) {
   return String(value ?? '')
 }
-
 
 /**
  * 摘要总预算（码点）：`rules.summaryBudgetChars` 默认 6000；0/非法回落默认值（0 不是「无限」）。
@@ -28,13 +25,11 @@ export function summaryBudgetOf(config) {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : 6000
 }
 
-
 /** 配置 `rules.dir` 优先，空则 `$DSH_HOME/rules`。 */
 export function resolveRulesRoot(config) {
   const raw = textOf(config?.rules?.dir).trim()
   return raw || defaultRuleRoot()
 }
-
 
 export function gitView({ config, detect = detectGit, force = false } = {}) {
   const info = typeof detect === 'function' ? detect({ force }) : detect
@@ -48,12 +43,10 @@ export function gitView({ config, detect = detectGit, force = false } = {}) {
   return view
 }
 
-
 /** 规则标题：结构化 action 优先，否则正文首句（只展示，不改正文）。 */
 export function titleOf(front, body) {
   return titleOfRule(front, body)
 }
-
 
 // ---------------------------------------------------------------------------
 // R5：编辑 / 版本 diff / 回滚（文件+git 在 rule-store，镜像/渲染/审计在本层编排）
@@ -71,7 +64,6 @@ export function ruleView(doc) {
   }
 }
 
-
 /** 写后处理视图（与 update/revert 同形状：面板只写一套渲染）。 */
 export function postView(post) {
   return {
@@ -86,7 +78,6 @@ export function postView(post) {
       : null,
   }
 }
-
 
 /**
  * 请求体身份归一（面板显式给了 identity 就用它，否则读扁平 userId/roleId/workspace）。
@@ -103,13 +94,11 @@ export function identityOf(body) {
   }
 }
 
-
 export function writeGuard(config, detect) {
   // enabled 是 volatile（Ref）；不能拿 Ref 对象直接和 false 比。
   if (value(config?.rules?.enabled, true) === false) return { ok: false, error: 'rules_disabled' }
   return gitRequired(config, detect)
 }
-
 
 /**
  * 后处理：镜像（rules.mirrorAuto）→ AGENTS 摘要（rules.renderAgents）。
@@ -141,7 +130,6 @@ export function applyPostSteps({ dir, config, backend, mirror, renderAgents, log
   }
   return { mirror: mirrorResult, agents: agentsResult }
 }
-
 
 /**
  * 审计一次规则编辑/回滚/删除：writes(reason=rule_edit|rule_revert|rule_purge) + evolution 变更。
@@ -195,7 +183,6 @@ export function auditRuleChange({
   }
 }
 
-
 /** 默认规则恢复函数（task-1 可能提供）；按常见命名探测，未提供返回 null。 */
 export async function loadDefaultRestore() {
   try {
@@ -207,12 +194,10 @@ export async function loadDefaultRestore() {
   return null
 }
 
-
 export function sendMethodNotAllowed(res, allow) {
   res.setHeader('allow', allow)
   return sendJson(res, 405, { ok: false, error: 'method_not_allowed' })
 }
-
 
 /**
  * 错误码 → HTTP 状态：单一真源在 `src/shared/error-table.mjs`。
@@ -227,7 +212,6 @@ export function statusForError(code) {
   return statusOf(code)
 }
 
-
 /** query 读取（handleRules 只拿 pathname，query 必须自己从 req.url 取）。 */
 export function queryOf(req) {
   try {
@@ -237,12 +221,10 @@ export function queryOf(req) {
   }
 }
 
-
 /** `?status=` 读取。 */
 export function statusQuery(req) {
   return textOf(queryOf(req).get('status'))
 }
-
 
 export function decodeKey(rest) {
   try {

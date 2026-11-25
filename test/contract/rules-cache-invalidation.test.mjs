@@ -16,6 +16,7 @@ let root
 let config
 let handler
 let cleared
+const mdCount = () => nodeFs.readdirSync(root).filter((name) => name.endsWith('.md')).length
 
 function fakeReq(method, url, payload) {
   const req = Readable.from(payload === undefined ? [] : [Buffer.from(JSON.stringify(payload))])
@@ -83,7 +84,6 @@ after(() => nodeFs.rmSync(dirname(root), { recursive: true, force: true }))
 
 test('apply 成功后清缓存并落盘，plan_hash_mismatch 不清', async () => {
   cleared = 0
-  const mdCount = () => nodeFs.readdirSync(root).filter((name) => name.endsWith('.md')).length
   const before = mdCount()
   const made = await post('/whale-memory/api/rules/propose', { text: '以后都别把召回缓存当持久层' })
   assert.equal(made.status, 200, JSON.stringify(made.body))
@@ -153,4 +153,21 @@ test('revert 成功后清缓存并落盘，空 rev 不清', async () => {
   assert.equal(empty.status, 400, JSON.stringify(empty.body))
   assert.equal(empty.body.error, 'invalid_rev')
   assert.equal(cleared, 1, '空 rev 不得清缓存')
+})
+
+test('create 成功后清缓存并落盘，坏 draft 不清', async () => {
+  cleared = 0
+  const before = mdCount()
+  const ok = await post('/whale-memory/api/rules/create', {
+    draft: { text: '必须为新建规则清召回缓存后再注入。', type: 'iron-rule', priority: 'P1', scope: 'global' },
+  })
+  assert.equal(ok.status, 200, JSON.stringify(ok.body))
+  assert.equal(nodeFs.existsSync(join(root, `${ok.body.key}.md`)), true, 'create 必须真落盘规则文件')
+  assert.ok(nodeFs.readFileSync(join(root, `${ok.body.key}.md`), 'utf8').includes('召回缓存'), 'create 落盘必须是草稿正文')
+  assert.equal(mdCount(), before + 1, 'create 成功必须真落盘一条规则')
+  assert.equal(cleared, 1, 'create 成功后必须清召回缓存')
+  const bad = await post('/whale-memory/api/rules/create', { draft: { text: '' } })
+  assert.equal(bad.status, 422, JSON.stringify(bad.body))
+  assert.equal(bad.body.error, 'invalid_draft')
+  assert.equal(cleared, 1, 'create 失败不得清缓存')
 })
