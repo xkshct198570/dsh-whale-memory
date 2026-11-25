@@ -31,15 +31,6 @@ jobs:
           npm pack
           mv dsh-whale-memory-*.tgz dsh-whale-memory.tgz
           sha256sum dsh-whale-memory.tgz | tee SHA256SUMS.txt
-      - name: Release permission probe
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set +e
-          OUT=$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.permissions' 2>&1); echo "$OUT"
-          echo "::warning title=RepoPerms::$(printf '%s' "$OUT" | head -c 300)"
-          OUT2=$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=5" 2>&1 | head -c 400); echo "$OUT2"
-          echo "::warning title=ReleasesList::$(printf '%s' "$OUT2" | tr '\n' ' ' | head -c 400)"
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
