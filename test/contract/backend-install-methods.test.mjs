@@ -32,7 +32,7 @@ test('getter 不被压平：装后仍是 get，不变成字段/可写值', () =>
   assert.equal(new Probe().ready, true)
 })
 
-test('同名成员当场抛错（底座已有 → 域覆盖；两域同名 → 后装覆盖）', () => {
+test('底座同名/跨域同名均当场抛错且不半装', () => {
   class Probe { write() { return 'base' } }
   assert.throws(() => installMethods(Probe, { write() { return 'domain' } }), /duplicate member write/)
   class Empty {}
@@ -45,9 +45,17 @@ test('constructor 键显式拒绝（不得静默跳过）', () => {
   assert.throws(() => installMethods(Probe, { constructor() {} }), /constructor not allowed/)
 })
 
-test('入参必须是类；返回入参类（可链式）', () => {
-  assert.throws(() => installMethods(null, {}), /Class required/)
-  assert.throws(() => installMethods({}, {}), /Class required/)
+test('入参必须是带 prototype 的构造函数；返回入参（可链式）', () => {
+  assert.throws(() => installMethods(null, {}), /prototype required/)
+  assert.throws(() => installMethods({}, {}), /prototype required/)
   class Probe {}
   assert.equal(installMethods(Probe, { a() {} }), Probe)
+})
+
+test('原型键安全：方法名 __proto__ 也能正常装（合并表不得有原型）', () => {
+  class Probe {}
+  installMethods(Probe, { ['__proto__']() { return 'p' } })
+  const names = Object.getOwnPropertyNames(Probe.prototype)
+  assert.ok(names.includes('__proto__'), ' __proto__ 方法必须落为自有属性')
+  assert.equal(new Probe()['__proto__'](), 'p')
 })

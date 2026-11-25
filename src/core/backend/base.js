@@ -72,10 +72,10 @@ export function whereOf(identity, extra = []) {
  */
 export function installMethods(Cls, ...methodSets) {
   const proto = Cls && Cls.prototype
-  if (!proto || typeof proto !== 'object') throw new TypeError('installMethods: Class required')
+  if (!proto || typeof proto !== 'object') throw new TypeError('installMethods: constructor with prototype required')
   // 两段式：先全部校验/合并描述符，再一次 defineProperties —— 任一重名则整体不落，
   // 不留“装了一半”的原型（跨域同名时尤其重要）。
-  const merged = {}
+  const merged = Object.create(null) // 无原型：方法名恰为 __proto__ 时也不会改到合并表原型
   for (const methods of methodSets) {
     const descriptors = Object.getOwnPropertyDescriptors(methods)
     for (const key of Object.keys(descriptors)) {
