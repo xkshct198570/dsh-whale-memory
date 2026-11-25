@@ -16,6 +16,8 @@ export const REJECTED_KEEP_DAYS = 180
 export const REJECTED_KEEP_LAST = 200
 /** 过期候选归档目录（proposals/archive/）：移出主扫描范围，但保留裁定证据。 */
 export const PROPOSALS_ARCHIVE_DIR = 'archive'
+/** 需要措辞改写（不能直接落盘）的关系。 */
+export const REWRITE_RELATIONS = Object.freeze(['merge', 'conflict', 'refine'])
 
 export function textOf(value) {
   return value === null || value === undefined ? '' : String(value)
