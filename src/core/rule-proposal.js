@@ -1,264 +1,49 @@
 /**
- * 规则提案制（R3b）：候选生成、冷却、裁定、**唯一应用事务**。
+ * 规则提案的「候选生成 + 拒绝 + 会话待确认 + 应用」门面（R3b，纯函数、零 I/O）。
  *
- * 职责：
- * - `createProposal`：信号门槛 → 结构化编译 → 关系判定 → 冷却检查 → 原子写候选 JSON；
- * - `listProposals` / `readProposal` / `rejectProposal`：候选只读视图与拒绝（写冷却日志）；
- * - `applyProposal`：守卫 → 落盘（单次 git commit）→ 镜像 → 重渲染 → 审计；任一步失败回滚；
- * - `confirmPendingForSession`：聊天里的"确认短语"→ 应用本会话唯一候选（含 30min TTL 映射）。
+ * store 底座（候选文件/冷却/上限/归档 + 文本工具）已拆到 `rule-proposal/store.js`；
+ * 本文件保留 create / reject / session / apply 四段，待 P3c2/P3c3/P3c4 继续拆分。
  *
  * 边界：
- * - 提案期**不调 LLM**（避免对话延迟）；合并/冲突/改写的措辞改写只在 apply 时做，
- *   且只在 `rules.llm` 打开时（架构书 §4.4）。
- * - 候选存 `proposals/<id>.json`，冷却日志 `proposals/.rejected.jsonl`；**不进 git、不镜像**。
- * - 规则文件仍由 rule-store 写（原子写 + 历史快照 + 校验），本模块不自己拼文件。
- * - 不碰 HTTP、不碰面板；路由/ hook 只做编排。
- *
- * Why 单独成文件：这是"机器起草、用户裁定"的唯一闸口。把它和路由/hook 混在一起，
- * 就会出现"面板能确认、聊天也能确认，但两条路径落盘逻辑不同"的分叉——同一入口才能保证
- * 守卫、编号、commit、镜像、审计五件事一次全做或全不做。
+ * - 候选文件是待裁定草稿；规则真源在 rule-store.js，镜像在 rule-mirror.js。
+ * - LLM 调用只在本模块（apply 的措辞改写）；store/关系/守卫都是纯函数。
  */
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync } from 'node:fs'
-import { join, resolve } from 'node:path'
-import { bool, num, value } from '../shared/config-values.js'
-import { dedupeKey, detectSignals } from './rules.js'
+import { existsSync, readFileSync, readdirSync, unlinkSync } from 'node:fs'
+import { join } from 'node:path'
+import { bool, num } from '../shared/config-values.js'
+import { detectSignals } from './rules.js'
 import {
-  buildMergePrompt,
-  classifyRelation,
-  compileStructured,
-  parseMergeReply,
+  buildMergePrompt, classifyRelation, compileStructured, parseMergeReply,
 } from './rule-reconcile.js'
 import {
-  atomicWriteFile,
-  defaultRuleRoot,
-  ensureRuleRepo,
-  gitCommit,
-  listRules,
-  nextRuleNumber,
-  occupancy,
-  readTombstones,
-  regenerateManifest,
-  requireGitGate,
-  ruleCommitState,
-  writeRule,
+  ensureRuleRepo, gitCommit, listRules, nextRuleNumber, occupancy,
+  readTombstones, regenerateManifest, requireGitGate, ruleCommitState, writeRule,
 } from './rule-store.js'
-// R8-03 的存储层契约（锁/事务日志/显式路径提交）由 store owner 落地；未落地时按下面的
-// `*Safe` 降级函数退回旧路径（同一事务语义，只是没有跨进程仓库锁与 .txn 日志）。
 import * as storeApi from './rule-store.js'
 import { buildApplyPlan } from './rule-plan.js'
 import { agentsPathOf, renderAgentsDigest, titleOfRule } from './rule-render.js'
 import { mirrorRules } from './rule-mirror.js'
+import {
+  REJECTED_FILE, REJECTED_KEEP_DAYS, REJECTED_KEEP_LAST, PROPOSALS_ARCHIVE_DIR,
+  proposalHashOf, resolveRuleRoot, proposalsDirOf, readProposal, listProposals,
+  enforceProposalCap, textOf, trimmed, chars, isoNow, PROPOSAL_ID_RE,
+  writeProposalFile, mkdirIfNeeded, appendRejected, isCooling,
+} from './rule-proposal/store.js'
 
-/** 候选 id 形状：`p<毫秒时间戳>_<hash8>`；同时充当路径安全闸（不允许 `..`/分隔符）。 */
-const PROPOSAL_ID_RE = /^p[0-9]{3,19}_[a-z0-9]{4,16}$/
-/** 冷却日志文件名（生成物；`proposals/` 下唯一以点开头的文件）。 */
-export const REJECTED_FILE = '.rejected.jsonl'
-/** 冷却日志保留口径（R9-14）：180 天内或最近 200 条，取并集；日志不得无限增长。 */
-export const REJECTED_KEEP_DAYS = 180
-export const REJECTED_KEEP_LAST = 200
-/** 过期候选归档目录（proposals/archive/）：移出主扫描范围，但保留裁定证据。 */
-export const PROPOSALS_ARCHIVE_DIR = 'archive'
+// store 的公开符号原样再导出：门面路径与导出名保持不变，调用方无需改动。
+export {
+  REJECTED_FILE, REJECTED_KEEP_DAYS, REJECTED_KEEP_LAST, PROPOSALS_ARCHIVE_DIR,
+  proposalHashOf, resolveRuleRoot, proposalsDirOf, readProposal, listProposals,
+  enforceProposalCap,
+}
+
 /** 会话候选映射 TTL：用户隔了半小时才回「确认」就不要再猜是哪条。 */
 export const SESSION_PENDING_TTL_MS = 30 * 60 * 1000
 /** 需要措辞改写（不能直接落盘）的关系。 */
 const REWRITE_RELATIONS = Object.freeze(['merge', 'conflict', 'refine'])
 /** 会话候选映射：只存最新一条（一屏只问一条，避免"确认"指代不明）。 */
 const sessionPending = new Map()
-
-function textOf(value) {
-  return value === null || value === undefined ? '' : String(value)
-}
-
-function trimmed(value) {
-  return textOf(value).trim()
-}
-
-function chars(text) {
-  return Array.from(textOf(text)).length
-}
-
-/**
- * 候选去重 hash（架构书 §3.2）：**必须含 scope+role**——同一句话在不同工作区是两条候选，
- * 不能互相占用命中计数/冷却窗口。文本先走 `dedupeKey` 归一化，scope/role 单独进盐。
- * @param {string} text 用户原句
- * @param {string|{scope?:string,role?:string}} [scopeOrDraft] 作用域（或草案）
- * @returns {string} 16 hex
- */
-export function proposalHashOf(text, scopeOrDraft = {}) {
-  const scope = trimmed(typeof scopeOrDraft === 'string' ? scopeOrDraft : scopeOrDraft?.scope) || 'global'
-  const role = trimmed(typeof scopeOrDraft === 'object' && scopeOrDraft ? scopeOrDraft.role : '')
-  return createHash('sha256').update(`${dedupeKey(text)}|${scope}|${role}`, 'utf8').digest('hex').slice(0, 16)
-}
-
-function today() {
-  return new Date().toISOString().slice(0, 10)
-}
-
-function isoNow(now) {
-  return new Date(now).toISOString()
-}
-
-/**
- * 规则根：显式参数 > `config.rules.dir` > `$DSH_HOME/rules`。
- * @param {string} [rulesDir] @param {any} [config] @returns {string}
- */
-export function resolveRuleRoot(rulesDir, config) {
-  const explicit = trimmed(rulesDir)
-  if (explicit) return resolve(explicit)
-  const configured = trimmed(value(config?.rules?.dir, ''))
-  return configured ? resolve(configured) : defaultRuleRoot()
-}
-
-/** 候选目录。 */
-export function proposalsDirOf(rulesDir, config) {
-  return join(resolveRuleRoot(rulesDir, config), 'proposals')
-}
-
-// ---------------------------------------------------------------------------
-// 候选读写
-// ---------------------------------------------------------------------------
-
-/**
- * 原子写候选 JSON；失败不抛。
- * @param {string} file @param {object} proposal @returns {{ok:boolean,error?:string}}
- */
-function writeProposalFile(file, proposal) {
-  return atomicWriteFile(file, `${JSON.stringify(proposal, null, 2)}\n`)
-}
-
-/**
- * 读候选 JSON（id 非法/文件缺失/坏 JSON 都返回 `proposal_not_found`，不泄露路径细节）。
- * @param {{rulesDir?:string, config?:any, id:string}} args
- * @returns {{ok:true, proposal:object} | {ok:false, error:string}}
- */
-export function readProposal({ rulesDir, config, id } = {}) {
-  const wanted = trimmed(id)
-  if (!PROPOSAL_ID_RE.test(wanted)) return { ok: false, error: 'proposal_not_found' }
-  const file = join(proposalsDirOf(rulesDir, config), `${wanted}.json`)
-  let raw
-  try {
-    raw = readFileSync(file, 'utf8')
-  } catch {
-    return { ok: false, error: 'proposal_not_found' }
-  }
-  try {
-    const proposal = JSON.parse(raw)
-    if (!proposal || typeof proposal !== 'object') return { ok: false, error: 'proposal_not_found' }
-    return { ok: true, proposal: { ...proposal, id: textOf(proposal.id || wanted), file } }
-  } catch {
-    return { ok: false, error: 'proposal_not_found' }
-  }
-}
-
-/**
- * 候选列表（新→旧）；`status` 支持单值或逗号分隔多值过滤。
- * @param {{rulesDir?:string, config?:any, status?:string}} [args]
- * @returns {{ok:true, proposals:Array<object>, dir:string}}
- */
-export function listProposals({ rulesDir, config, status = '' } = {}) {
-  const dir = proposalsDirOf(rulesDir, config)
-  const wanted = trimmed(status).split(',').map((s) => s.trim()).filter(Boolean)
-  const proposals = []
-  const names = readdirNames(dir)
-  for (const name of names) {
-    if (!name.endsWith('.json')) continue
-    const id = name.slice(0, -'.json'.length)
-    if (!PROPOSAL_ID_RE.test(id)) continue
-    const got = readProposal({ rulesDir, config, id })
-    if (!got.ok) continue
-    if (wanted.length && !wanted.includes(textOf(got.proposal.status))) continue
-    proposals.push(got.proposal)
-  }
-  proposals.sort((a, b) => String(b.created || '').localeCompare(String(a.created || ''))
-    || String(b.id).localeCompare(String(a.id)))
-  return { ok: true, proposals, dir }
-}
-
-/** 目录列表（不存在/不可读按空处理：候选目录可能还没建）。 */
-function readdirNames(dir) {
-  try {
-    return readdirSync(dir)
-  } catch {
-    return []
-  }
-}
-
-// ---------------------------------------------------------------------------
-// 冷却（拒绝日志）
-// ---------------------------------------------------------------------------
-
-/** 读冷却日志：坏行跳过，不让一行脏数据挡住所有提案。 */
-function readRejected(dir) {
-  let raw = ''
-  try {
-    raw = readFileSync(join(dir, REJECTED_FILE), 'utf8')
-  } catch {
-    return []
-  }
-  const entries = []
-  for (const line of raw.split('\n')) {
-    const item = line.trim()
-    if (!item) continue
-    try {
-      const parsed = JSON.parse(item)
-      if (parsed && typeof parsed === 'object' && trimmed(parsed.hash)) entries.push(parsed)
-    } catch { /* 坏行跳过 */ }
-  }
-  return entries
-}
-
-/**
- * 冷却日志裁剪（R9-14）：保留「180 天内」与「最近 200 条」的并集，避免 jsonl 无限增长。
- *
- * 为什么取并集而不是只按时间：冷却窗口内必须留着（否则同一句可被反复提案），
- * 而历史裁定证据也要留最近一批供面板/审计回看；两条判据各自独立。
- *
- * @param {Array<object>} entries @param {number} now
- * @returns {Array<object>}
- */
-function pruneRejected(entries, now) {
-  const list = Array.isArray(entries) ? entries : []
-  if (!list.length) return []
-  const nowMs = Number.isFinite(Number(now)) ? Number(now) : Date.now()
-  const cutoff = nowMs - REJECTED_KEEP_DAYS * 24 * 3600 * 1000
-  const recentStart = Math.max(0, list.length - REJECTED_KEEP_LAST)
-  return list.filter((item, index) => {
-    if (index >= recentStart) return true
-    const expiresAt = Number.isFinite(Number(item?.expiresAt))
-      ? Number(item.expiresAt)
-      : (Number.isFinite(Number(item?.ts)) ? Number(item.ts) + REJECTED_KEEP_DAYS * 24 * 3600 * 1000 : NaN)
-    return Number.isFinite(expiresAt) && expiresAt >= cutoff
-  })
-}
-
-/** 追加一行冷却记录（原子重写 + 裁剪：jsonl 被并发截断会让冷却整体失效）。 */
-function appendRejected(dir, entry, now = Date.now()) {
-  const entries = pruneRejected([...readRejected(dir), entry], now)
-  const lines = entries.map((item) => JSON.stringify(item)).join('\n')
-  return atomicWriteFile(join(dir, REJECTED_FILE), `${lines}\n`)
-}
-
-/**
- * 是否在冷却期：同 hash 在 `rules.askCooldownDays`(30) 天的**绝对窗口**内被拒绝过。
- *
- * 为什么按 `expiresAt` 而不是 `now - ts`：时钟回拨时 `now - ts` 会变成负数（永远 ≤ 窗口），
- * 冷却/会话 TTL 就被永久冻住；落绝对到期时间后，回拨只是延长到原到期点，前跳则正常解冻。
- * @returns {boolean}
- */
-function isCooling(dir, hash, days, now) {
-  if (!hash || days <= 0) return false
-  const windowMs = days * 24 * 3600 * 1000
-  for (const entry of readRejected(dir)) {
-    if (trimmed(entry.hash) !== hash) continue
-    const expiresAt = Number.isFinite(Number(entry.expiresAt))
-      ? Number(entry.expiresAt)
-      : (Number.isFinite(Number(entry.ts)) ? Number(entry.ts) + windowMs : NaN)
-    if (!Number.isFinite(expiresAt)) continue
-    if (now < expiresAt) return true
-  }
-  return false
-}
 
 // ---------------------------------------------------------------------------
 // 候选生成
@@ -435,64 +220,6 @@ export function createProposal({
 
   const expired = enforceProposalCap({ rulesDir: base, config, now, log })
   return { ok: true, proposal, cooling, ...(expired.length ? { expired } : {}) }
-}
-
-/** 建候选目录（recursive：首次提案时 rules/proposals 可能都不存在）。 */
-function mkdirIfNeeded(dir) {
-  mkdirSync(dir, { recursive: true })
-}
-
-/**
- * 候选上限：保留 pending/needs_manual 里最新的 `rules.maxProposals` 条，最旧的标 expired。
- * 为什么不删文件：候选是裁定证据，面板要能翻历史；只改状态。
- * @returns {string[]} 被标 expired 的 id
- */
-export function enforceProposalCap({ rulesDir, config = {}, now = Date.now(), log = () => {} } = {}) {
-  const max = Math.max(1, num(config?.rules?.maxProposals, 20))
-  const { proposals, dir } = listProposals({ rulesDir, config, status: 'pending,needs_manual' })
-  if (proposals.length <= max) return []
-  const keep = new Set(proposals.slice(0, max).map((item) => item.id))
-  const expired = []
-  for (const item of proposals) {
-    if (keep.has(item.id)) continue
-    const file = item.file || join(dir, `${item.id}.json`)
-    const next = { ...item, status: 'expired', updated: isoNow(now) }
-    const written = writeProposalFile(file, next)
-    if (written.ok) expired.push(item.id)
-  }
-  if (!expired.length) return []
-  // 归档（R9-14）：expired 候选移出主目录，只改状态不够——listProposals 每次全扫主目录，
-  // 过期项无限堆积会让候选扫描越跑越慢，也会挤占面板「待确认」视野。
-  archiveExpiredProposals(dir, expired, log)
-  log(`[whale-memory] proposals cap=${max} expired=${expired.length}`)
-  return expired
-}
-
-/**
- * 把过期候选从 `proposals/*.json` 移到 `proposals/archive/`：保留裁定证据但退出主扫描范围。
- *
- * 失败只记日志不回滚（过期是状态事实，归档是卫生动作）：rename 失败时留主目录，
- * 下次会再试；不删文件、不改状态。
- *
- * @param {string} dir proposals 目录 @param {string[]} ids 已标 expired 的候选 id
- * @param {Function} log
- */
-function archiveExpiredProposals(dir, ids, log) {
-  const archiveDir = join(dir, PROPOSALS_ARCHIVE_DIR)
-  try { mkdirSync(archiveDir, { recursive: true }) } catch (err) {
-    log(`[whale-memory] proposals archive mkdir failed: ${err?.message || err}`)
-    return
-  }
-  for (const id of ids) {
-    const from = join(dir, `${id}.json`)
-    const to = join(archiveDir, `${id}.json`)
-    if (!existsSync(from)) continue
-    try {
-      renameSync(from, to)
-    } catch (err) {
-      log(`[whale-memory] proposals archive rename failed id=${id} code=${err?.code || err?.message || err}`)
-    }
-  }
 }
 
 /**
