@@ -73,7 +73,7 @@
     "check:deps": "node scripts/check-deps.mjs",
     "pretest": "node scripts/i18n-check.mjs --check && node scripts/manual-build.mjs --check && node scripts/build-client.mjs --check && node scripts/check-deps.mjs && node scripts/check-shared-drift.mjs --check && node scripts/compare-baseline.mjs --no-tests",
     "posttest": "node scripts/check-test-counts.mjs",
-    "prepack": "node scripts/i18n-check.mjs --check && node scripts/manual-build.mjs --check && node scripts/build-client.mjs --check"
+    "prepack": "node scripts/i18n-check.mjs --check 1>&2 && node scripts/manual-build.mjs --check 1>&2 && node scripts/build-client.mjs --check 1>&2"
   },
   "dsh": {
     "manifestVersion": 1,
