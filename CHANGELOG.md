@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.8 — 2026-11-26（wrap.provider 投影修复）
+
+- 修复：`wrapCfg()` 未把 `wrap.provider` 投影给蒸馏阶段，配置了也被会话选择覆盖（真机 01:44 run4 日志 `model=gui-ji-liu-dong/deepseek-flash`、正文/思考均为 0）。
+- 回归：新增“cfg.provider 必须传到 llm”用例；测试 1048（1047 pass / 1 skip / 0 fail）。
+
 ## 0.6.7 — 2026-11-26（收尾模型可分离＋推理占优诊断）
 
 - 新增 `wrap.provider`：收尾蒸馏可单独指定模型供应商（`wrap.model` 已有），默认空=沿用当前会话选择；本机默认对话模型是推理档，思考会吃光输出预算（真机：attempt1 textLen=2526/reasoning=8542，attempt2 textLen=0/reasoning=9371）。

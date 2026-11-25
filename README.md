@@ -4,7 +4,7 @@
 
 Local-first long-term memory for DeepSeek Harness sessions: recall relevant memories before each turn, review and edit them in a six-tab panel, and keep rules in a local git Markdown repository where the database is only a search mirror.
 
-> Current version **0.6.7** (R12: session wrap): local SQLite memory store, automatic recall, six-tab panel, write auditing and adoption signals, optional two-way sync/outbox, metrics and daily reports, and legacy migration auditing. Rule source of truth: `~/.dsh/rules` (proposals, plan/apply, tombstone numbering, health check). Session wrap distils lessons, decisions and open loops when a session ends, producing shadow candidates, rule proposals and a report without raw conversation.
+> Current version **0.6.8** (R12: session wrap): local SQLite memory store, automatic recall, six-tab panel, write auditing and adoption signals, optional two-way sync/outbox, metrics and daily reports, and legacy migration auditing. Rule source of truth: `~/.dsh/rules` (proposals, plan/apply, tombstone numbering, health check). Session wrap distils lessons, decisions and open loops when a session ends, producing shadow candidates, rule proposals and a report without raw conversation.
 > Requirements: DSH `>=0.2.2-rc.5 <0.3.0`, Node `>=22.13.0` (built-in SQLite).
 
 ## Why it is useful

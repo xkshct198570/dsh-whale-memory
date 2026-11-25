@@ -87,6 +87,15 @@ test('蒸馏：思考字数单独统计，且预算用 4096 而不是 1800', asy
   assert.ok(DISTILL_MAX_TOKENS >= 4096)
 })
 
+test('蒸馏：cfg.provider 必须传到 llm（0.6.8 防回归）', async () => {
+  const seen = []
+  const llm = scriptedLlm([[{ type: 'text-delta', text: GOOD }]], seen)
+  const { args } = deps(llm, { provider: 'default', model: 'm' }, { cfg: { provider: 'custom', model: 'x' } })
+  await distillPhase(args)
+  assert.equal(seen[0].provider, 'custom')
+  assert.equal(seen[0].model, 'x')
+})
+
 test('重试提示：要求第一个字符是 JSON 对象，且不含代码围栏', () => {
   const prompt = distillRetryPrompt('原始提示词')
   assert.match(prompt, /原始提示词/)

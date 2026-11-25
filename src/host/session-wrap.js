@@ -67,6 +67,8 @@ export function installSessionWrap(ctx, {
       retentionDays: num(w.retentionDays, 180),
       maxRunsPerDay: num(w.maxRunsPerDay, 6),
       report: reportOverride === null ? bool(w.report, true) : Boolean(reportOverride),
+      // 0.6.8：provider 曾漏投影，导致 wrap.provider 配了也被 selection 覆盖（真机 01:44 证据）。
+      provider: String(value(w.provider, '') || ''),
       model: String(value(w.model, '') || ''),
       maxMaterialChars: num(w.maxMaterialChars, 12000),
       timeoutMs: num(w.timeoutMs, modelTimeoutMs),
