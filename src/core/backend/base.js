@@ -1,4 +1,4 @@
-// 职责：backend 共同底座——身份类型、字段白名单、身份 WHERE 安全闸。
+// 职责：backend 共同底座——身份类型、字段白名单、身份 WHERE 安全闸、原型装配工具（installMethods）。
 // 依赖方向：零 import（纯常量/纯函数）；被 local-db/query-api/write-api/transfer 引用，不得反向 import 任何 backend 子模块。
 
 /** @typedef {{ userId: string, roleId: string, workspace: string }} Identity */
@@ -73,16 +73,20 @@ export function whereOf(identity, extra = []) {
 export function installMethods(Cls, ...methodSets) {
   const proto = Cls && Cls.prototype
   if (!proto || typeof proto !== 'object') throw new TypeError('installMethods: Class required')
+  // 两段式：先全部校验/合并描述符，再一次 defineProperties —— 任一重名则整体不落，
+  // 不留“装了一半”的原型（跨域同名时尤其重要）。
+  const merged = {}
   for (const methods of methodSets) {
     const descriptors = Object.getOwnPropertyDescriptors(methods)
     for (const key of Object.keys(descriptors)) {
-      if (key === 'constructor') continue
-      if (Object.prototype.hasOwnProperty.call(proto, key)) {
+      if (key === 'constructor') throw new Error('installMethods: constructor not allowed')
+      if (Object.prototype.hasOwnProperty.call(proto, key) || Object.prototype.hasOwnProperty.call(merged, key)) {
         throw new Error(`installMethods: duplicate member ${key}`)
       }
       descriptors[key].enumerable = false
+      merged[key] = descriptors[key]
     }
-    Object.defineProperties(proto, descriptors)
   }
+  Object.defineProperties(proto, merged)
   return Cls
 }

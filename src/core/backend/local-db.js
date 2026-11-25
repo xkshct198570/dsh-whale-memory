@@ -1,4 +1,4 @@
-// 职责：backend 本地底座——LocalBackend 类本体（连接/健康/迁移/dispose）与四域方法装配。
+// 职责：backend 本地底座——LocalBackend 类本体（连接/健康/迁移/dispose）与三域方法装配。
 // 依赖方向：base/db/workers 门面 ← 本文件；被 hybrid-bridge 引用；不 import host，也不 import 其它域的内部文件。
 
 import { closeDb, openDb, setMeta } from '../db.js'
@@ -101,7 +101,5 @@ export class LocalBackend {
   }
 }
 
-// 装配：把三个域的方法对象装回原型（描述符与 class 方法一致，见 base.installMethods）。
-installMethods(LocalBackend, queryApi)
-installMethods(LocalBackend, writeApi)
-installMethods(LocalBackend, transferApi)
+// 装配：三个域的方法对象一次装回原型（描述符与 class 方法一致；任一重名整体不落，见 base.installMethods）。
+installMethods(LocalBackend, queryApi, writeApi, transferApi)

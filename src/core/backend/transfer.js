@@ -8,8 +8,6 @@ import { bigrams, contentHash, normalize } from '../tokenize.js'
 import { isActiveHashConflict, recordWrite } from '../writer.js'
 import { NODE_EXPORT_FIELDS, identityFilter } from './base.js'
 
-/** @typedef {import('./backend/base.js').Identity} Identity */
-
 /** 导入字段白名单（非法枚举回落默认，避免把 export 的脏值写进 CHECK 约束）。 */
 const NODE_STATUS = new Set(['active', 'archived', 'superseded', 'stale'])
 
