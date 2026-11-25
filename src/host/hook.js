@@ -24,7 +24,7 @@ import { bool, num, value } from '../shared/config-values.js'
 import { judgeReply } from '../core/adoption.js'
 import { listRules } from '../core/rule-store.js'
 import { isRuleStatement } from '../core/rules.js'
-import { agentsBlockStale, agentsPathOf, fileHasMarkers, renderAgentsDigest } from '../core/rule-render.js'
+import { agentsNeedsRepair, agentsPathOf, fileHasMarkers, renderAgentsDigest } from '../core/rule-render.js'
 import { recordInjection } from './inject-stats.js'
 import { createHostAdapter } from './ctx-adapter.js'
 import { refineProposal } from '../core/rule-refine.js'
@@ -309,6 +309,8 @@ export function installHook(ctx, {
   const inflight = new Set()
   /** 规则文件被外部改（git pull/手写）后，摘要块自动补渲染一次；同进程只跑一份（D1）。 */
   let agentsRenderInFlight = false
+  /** 已确认对齐到的规则最大 mtime（审计 P1-1）：渲染成功即前移，避免“内容一致→mtime 不动→每步重渲染”。 */
+  let agentsRenderFreshUpTo = 0
   /**
    * 待判定的注入与回复文本，**按会话单槽**而不是 (turn,step) 复合键。
    * why：pre-step 的 turn/step 与 assistant-stream 帧的编号不保证同源同偏移，
@@ -399,7 +401,7 @@ export function installHook(ctx, {
    * @param {{rulesDir:string, agentsPath:string}} args
    * @returns {void}
    */
-  const scheduleAgentsRepair = ({ rulesDir, agentsPath }) => {
+  const scheduleAgentsRepair = ({ rulesDir, agentsPath, newest = 0 }) => {
     if (agentsRenderInFlight) return
     agentsRenderInFlight = true
     setImmediate(() => {
@@ -413,6 +415,7 @@ export function installHook(ctx, {
           log,
         })
         if (result && result.ok) {
+          agentsRenderFreshUpTo = Math.max(agentsRenderFreshUpTo, Number(newest) || 0)
           log(`[whale-memory] agents block stale -> re-rendered rules=${result.count} changed=${result.changed}`)
           invalidateRulesCache()
         } else if (result) {
@@ -439,8 +442,9 @@ export function installHook(ctx, {
     // AGENTS 指纹只 stat 不整读（R9-14）：每步 readFileSync 整个 AGENTS 是纯浪费；
     // inode+size+mtime 足以发现内容/换文件，块陈旧单独用 mtime 比较判定。
     const agentsSig = fileStatKey(agentsPath)
-    const agentsStale = agentsBlockStale({ agentsPath, rulesDir })
-    if (agentsStale) scheduleAgentsRepair({ rulesDir, agentsPath })
+    // newest=rulesMtime：复用本步已算的目录扫描，避免每步第二遍 readdir+stat（审计 P1-11）。
+    const agentsStale = agentsNeedsRepair({ agentsPath, rulesDir, newest: rulesMtime, freshUpTo: agentsRenderFreshUpTo })
+    if (agentsStale) scheduleAgentsRepair({ rulesDir, agentsPath, newest: rulesMtime })
     const key = `${RULES_KEY_PREFIX}v3|d:${dirMtime(rulesDir)}|f:${rulesMtime}|b:${budget}`
       + `|r:${trimmed(identity.roleId)}|w:${normalizeScopePath(identity.workspace)}`
       + `|a:${agentsSig}|s:${agentsStale ? 1 : 0}`

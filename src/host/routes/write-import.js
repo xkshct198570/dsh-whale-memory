@@ -92,7 +92,7 @@ export async function handleWriteImport({
       // 大导入不占主线程：>50 行走 202 + jobId，后台每批 50 条。
       if (!dryRun && lineCount > 50 && typeof backend.startImport === 'function') {
         try {
-          const started = await backend.startImport({ jsonl, identity })
+          const started = await backend.startImport({ jsonl, identity, forceIdentity: true })
           res.statusCode = 202
           res.setHeader('content-type', 'application/json; charset=utf-8')
           res.setHeader('cache-control', 'no-store')
@@ -109,7 +109,7 @@ export async function handleWriteImport({
       }
       let result
       try {
-        result = await backend.importJsonl({ jsonl, identity, dryRun })
+        result = await backend.importJsonl({ jsonl, identity, dryRun, forceIdentity: true })
       } catch (err) {
         log(`[whale-memory] import fail: ${err?.message || 'error'}`)
         return sendJson(res, 502, { ok: false, error: 'backend_error' })
@@ -159,7 +159,7 @@ export async function handleWriteImport({
       if (req.method !== 'GET') return sendMethodNotAllowed(res, 'GET')
       const id = new URL(req.url, 'http://127.0.0.1').searchParams.get('id') || ''
       if (!id || typeof backend.importStatus !== 'function') return sendJson(res, 400, { ok: false, error: 'invalid_job_id' })
-      const st = await backend.importStatus(id)
+      const st = await backend.importStatus(id, { identity })
       return sendJson(res, st?.ok === false ? 404 : 200, st?.ok === false ? st : { ok: true, ...st.job })
     }
 

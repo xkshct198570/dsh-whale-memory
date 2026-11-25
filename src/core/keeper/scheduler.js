@@ -333,9 +333,14 @@ export function createKeeper({
  */
 export function recoverRunningJobs(store, log = () => {}) {
   if (!store || typeof store.withDb !== 'function') return 0
+  // 只回收非保留 kind（审计 P2-F5）：write job 的唯一消费者是写队列，它自己会把
+  // running 复位；keeper 再复位会让下一个 keeper tick 把同一 write job 跑第二遍。
+  const reserved = [...KEEPER_RESERVED_KINDS]
+  const marks = reserved.map(() => '?').join(',')
   const changed = Number(store.withDb((db) => db.prepare(
-    "UPDATE jobs SET state='queued', next_at=NULL, updated_at=? WHERE state='running'",
-  ).run(Date.now() / 1000))?.changes || 0)
+    `UPDATE jobs SET state='queued', next_at=NULL, updated_at=? WHERE state='running'
+       ${reserved.length ? `AND kind NOT IN (${marks})` : ''}`,
+  ).run(Date.now() / 1000, ...reserved))?.changes || 0)
   if (changed > 0) log(`[whale-memory] keeper recovered ${changed} stale running job(s)`)
   return changed
 }

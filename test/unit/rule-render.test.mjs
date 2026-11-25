@@ -7,9 +7,10 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { utimesSync } from 'node:fs'
 import {
   RULES_BEGIN, RULES_END,
-  agentsPathOf, fileHasMarkers, inspectMarkers,
+  agentsNeedsRepair, agentsPathOf, fileHasMarkers, inspectMarkers,
   renderAgentsDigest, rulesDigestContent, titleOfRule,
 } from '../../src/core/rule-render.js'
 
@@ -474,4 +475,27 @@ test('R9-14：链终点过滤——active 但带 merged_into/superseded_by 指�
   const got = rulesDigestContent([merged, superseded, terminal])
   assert.deepEqual(got.keys, ['rule-new'], '只允许链终点进摘要')
   assert.equal(got.content.includes('已被合并'), false)
+})
+
+test('agentsBlockStale：内容已对齐时 render 必须解除陈旧（禁止每步重渲染）', (t) => {
+  const dir = freshDir(t)
+  const { path } = agentsFile(dir)
+  const rulesDir = join(dir, 'rules')
+  const rules = [doc({ key: 'iron-rule-17', number: 17, action: '删文档前先核路径', text: '删文档前先核对绝对路径。' })]
+  // 第一次渲染：内容从无到有，changed=true。
+  assert.equal(renderAgentsDigest({ rules, agentsPath: path, rulesDir }).changed, true)
+  // 模拟规则文件比 AGENTS 块新（git pull/touch 都会发生）：旧实现会判陈旧且永不解除。
+  const ruleFile = join(rulesDir, 'iron-rule-17.md')
+  writeFileSync(ruleFile, 'mtime 探针', 'utf8')
+  utimesSync(ruleFile, new Date(Date.now() + 5000), new Date(Date.now() + 5000))
+  const newest = statSync(ruleFile).mtimeMs
+  assert.equal(agentsNeedsRepair({ agentsPath: path, rulesDir, newest, freshUpTo: 0 }), true)
+  // 第二次渲染：内容一致 → changed=false（不落盘、mtime 不动，保持幂等契约）。
+  const again = renderAgentsDigest({ rules, agentsPath: path, rulesDir })
+  assert.equal(again.ok, true)
+  assert.equal(again.changed, false)
+  // hook 在渲染成功后把 freshUpTo 前移到 newest：陈旧判据必须解除，否则每步重渲染。
+  assert.equal(agentsNeedsRepair({ agentsPath: path, rulesDir, newest, freshUpTo: newest }), false)
+  // 新的规则改动（更大的 mtime）仍要能触发一次修复。
+  assert.equal(agentsNeedsRepair({ agentsPath: path, rulesDir, newest: newest + 1000, freshUpTo: newest }), true)
 })

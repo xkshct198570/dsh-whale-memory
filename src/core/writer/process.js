@@ -110,6 +110,19 @@ function resolveConfig(config) {
  * @returns {{ ok: boolean, id?: string, action: string, reason: string }}
  */
 export function processEvent(db, event, config = {}) {
+  // 事务边界（审计 P2-F4）：节点落库与 writes 审计必须同一事务。
+  // 旧实现节点先 COMMIT、审计后写；审计失败时节点已生效而 writes 0 行，面板/回溯看不到这次写入。
+  // 内层已有的 withTx 会识别嵌套事务并不重复 BEGIN（audit.js:96），由这一层统一提交。
+  return withTx(db, () => processEventInTx(db, event, config))
+}
+
+/**
+ * processEvent 的事务体：决策 → 落库 → 审计（只允许由上面的 processEvent 调用）。
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {object} event
+ * @param {object} config
+ */
+function processEventInTx(db, event, config = {}) {
   const options = resolveConfig(config)
   // 调用方（仅 backend.write 的内部参数）可以对**单条**事件强制 shadow：
   // Session Wrap 要求即使全局 reviewMode=auto，候选也必须先经审核，且不能靠临时改全局配置
@@ -156,6 +169,9 @@ export function processEvent(db, event, config = {}) {
     } else {
       // 同 origin/相似 MERGE：更新正文；事件带 TTL 时同时续期（搜索反哺每天刷新同一查询的摘要）。
       const expiredAt = validExpiredAt(event?.expired_at)
+      // 正文改写必须留 evolution（审计 P2-F6）：影子审阅 accept 的 MERGE 有留痕，
+      // auto 路径旧实现只有 writes，没有 evolution，两条路径的回溯口径不一致。
+      const before = db.prepare('SELECT text FROM nodes WHERE id=?').get(targetId) || {}
       try {
         withTx(db, () => {
           if (expiredAt !== null) {
@@ -164,6 +180,12 @@ export function processEvent(db, event, config = {}) {
           } else {
             db.prepare('UPDATE nodes SET text=?, text_hash=?, text_bigrams=?, updated_at=? WHERE id=?')
               .run(text, contentHash(text), bigrams(text), ts, targetId)
+          }
+          if (String(before.text ?? '') !== text) {
+            recordEvolution(db, {
+              ts, fromId: targetId, toId: targetId, field: 'text',
+              oldValue: before.text ?? '', newValue: text, traceId: event?.traceId,
+            })
           }
         })
       } catch (err) {

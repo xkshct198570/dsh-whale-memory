@@ -23,6 +23,7 @@
  * 两个 FTS 都是外部内容表（content=nodes），由 AI/AD/AU 三个触发器保持同步；
  * 任何写路径都不得绕过触发器直接改 FTS。
  */
+import { qualityOrderSql } from './node-rank.js'
 
 export const SCHEMA_VERSION = 5
 
@@ -304,7 +305,7 @@ export function dedupeActiveHashes(db) {
   const keep = db.prepare(`SELECT id FROM nodes
     WHERE status='active' AND (origin IS NULL OR origin NOT LIKE 'rule:%')
       AND text_hash=? AND user_id=? AND role_id=? AND workspace=?
-    ORDER BY created_at ASC, rowid ASC LIMIT 1`)
+    ORDER BY ${qualityOrderSql()} LIMIT 1`)
   const retire = db.prepare(`UPDATE nodes SET status='superseded', superseded_by=?, invalid_at=?,
     updated_at=? WHERE id=?`)
   const ts = Date.now() / 1000
@@ -317,7 +318,7 @@ export function dedupeActiveHashes(db) {
       const rows = db.prepare(`SELECT id FROM nodes
         WHERE status='active' AND (origin IS NULL OR origin NOT LIKE 'rule:%')
           AND text_hash=? AND user_id=? AND role_id=? AND workspace=? AND id<>?
-        ORDER BY created_at ASC, rowid ASC`).all(
+        ORDER BY ${qualityOrderSql()}`).all(
         group.text_hash, group.user_id, group.role_id, group.workspace, canonical.id)
       for (const row of rows) {
         retire.run(canonical.id, ts, ts, row.id)

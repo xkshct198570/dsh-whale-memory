@@ -23,6 +23,23 @@ import { handleNodesReview } from './nodes-review.js'
 import { handleConfigSync } from './config-sync.js'
 import { handleWrap } from './wrap.js'
 
+const REMOTE_READ_POST = new Set([`${PREFIX}/search`, `${PREFIX}/recall-test`])
+// 远端（allowRemote）放开的只有"面板浏览"语义：search/recall 与列表。
+// 以下 GET 虽只读也不给远端（审计 P1）：整库导出、收尾报告/状态（owner 摘要）、
+// 配置（identity/dataDir/bridgeUrl）、写入审计（before_text 正文）、导入 job 状态（可枚举他 job）。
+// 判据：单个响应里出现"整库/他身份正文/内部运行参数"就不该进 LAN 面板。
+const REMOTE_READ_DENY_GET = new Set([
+  `${PREFIX}/export`, `${PREFIX}/wrap/status`, `${PREFIX}/wrap/report`,
+  `${PREFIX}/config`, `${PREFIX}/writes`, `${PREFIX}/import/status`,
+])
+const remoteReadable = (method, path) => {
+  const m = String(method || '').toUpperCase()
+  if (m === 'GET') return !REMOTE_READ_DENY_GET.has(path)
+  if (m === 'POST') return REMOTE_READ_POST.has(path)
+  return false
+}
+export { REMOTE_READ_DENY_GET, REMOTE_READ_POST, remoteReadable }
+
 export function createRoutes({
   config, backend,
   getIdentityCfg = () => config?.identity,
@@ -54,24 +71,6 @@ export function createRoutes({
       const host = ctx?.webServer?.host
       return typeof host === 'string' && host.trim() ? [host.trim()] : []
     } catch { return [] }
-  }
-
-  /**
-   * allowRemote 下非回环 peer 仍可用的「读语义」端点。
-   *
-   * 为什么按端点而不是按 HTTP 方法：/search 与 /recall-test 是纯检索（不写库、不调模型），
-   * 但浏览器只能发 POST；若按方法一律当写请求，远端面板的检索页会全 403。
-   * 反过来 /export 虽为 GET，却是整库原文下载，远端默认不给。
-   */
-  const REMOTE_READ_POST = new Set([`${PREFIX}/search`, `${PREFIX}/recall-test`])
-  // 收尾状态/报告含 owner 会话摘要与候选计数：远端面板只读也不给，回环仍可用。
-  const REMOTE_READ_DENY_GET = new Set([`${PREFIX}/export`, `${PREFIX}/wrap/status`, `${PREFIX}/wrap/report`])
-  const remoteReadable = (method, path) => {
-    const m = String(method || '').toUpperCase()
-    if (m === 'GET') return !REMOTE_READ_DENY_GET.has(path)
-
-    if (m === 'POST') return REMOTE_READ_POST.has(path)
-    return false
   }
 
   /** 主分发（内部）：抛错由下面的 handle 统一兜底成 502 JSON。 */

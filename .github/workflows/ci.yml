@@ -21,6 +21,8 @@ jobs:
 
       - name: Static gates
         run: node scripts/check.mjs
+      - name: Size gate（铁律 23：>800 计划 / >1200 冻结 / >2000 先拆）
+        run: node scripts/lint-size.mjs
       - name: i18n keys
         run: node scripts/i18n-check.mjs
       - name: Manual generated block

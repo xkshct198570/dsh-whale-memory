@@ -10,6 +10,7 @@
  * 本模块只碰 edges/evolution/nodes.context_note，不碰 FTS、不碰注入文本。
  */
 import { now } from './db.js'
+import { identityFilter } from './backend/base.js'
 
 /** context_note 硬顶（字）；与 schema CHECK 同值。 */
 export const NOTE_MAX = 200
@@ -222,14 +223,10 @@ export function expandOneHop(db, { seeds = [], identity = {}, minConf = 0.6, cap
   const ids = [...new Set(seeds.slice(0, 3).map((s) => String(s?.id || '')).filter(Boolean))]
   if (ids.length === 0) return []
   const marks = ids.map(() => '?').join(',')
-  const filter = []
-  const params = []
-  for (const [col, v] of [['user_id', identity?.userId], ['role_id', identity?.roleId], ['workspace', identity?.workspace]]) {
-    if (!v) continue
-    filter.push(`(n.${col} = '' OR n.${col} = ?)`)
-    params.push(String(v))
-  }
-  const where = filter.length ? ` AND ${filter.join(' AND ')}` : ''
+  // 身份判据单一来源（审计 P0）：identity 对象必过滤，空串是分区值，不再“空=全见”。
+  const filter = identityFilter(identity, { alias: 'n.' })
+  const params = filter.params
+  const where = filter.sql ? ` AND ${filter.sql}` : ''
   const sql = `SELECT e.from_id, e.to_id, e.conf, n.id, n.text, n.level, n.memory_type, n.source, n.created_at, n.last_hit_at
     FROM edges e JOIN nodes n ON n.id = CASE WHEN e.from_id IN (${marks}) THEN e.to_id ELSE e.from_id END
     WHERE (e.from_id IN (${marks}) OR e.to_id IN (${marks}))
@@ -264,18 +261,14 @@ export function expandOneHop(db, { seeds = [], identity = {}, minConf = 0.6, cap
  * @param {{ userId?: string, roleId?: string, workspace?: string } | null} [identity]
  */
 export function relationStats(db, identity = null) {
-  const filter = []
-  const params = []
-  for (const [col, v] of [['user_id', identity?.userId], ['role_id', identity?.roleId], ['workspace', identity?.workspace]]) {
-    const value = typeof v === 'string' ? v : String(v ?? '')
-    if (!value) continue
-    filter.push(`(n.${col} = '' OR n.${col} = ?)`)
-    params.push(value)
-  }
-  const seen = filter.length ? `(from_id IN (SELECT id FROM nodes n WHERE ${filter.join(' AND ')}) AND to_id IN (SELECT id FROM nodes n WHERE ${filter.join(' AND ')}))` : ''
-  const seenArgs = filter.length ? [...params, ...params] : []
+  const filter = identityFilter(identity, { alias: 'n.' })
+  const params = filter.params
+  const seen = filter.sql
+    ? `(from_id IN (SELECT id FROM nodes n WHERE ${filter.sql}) AND to_id IN (SELECT id FROM nodes n WHERE ${filter.sql}))`
+    : ''
+  const seenArgs = filter.sql ? [...params, ...params] : []
   const edgeScope = seen ? ` WHERE ${seen}` : ''
-  const nodeScope = filter.length ? ` AND ${filter.join(' AND ')}` : ''
+  const nodeScope = filter.sql ? ` AND ${filter.sql}` : ''
   const one = (sql, args = []) => Number(db.prepare(sql).get(...args)?.n || 0)
   return {
     edges: one(`SELECT count(*) AS n FROM edges${edgeScope}`, seenArgs),

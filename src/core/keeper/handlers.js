@@ -7,9 +7,11 @@
  * 日报统计只读 recalls；不碰 FTS、不碰召回注入；write/reflect 的 handler 由 index.js 接线，这里不注册。
  */
 import { mkdirSync, writeFileSync } from 'node:fs'
+import { backupOnMigrate } from '../db.js'
 import { dirname, join } from 'node:path'
 import { bool, num, value } from '../../shared/config-values.js'
 import { METRIC_DEFS, computeMetrics, writeMetricsRows } from '../metrics.js'
+import { compareQuality } from '../node-rank.js'
 import { parseTags, rebuildTagEdges, upsertEdge } from '../relations.js'
 import { toSeconds } from './util.js'
 import { dayStamp } from '../../shared/day-stamp.js'
@@ -19,8 +21,7 @@ const VECTOR_BATCH = 32
 
 /** text_hash 重复收敛每批最多归档条数（审计行同批上限，写连接保持短事务）。 */
 const DEDUPE_BATCH = 200
-/** 来源等级：owner > self > group > web/tool > import（writer SOURCE_MAP 的语义优先级）。 */
-const SOURCE_RANK = { owner: 5, self: 4, group: 3, web: 2, tool: 2, import: 1 }
+/** 收敛保留谁：与迁移去重共用同一质量序（src/core/node-rank.js），禁止两套口径。 */
 
 /**
  * 同身份 text_hash 重复 active 节点收敛（架构书 §8.2）。
@@ -54,10 +55,7 @@ export function convergeDuplicateHashes(db, { batch = DEDUPE_BATCH, maxNodes = 5
   const doomed = []
   for (const list of groups.values()) {
     if (list.length < 2) continue
-    list.sort((a, b) =>
-      (SOURCE_RANK[String(b.source)] ?? 0) - (SOURCE_RANK[String(a.source)] ?? 0) ||
-      Number(a.created_at || 0) - Number(b.created_at || 0) ||
-      (String(a.id) < String(b.id) ? -1 : 1))
+    list.sort(compareQuality)
     for (const row of list.slice(1)) {
       doomed.push(row)
       if (doomed.length >= limit) break
@@ -281,18 +279,35 @@ export function installDefaultHandlers(keeper, deps) {
     const days = num(config?.privacy?.retentionDays, 0)
     if (!(days > 0)) return { skipped: 'retention_disabled' }
     const cutoff = nowSec() - days * 86400
-    // 分区口径：物理删除是破坏性动作，默认只清"本机配置的身份分区"（config.identity），
-    // 不碰别人的分区；payload.identity 可显式指定（同步/测试用）。
-    // 身份三元组全是 .volatile() Ref，必须经 value() 解包，否则恒空 = 静默退化成全局清理。
+    // 分区口径（审计 P1-F1）：物理删除是破坏性动作，只能清“可判定”的分区。
+    // 旧实现读 config.identity，auto 模式三字段默认全空 → archiveScope 退化为 scope=all
+    // （整库物理删除 archived 行，跨身份且不可逆）。现在 auto 且无固定 userId 时拒绝执行，
+    // 由 status/log 可见（不静默）；显式 payload.identity 仍可用于同步/测试。
+    // 身份三元组都是 .volatile() Ref，必须 value() 解包，否则恒空＝退化全局清理。
     const configuredIdentity = {
       userId: value(config?.identity?.userId, ''),
       roleId: value(config?.identity?.roleId, ''),
       workspace: value(config?.identity?.workspace, ''),
     }
-    // payload.identity 显式给对象时以它为准（同步/测试）；给 `{}` 表示"恢复全局清理"。
-    // 注意破坏性语义：默认口径从旧版"全库清理"改为"配置身份分区清理"，共享('')内容不删。
+    const mode = String(value(config?.identity?.mode, 'auto') || 'auto')
     const requested = payload?.identity && typeof payload.identity === 'object' ? payload.identity : null
+    if (!requested && mode === 'auto' && !configuredIdentity.userId) {
+      log(`[whale-memory] keeper archive skipped identity_auto_unsafe days=${days}`)
+      return { skipped: 'identity_auto_unsafe', cutoff, days }
+    }
     const scope = archiveScope(requested || configuredIdentity)
+    // 物理删除前出整库快照（fail-closed）：没有可回滚点就不删。
+    let backup = { performed: false, reason: 'no_db_file' }
+    const dbFile = String(store?.dbFile || '')
+    if (dbFile) {
+      try { backup = store.withDb((db) => backupOnMigrate(db, dirname(dbFile))) } catch (err) {
+        backup = { performed: false, reason: String(err?.message || err).slice(0, 160) }
+      }
+    }
+    if (!backup?.performed) {
+      log(`[whale-memory] keeper archive skipped backup_failed:${backup?.reason || 'unknown'} days=${days}`)
+      return { skipped: 'backup_failed', reason: backup?.reason || 'unknown', cutoff, days }
+    }
     return store.withDb((db) => {
       db.exec('BEGIN IMMEDIATE')
       let deleted = 0
@@ -302,15 +317,15 @@ export function installDefaultHandlers(keeper, deps) {
         deleted = Number(info?.changes || 0)
         db.prepare(`INSERT INTO writes (ts,trace_id,action,node_id,reason,mode)
           VALUES (?,?,'ARCHIVE',NULL,?,'auto')`).run(
-          nowSec(), '', `retention_days=${days}; cutoff=${cutoff}; deleted=${deleted}${scope.note}`,
+          nowSec(), '', `retention_days=${days}; cutoff=${cutoff}; deleted=${deleted}${scope.note}; backup=${backup.path || ''}`,
         )
         db.exec('COMMIT')
       } catch (err) {
         try { db.exec('ROLLBACK') } catch { /* noop */ }
         throw err
       }
-      log(`[whale-memory] keeper archive deleted=${deleted} days=${days}`)
-      return { deleted, cutoff, days }
+      log(`[whale-memory] keeper archive deleted=${deleted} days=${days} backup=${backup.path || '-'}`)
+      return { deleted, cutoff, days, backup: backup.path || '' }
     })
   })
 

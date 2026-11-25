@@ -437,11 +437,11 @@ test('archive：retention 关 → skipped；开 → 物理删过期 archived 并
     assert.ok(off.db.prepare('SELECT id FROM nodes WHERE id=?').get(old), '关闭时不得删')
   } finally { off.close() }
 
-  const on = fresh({ config: { privacy: { retentionDays: 7 } } })
+  const on = fresh({ config: { privacy: { retentionDays: 7 }, identity: { userId: 'u9' } } })
   try {
-    const old = node(on.db, { text: '已归档旧节点', status: 'archived', updatedAt: on.clock - 8 * 86400 })
-    const recent = node(on.db, { text: '刚归档节点', status: 'archived', updatedAt: on.clock - 86400 })
-    const activeOld = node(on.db, { text: '老但还活着', status: 'active', updatedAt: on.clock - 30 * 86400 })
+    const old = node(on.db, { text: '已归档旧节点', status: 'archived', updatedAt: on.clock - 8 * 86400, userId: 'u9' })
+    const recent = node(on.db, { text: '刚归档节点', status: 'archived', updatedAt: on.clock - 86400, userId: 'u9' })
+    const activeOld = node(on.db, { text: '老但还活着', status: 'active', updatedAt: on.clock - 30 * 86400, userId: 'u9' })
     const res = await on.keeper.runNow('archive', {})
     assert.equal(res.state, 'done')
     assert.equal(res.result.deleted, 1)
@@ -452,6 +452,21 @@ test('archive：retention 关 → skipped；开 → 物理删过期 archived 并
     assert.equal(audit.length, 1)
     assert.match(audit[0].reason, /retention_days=7/)
   } finally { on.close() }
+})
+
+test('archive 分区不可判定（auto + 空 userId）→ skipped，绝不退化成全库物理删除', async () => {
+  // 审计 P1-F1 反例：旧实现三字段全空 → archiveScope(scope=all)，跨身份物理删 archived 行。
+  const f = fresh({ config: { privacy: { retentionDays: 1 } } })
+  try {
+    const mine = node(f.db, { text: '甲区过期归档', status: 'archived', updatedAt: f.clock - 2 * 86400, userId: 'alice' })
+    const other = node(f.db, { text: '乙区过期归档', status: 'archived', updatedAt: f.clock - 2 * 86400, userId: 'bob' })
+    const res = await f.keeper.runNow('archive', {})
+    assert.equal(res.state, 'done')
+    assert.equal(res.result.skipped, 'identity_auto_unsafe')
+    assert.ok(f.db.prepare('SELECT id FROM nodes WHERE id=?').get(mine), '不可判定时不得删任何人')
+    assert.ok(f.db.prepare('SELECT id FROM nodes WHERE id=?').get(other))
+    assert.equal(f.db.prepare("SELECT count(*) AS n FROM writes WHERE action='ARCHIVE'").get().n, 0)
+  } finally { f.close() }
 })
 
 test('archive retention=0（真实 Config 默认值）→ skipped，归档一条都不删', async () => {

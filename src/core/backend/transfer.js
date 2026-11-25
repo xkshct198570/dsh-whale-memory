@@ -109,15 +109,18 @@ function importNodeRow(base, id, text, tags) {
  * @param {{ ts: number, seq: number }} opts ts=当前时间兜底；seq=行序号（生成 id 保证唯一）
  * @returns {{ kind: 'error', reason: string, textHash: string } | { kind: 'rows', rows: object[], split?: boolean }}
  */
-function planImportRows(row, identity, { ts, seq }) {
+function planImportRows(row, identity, { ts, seq, forceIdentity = false }) {
   const raw = String(row?.text ?? '')
   const text = normalize(raw)
   if (!text) return { kind: 'error', reason: 'invalid_text', textHash: contentHash(raw) }
 
+  // 分区列（审计 P1-02）：HTTP 导入必须强制请求身份，行内 user_id/role_id/workspace 不得把
+  // 数据写进别的分区；CLI/离线迁移可显式 forceIdentity=false 保留源分区（默认仍强制）。
+  const pickPartition = (rowValue, idValue) => String(forceIdentity ? (idValue ?? '') : (rowValue ?? idValue ?? ''))
   const base = {
-    role_id: String(row?.role_id ?? identity?.roleId ?? ''),
-    user_id: String(row?.user_id ?? identity?.userId ?? ''),
-    workspace: String(row?.workspace ?? identity?.workspace ?? ''),
+    role_id: pickPartition(row?.role_id, identity?.roleId),
+    user_id: pickPartition(row?.user_id, identity?.userId),
+    workspace: pickPartition(row?.workspace, identity?.workspace),
     level: pickEnum(row?.level, NODE_LEVELS, 'normal'),
     memory_type: pickEnum(row?.memory_type, NODE_TYPES, 'semantic'),
     source: pickEnum(row?.source, NODE_SOURCES, 'import'),
@@ -292,6 +295,7 @@ export const transferApi = {
     const db = this._db()
     const lines = String(q?.jsonl || '').split('\n').map((s) => s.trim()).filter(Boolean)
     const ident = q?.identity || {}
+    const forceIdentity = q?.forceIdentity !== false
     const ts = now()
     const dryRun = Boolean(q?.dryRun)
     const insert = db.prepare(IMPORT_INSERT_SQL)
@@ -322,7 +326,7 @@ export const transferApi = {
         }
         return
       }
-      const plan = planImportRows(row, ident, { ts, seq: index })
+      const plan = planImportRows(row, ident, { ts, seq: index, forceIdentity })
       if (plan.kind === 'error') {
         errors += 1
         reasons[plan.reason] = (reasons[plan.reason] || 0) + 1
@@ -368,7 +372,7 @@ export const transferApi = {
     const db = this._db()
     const filter = identityFilter(q?.identity)
     const rows = db.prepare(
-      `SELECT ${NODE_EXPORT_FIELDS.join(',')} FROM nodes${filter.sql} ORDER BY created_at, id`,
+      `SELECT ${NODE_EXPORT_FIELDS.join(',')} FROM nodes${filter.sql ? ` WHERE ${filter.sql}` : ''} ORDER BY created_at, id`,
     ).all(...filter.params)
     return rows.map((r) => JSON.stringify(r)).join('\n') + (rows.length ? '\n' : '')
   },
@@ -386,10 +390,17 @@ export const transferApi = {
     const db = this._db()
     const jsonl = String(q?.jsonl || '')
     const total = jsonl.split('\n').filter((line) => line.trim()).length
-    const payload = { jsonl, identity: q?.identity || {}, total }
+    const ident = q?.identity || {}
+    const payload = { jsonl, identity: ident, total, forceIdentity: q?.forceIdentity !== false }
     const created = db.prepare('INSERT INTO jobs (kind,state,attempts,payload,created_at,updated_at) VALUES (?,?,?,?,?,?)')
       .run('import', 'running', 0, JSON.stringify(payload), now(), now())
     const jobId = String(created.lastInsertRowid)
+    // 分区作用域随 job 落 meta（小 JSON，避免状态查询解析 4MB payload）：审计 P1-03。
+    try {
+      setMeta(db, `import_identity:${jobId}`, JSON.stringify({
+        userId: String(ident.userId ?? ''), roleId: String(ident.roleId ?? ''), workspace: String(ident.workspace ?? ''),
+      }))
+    } catch { /* meta 写失败不影响导入本体；状态查询会退化为 job_not_found 保守策略 */ }
     this._resumeImportJob(jobId).catch((err) => this.log(`[whale-memory] import job fail-open: ${err?.message || err}`))
     return { ok: true, async: true, jobId, total }
   },
@@ -412,6 +423,7 @@ export const transferApi = {
     const lines = String(payload.jsonl || '').split('\n').map((line) => line.trim()).filter(Boolean)
     if (!lines.length) return { ok: false, error: 'payload_corrupt' }
     const ident = payload.identity && typeof payload.identity === 'object' ? payload.identity : {}
+    const forceIdentity = payload.forceIdentity !== false
     db.prepare("UPDATE jobs SET state='running', updated_at=? WHERE id=?").run(now(), id)
     const progress = readImportProgress(db, id)
     let cursor = Math.max(0, Math.min(lines.length, Number(progress.cursor) || 0))
@@ -444,7 +456,7 @@ export const transferApi = {
           }
           return
         }
-        const plan = planImportRows(parsed, ident, { ts, seq: index })
+        const plan = planImportRows(parsed, ident, { ts, seq: index, forceIdentity })
         if (plan.kind === 'error') {
           progress.errors += 1
           progress.reasons[plan.reason] = (progress.reasons[plan.reason] || 0) + 1
@@ -505,11 +517,22 @@ export const transferApi = {
     }
   },
 
-  async importStatus(jobId) {
+  async importStatus(jobId, { identity = null } = {}) {
     const db = this._db()
     const id = Number(jobId)
     const row = db.prepare('SELECT id,kind,state,last_error,created_at,updated_at FROM jobs WHERE id=?').get(id)
     if (!row) return { ok: false, error: 'job_not_found' }
+    // 作用域闸（审计 P1-03）：job 有登记身份时，只有同三元组能看；不登记=老 job，保守拒绝。
+    if (identity && typeof identity === 'object') {
+      let scope = null
+      try { scope = JSON.parse(getMeta(db, `import_identity:${id}`) || 'null') } catch { scope = null }
+      if (!scope
+        || String(scope.userId ?? '') !== String(identity.userId ?? '')
+        || String(scope.roleId ?? '') !== String(identity.roleId ?? '')
+        || String(scope.workspace ?? '') !== String(identity.workspace ?? '')) {
+        return { ok: false, error: 'job_not_found' }
+      }
+    }
     // 进度在 meta（小 JSON）；jobs.payload 里的 jsonl 永不回传。
     const progress = readImportProgress(db, id)
     return {

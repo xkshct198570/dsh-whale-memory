@@ -34,7 +34,7 @@ function hitIdsCount(raw) {
 function bothEndsVisible(identity) {
   const filter = identityFilter(identity)
   if (!filter.sql) return { sql: '', params: [], active: false }
-  const vis = `SELECT id FROM nodes${filter.sql}`
+  const vis = `SELECT id FROM nodes WHERE ${filter.sql}`
   return {
     sql: `(from_id IN (${vis}) AND to_id IN (${vis}))`,
     params: [...filter.params, ...filter.params],
@@ -339,7 +339,7 @@ export const queryApi = {
     try {
       const filter = identityFilter(opts?.identity)
       const cond = filter.sql
-        ? `AND e.from_id IN (SELECT id FROM nodes${filter.sql}) AND e.to_id IN (SELECT id FROM nodes${filter.sql})`
+        ? `AND e.from_id IN (SELECT id FROM nodes WHERE ${filter.sql}) AND e.to_id IN (SELECT id FROM nodes WHERE ${filter.sql})`
         : ''
       const rows = db.prepare(`SELECT e.id, e.from_id, e.to_id, e.etype, e.source, e.conf, e.weight, e.created_at
         FROM edges e

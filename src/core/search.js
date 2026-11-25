@@ -4,7 +4,7 @@
  * 硬约束（架构书 §5.2，不可调）：
  * - 每一路 FTS 必须 `LIMIT 50`；单次检索候选总量 `MAX_CANDIDATES=150`；排序只在候选集上算。
  * - 空查询 / minLenOk=false / 纯符号 → 直接空结果，绝不 LIKE、绝不无 LIMIT 扫表。
- * - 身份过滤：传入非空 userId/roleId/workspace ⇒ `(列='' OR 列=值)`；不传 ⇒ 全见。
+ * - 身份过滤：传 identity 对象 ⇒ 三个分区列必过滤（`列='' OR 列=值`）；null ⇒ 内部全见。
  * - L3 向量在 S2 关闭（vec 恒 0，未向量化节点不惩罚）。
  *
  * 打分（v2 口径移植）：
@@ -16,6 +16,7 @@
  *   score     = rel × mult × gain，intent 与 memory_type 一致时 mult=1.5
  * 只有 rel >= minRel 才保留；被门挡掉的候选计入 below_min_n（面板要看得见）。
  */
+import { identityFilter } from './backend/base.js'
 import { buildPlan } from './queryplan.js'
 import { normalize } from './tokenize.js'
 import { now } from './db.js'
@@ -57,27 +58,6 @@ function dedupe(values) {
   return out
 }
 
-/**
- * 身份过滤条件（只对传入的非空字段生效）。
- * @param {{ userId?: string, roleId?: string, workspace?: string } | null | undefined} identity
- * @returns {{ sql: string, params: string[] }}
- */
-function identityFilter(identity) {
-  const clauses = []
-  const params = []
-  for (const [col, value] of [
-    ['user_id', identity?.userId],
-    ['role_id', identity?.roleId],
-    ['workspace', identity?.workspace],
-  ]) {
-    const v = typeof value === 'string' ? value : String(value ?? '')
-    if (!v) continue
-    clauses.push(`(n.${col} = '' OR n.${col} = ?)`)
-    params.push(v)
-  }
-  return { sql: clauses.length ? ` AND ${clauses.join(' AND ')}` : '', params }
-}
-
 /** 规则镜像的 origin 前缀（与 rule-mirror.js 的 RULE_ORIGIN_PREFIX 同值）。 */
 const RULE_ORIGIN_PREFIX = 'rule:'
 
@@ -101,7 +81,7 @@ function collectFts(db, table, match, filter, candidates, path = 'L1') {
   const sql =
     `SELECT n.id, n.text, n.level, n.memory_type, n.source, n.created_at, n.last_hit_at, n.context_note ` +
     `FROM ${table} JOIN nodes n ON n.rowid = ${table}.rowid ` +
-    `WHERE ${table} MATCH ? AND n.status = 'active'${RECALL_ORIGIN_FILTER}${filter.sql} ` +
+    `WHERE ${table} MATCH ? AND n.status = 'active'${RECALL_ORIGIN_FILTER}${filter.sql ? ' AND ' + filter.sql : ''} ` +
     `ORDER BY rank LIMIT ${FTS_LIMIT}`
   let rows
   try {

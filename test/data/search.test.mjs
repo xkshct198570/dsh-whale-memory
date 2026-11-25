@@ -127,18 +127,20 @@ test('minRel 门挡掉低相关候选并计入 below_min_n', () => {
   assert.equal(r.hits.length, 1)
   assert.equal(r.hits[0].id, 'n1')
   assert.equal(r.hits[0].rel, 0.5)
-  assert.equal(r.below_min_n, 5)
+  // 分区口径（审计 P0）：workspace='' 只代表空分区，不再“不过滤”，ws1 的 n8 不参与候选。
+  assert.equal(r.below_min_n, 4)
   assert.ok(!r.hits.some((h) => h.id === 'n3' || h.id === 'n7'))
 
   const strict = search(db, { query: '网关 断网 冻结 回调', identity: ALICE, minRel: 0.9 })
   assert.equal(strict.count, 0)
   assert.equal(strict.hits.length, 0)
-  assert.equal(strict.below_min_n, 6)
+  assert.equal(strict.below_min_n, 5)
 })
 
 test('score 降序：level/source/type 决定 effWeight', () => {
   const r = search(db, { query: '网关', identity: ALICE })
-  assert.deepEqual(r.hits.map((h) => h.id), ['n1', 'n8', 'n6'])
+  // ws1 的 n8 属其它分区：空 workspace 身份不得看见（审计 P0）。
+  assert.deepEqual(r.hits.map((h) => h.id), ['n1', 'n6'])
   for (let i = 1; i < r.hits.length; i++) assert.ok(r.hits[i - 1].score >= r.hits[i].score)
   const n1 = r.hits[0]
   assert.ok(Math.abs(n1.components.effWeight - 12) < 0.01)
@@ -325,4 +327,17 @@ test('召回排除规则镜像行：FTS 命中与扩散都不得返回 origin ru
   } finally {
     disposeSearchDb(f)
   }
+})
+
+test('身份分区（审计 P0）：空 workspace 不再等于全库可见', () => {
+  // 反例：旧实现 workspace='' 跳过过滤，ws1 的 n8 会漏进空分区的检索/列表。
+  const empty = search(db, { query: '网关 工作区', identity: { userId: 'alice', roleId: '', workspace: '' } })
+  assert.ok(!empty.hits.some((h) => h.id === 'n8'), '空分区不得命中 ws1 节点')
+  // 共享分区对任意分区可见：ws1 身份应同时看到 n1（''）与 n8（ws1）。
+  const ws1 = search(db, { query: '网关 工作区', identity: { userId: 'alice', roleId: '', workspace: 'ws1' } })
+  assert.ok(ws1.hits.some((h) => h.id === 'n8'), '本分区节点应命中')
+  assert.ok(ws1.hits.some((h) => h.id === 'n1'), '共享分区节点应对本分区可见')
+  // null 身份=内部管理查询（stats/审计），仍全见。
+  const admin = search(db, { query: '网关 工作区', identity: null })
+  assert.ok(admin.hits.some((h) => h.id === 'n8'))
 })

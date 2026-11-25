@@ -242,9 +242,9 @@ export function installSessionWrap(ctx, {
   }
 
   /** 报告读取：路径穿越防护在 reportRead 内。 */
-  function report(runId) {
+  function report(runId, { identity = null } = {}) {
     if (!supported) return { ok: false, error: 'unsupported_backend' }
-    return reportRead({ runId, withDb, reportDir: reportDir() })
+    return reportRead({ runId, withDb, reportDir: reportDir(), identity })
   }
 
   function sweepSpool({ ttlHours = null } = {}) {

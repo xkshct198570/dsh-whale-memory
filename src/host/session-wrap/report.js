@@ -97,9 +97,17 @@ export function reportPhase({ runId, run, spool, distilled, items, api, backend,
 }
 
 /** 报告读取：只认 run.report_path 且必须落在 reports 目录内（防路径穿越）。 */
-export function reportRead({ runId, withDb, reportDir }) {
+export function reportRead({ runId, withDb, reportDir, identity = null }) {
   const run = withDb((db) => getRun(db, runId))
   if (!run || !run.report_path) return { ok: false, error: 'report_missing' }
+  // 作用域闸（审计 P1-03）：显式身份必须与 run 三元组完全一致；不一致按“不存在”返回，
+  // 不暴露“这条 run 属于别的分区”这一事实。identity=null 是本机面板默认视图。
+  if (identity && typeof identity === 'object') {
+    const same = String(run.user_id ?? '') === String(identity.userId ?? '')
+      && String(run.role_id ?? '') === String(identity.roleId ?? '')
+      && String(run.workspace ?? '') === String(identity.workspace ?? '')
+    if (!same) return { ok: false, error: 'report_missing' }
+  }
   const dir = resolve(reportDir)
   const abs = resolve(String(run.report_path))
   if (!existsSync(abs)) return { ok: false, error: 'report_missing' }

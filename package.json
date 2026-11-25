@@ -71,7 +71,8 @@
     "check:client": "node scripts/build-client.mjs --check",
     "lint:size": "node scripts/lint-size.mjs",
     "check:deps": "node scripts/check-deps.mjs",
-    "pretest": "node scripts/i18n-check.mjs --check && node scripts/manual-build.mjs --check && node scripts/build-client.mjs --check && node scripts/check-deps.mjs && node scripts/check-shared-drift.mjs --check && node scripts/compare-baseline.mjs --no-tests",
+    "check:drift:peer": "node scripts/check-shared-drift.mjs --check --peer ../dsh-persona-hub",
+    "pretest": "node scripts/i18n-check.mjs --check && node scripts/manual-build.mjs --check && node scripts/build-client.mjs --check && node scripts/lint-size.mjs && node scripts/check-deps.mjs && node scripts/check-shared-drift.mjs --check && node scripts/compare-baseline.mjs --no-tests",
     "posttest": "node scripts/check-test-counts.mjs",
     "prepack": "node scripts/i18n-check.mjs --check 1>&2 && node scripts/manual-build.mjs --check 1>&2 && node scripts/build-client.mjs --check 1>&2"
   },

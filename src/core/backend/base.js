@@ -12,26 +12,37 @@ export const NODE_EXPORT_FIELDS = [
 ]
 
 /**
- * 导出身份过滤：与 search 同口径 `(列='' OR 列=?)`，空身份字段不过滤。
- * 为什么导出也要过滤：导出文件会被拿去推送/外传，不带身份条件等于跨分区泄漏。
+ * 身份过滤：`(列='' OR 列=?)`——共享分区('')对任何分区可见，跨分区互不可见。
+ *
+ * 关键判据（审计 P0）：**只要调用方给了 identity 对象，就必须过滤**，空字符串是分区值
+ * 而不是"不过滤"。旧实现 `if (!value) continue` 让 `workspace=''` 退化成全库可见：
+ * 面板默认身份 workspace='' 时 /nodes /export /writes 会返回别的 workspace 的节点与正文。
+ * 身份对象为 null/undefined 才表示内部管理查询（stats/计数），此时不过滤。
+ *
+ * 为什么仍保留 `列='' OR`：共享记忆（空分区）按设计对所有分区可见，见
+ * `test/data/blind-spots.test.mjs` 盲区①；删掉会切断共享规则/事实召回。
+ *
+ * 同一判据只此一处：search.js / relations.js 复用本函数，禁止再抄一份（铁律 2）。
  *
  * @param {{ userId?: unknown, roleId?: unknown, workspace?: unknown } | null | undefined} identity
- * @returns {{ sql: string, params: string[] }}
+ * @param {{ alias?: string, operator?: string }} [opts] alias＝列前缀（如 'n.'），operator＝子句连接符
+ * @returns {{ sql: string, params: string[] }} sql 不含前导 WHERE（调用方决定拼法）
  */
-export function identityFilter(identity) {
+export function identityFilter(identity, { alias = '', operator = ' AND ' } = {}) {
+  if (!identity || typeof identity !== 'object') return { sql: '', params: [] }
+  const prefix = String(alias || '')
   const clauses = []
   const params = []
   for (const [col, raw] of [
-    ['user_id', identity?.userId],
-    ['role_id', identity?.roleId],
-    ['workspace', identity?.workspace],
+    ['user_id', identity.userId],
+    ['role_id', identity.roleId],
+    ['workspace', identity.workspace],
   ]) {
     const value = typeof raw === 'string' ? raw : String(raw ?? '')
-    if (!value) continue
-    clauses.push(`(${col} = '' OR ${col} = ?)`)
+    clauses.push(`(${prefix}${col} = '' OR ${prefix}${col} = ?)`)
     params.push(value)
   }
-  return { sql: clauses.length ? ` WHERE ${clauses.join(' AND ')}` : '', params }
+  return { sql: clauses.join(operator), params }
 }
 
 /**
@@ -49,7 +60,7 @@ export function whereOf(identity, extra = []) {
   const parts = []
   const params = []
   if (filter.sql) {
-    parts.push(filter.sql.slice(' WHERE '.length))
+    parts.push(filter.sql)
     params.push(...filter.params)
   }
   for (const [sql, args] of extra) {

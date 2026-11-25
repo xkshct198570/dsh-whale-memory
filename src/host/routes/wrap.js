@@ -45,7 +45,12 @@ export async function handleWrap({
       const params = new URL(req.url, 'http://127.0.0.1').searchParams
       const id = Number(params.get('id'))
       if (!Number.isInteger(id) || id <= 0) return sendJson(res, 400, { ok: false, error: 'invalid_id' })
-      const got = wrap.report(id)
+      // 显式身份参数必须参与作用域（审计 P1-03）：默认面板保持“本机最近一次”，
+      // 但调用方一旦声明 userId/roleId/workspace，就不能按 id 跨分区直读报告。
+      const hasOverride = ['userId', 'roleId', 'workspace'].some((key) => params.get(key) !== null)
+      const idn = hasOverride ? requestIdentity(identityParams(params)) : { ok: true, identity: null }
+      if (!idn.ok) return sendJson(res, 400, { ok: false, error: idn.error })
+      const got = wrap.report(id, { identity: idn.identity })
       if (!got?.ok) {
         const error = String(got?.error || 'report_unavailable')
         const status = error === 'report_missing' ? 404 : error === 'report_path_outside' ? 403 : 502

@@ -122,6 +122,8 @@ test('import：成功 200 返回统计与 dryRun，身份透传', async () => {
   assert.equal(call.jsonl, '{"id":"n1"}\n')
   assert.equal(call.dryRun, false)
   assert.deepEqual(call.identity, { userId: 'u1', roleId: '', workspace: '' })
+  // 审计 P1-02：HTTP 导入必须强制请求身份，行内 user_id/role_id/workspace 不得指定写入分区。
+  assert.equal(call.forceIdentity, true)
   const dry = await post('/whale-memory/api/import', { jsonl: '{"id":"n2"}\n', dryRun: true })
   assert.equal(dry.body.dryRun, true)
 })

@@ -346,9 +346,11 @@ function decideByRules(db, event, opts = {}) {
   const redacted = privacy.reason === 'privacy_redacted'
 
   // 3. 当日配额（NOOP/REJECT 不占额度：它们没有产生新事实；SPLIT 是导入迁移记账，不算当日新增）
+  // 只数“改变长期记忆”的动作：ADD/MERGE/SUPERSEDE；面板 EDIT、人工 ARCHIVE、巩固 CONSOLIDATE、
+  // 影子 CANDIDATE/REVIEW 都不产生新事实，旧口径把它们也计入会把当日新写入提前挡死（审计 P2-F3）。
   const since = startOfDay(now())
   const used = Number(db.prepare(
-    "SELECT count(*) AS n FROM writes WHERE ts>=? AND user_id=? AND role_id=? AND workspace=? AND action NOT IN ('NOOP','REJECT','SPLIT')",
+    "SELECT count(*) AS n FROM writes WHERE ts>=? AND user_id=? AND role_id=? AND workspace=? AND action IN ('ADD','MERGE','SUPERSEDE')",
   ).get(since, ident.userId, ident.roleId, ident.workspace)?.n || 0)
   if (used >= options.dailyCap) return { action: 'REJECT', reason: 'daily_cap', mode: options.mode }
 

@@ -192,6 +192,9 @@ test('MERGE：信息只增不减时合并到旧节点，不新增节点', (t) =>
   assert.equal(write.node_id, old.id)
   assert.equal(write.before_text, oldText)
   assert.equal(write.after_text, newText)
+  // 审计 P2-F6：auto MERGE 改写正文必须与影子 accept 同口径留 evolution。
+  const evo = db.prepare("SELECT field,old_value,new_value FROM evolution WHERE to_id=? ORDER BY id").all(old.id)
+  assert.ok(evo.some((row) => row.field === 'text' && row.old_value === oldText && row.new_value === newText))
 })
 
 test('SUPERSEDE：端口槽位冲突取代旧节点，双时态与 supersede 边齐备', (t) => {

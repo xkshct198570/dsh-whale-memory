@@ -273,25 +273,47 @@ export function rulesDigestContent(rules, opts = {}) {
  * @param {{agentsPath?:string, rulesDir?:string}} [args]
  * @returns {boolean}
  */
-export function agentsBlockStale({ agentsPath = '', rulesDir = '' } = {}) {
+export function agentsBlockStale({ agentsPath = '', rulesDir = '', newest = undefined } = {}) {
   const file = trimmed(agentsPath)
   const dir = trimmed(rulesDir)
   if (!file || !dir) return false
   let agentsMtime
   try { agentsMtime = statSync(file).mtimeMs } catch { return false }
   if (!fileHasMarkers(file)) return false
-  let newest = 0
-  try {
-    for (const name of readdirSync(dir)) {
-      if (!name.endsWith('.md')) continue
-      try {
-        const m = statSync(join(dir, name)).mtimeMs
-        if (m > newest) newest = m
-      } catch { /* 刚好被换掉：跳过 */ }
-    }
-  } catch { return false }
-  return newest > agentsMtime
+  // newest 由调用方（hook）复用同一步已算好的规则最大 mtime：避免每步两遍 readdir+22×stat
+  // （审计 P1-11：0.352 ms/步纯 fs）。未提供时才自己扫。
+  let newestMtime = Number(newest)
+  if (!Number.isFinite(newestMtime) || newestMtime < 0) {
+    newestMtime = 0
+    try {
+      for (const name of readdirSync(dir)) {
+        if (!name.endsWith('.md')) continue
+        try {
+          const m = statSync(join(dir, name)).mtimeMs
+          if (m > newestMtime) newestMtime = m
+        } catch { /* 刚好被换掉：跳过 */ }
+      }
+    } catch { return false }
+  }
+  return newestMtime > agentsMtime
 }
+/**
+ * 是否需要重渲染 AGENTS 摘要块（审计 P1-1 的退避判据）。
+ *
+ * mtime 判据单独用会死循环：规则文件比 AGENTS 新 → 判陈旧 → 重渲染时内容一致不落盘 →
+ * mtime 不前进 → 永远陈旧 → 每步重渲染（实测 0.27→3.9 ms/步，一次 git pull 即触发）。
+ * `freshUpTo` 记录“上一次渲染已确认对齐到的规则最大 mtime”：渲染成功（含 changed=false）
+ * 后置为 newest，判据即解除；进程重启后为 0，只多渲染一次。
+ *
+ * @param {{agentsPath?:string, rulesDir?:string, newest?:number, freshUpTo?:number}} [args]
+ * @returns {boolean}
+ */
+export function agentsNeedsRepair({ agentsPath = '', rulesDir = '', newest = undefined, freshUpTo = 0 } = {}) {
+  if (!agentsBlockStale({ agentsPath, rulesDir, newest })) return false
+  const n = Number(newest)
+  return Number.isFinite(n) && n > Number(freshUpTo || 0)
+}
+
 
 /** 规则来源目录（用于「完整正文」脚注）；没有目录时给 `~/.dsh/rules` 口径的空串。 */
 function dirnameOfRules(rules) {

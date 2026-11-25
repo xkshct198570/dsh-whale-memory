@@ -148,38 +148,45 @@ export function openDb(dataDir, { readOnly = false, backupOnMigrate: doBackup = 
 
   const pathKey = join(dir, DB_FILE)
   let db = new DatabaseSync(pathKey, { readOnly })
-  db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`)
-  if (!readOnly) {
-    // 损坏探测先于任何写/迁移：坏页库若被 ensureSchema 当成新库，会跳过迁移快照并继续跑。
-    if (!quickChecked.has(pathKey)) {
-      const check = quickCheck(db)
-      if (!check.ok) {
-        if (check.busy) {
-          // 忙 ≠ 坏：另一进程持写锁/EXCLUSIVE 时 quick_check 会抛 SQLITE_BUSY。
-          // 这时绝不能改名隔离（会把健康库和新空库分叉），跳过本次快检继续用同一连接。
-          db.quickCheckSkipped = check.detail
-        } else if (check.corrupt) {
-          const quarantine = quarantineCorrupt(db, dir)
-          db = new DatabaseSync(pathKey, { readOnly: false })
-          db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`)
-          db.quarantine = quarantine || { renamed: [], reason: check.detail }
-        } else {
-          // 未知错误（权限/不可读等）：不做破坏性动作，保留现场并记状态。
-          db.quickCheckSkipped = check.detail
+  try {
+    db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`)
+    if (!readOnly) {
+      // 损坏探测先于任何写/迁移：坏页库若被 ensureSchema 当成新库，会跳过迁移快照并继续跑。
+      if (!quickChecked.has(pathKey)) {
+        const check = quickCheck(db)
+        if (!check.ok) {
+          if (check.busy) {
+            // 忙 ≠ 坏：另一进程持写锁/EXCLUSIVE 时 quick_check 会抛 SQLITE_BUSY。
+            // 这时绝不能改名隔离（会把健康库和新空库分叉），跳过本次快检继续用同一连接。
+            db.quickCheckSkipped = check.detail
+          } else if (check.corrupt) {
+            const quarantine = quarantineCorrupt(db, dir)
+            db = new DatabaseSync(pathKey, { readOnly: false })
+            db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`)
+            db.quarantine = quarantine || { renamed: [], reason: check.detail }
+          } else {
+            // 未知错误（权限/不可读等）：不做破坏性动作，保留现场并记状态。
+            db.quickCheckSkipped = check.detail
+          }
         }
+        quickChecked.add(pathKey)
       }
-      quickChecked.add(pathKey)
+      db.exec('PRAGMA journal_mode = WAL')
+      db.exec('PRAGMA synchronous = NORMAL')
+      const current = readSchemaVersion(db)
+      if (doBackup && current > 0 && current < SCHEMA_VERSION) {
+        // 快照结果挂在连接上供诊断（db.js 无 logger；不阻断、不静默：调用方可读）。
+        db.migrationBackup = backupOnMigrate(db, dir)
+      }
+      db.schemaInfo = ensureSchema(db)
     }
-    db.exec('PRAGMA journal_mode = WAL')
-    db.exec('PRAGMA synchronous = NORMAL')
-    const current = readSchemaVersion(db)
-    if (doBackup && current > 0 && current < SCHEMA_VERSION) {
-      // 快照结果挂在连接上供诊断（db.js 无 logger；不阻断、不静默：调用方可读）。
-      db.migrationBackup = backupOnMigrate(db, dir)
-    }
-    db.schemaInfo = ensureSchema(db)
+    return db
+  } catch (err) {
+    // 打开/迁移失败必须关连接（审计 P2-F7）：失败 open 每次都留 1 个 fd+连接，
+    // 坏库/未来版本库会让面板轮询与每轮 hook 持续泄漏，最终 EMFILE 拖垮宿主。
+    try { db?.close?.() } catch { /* 已关闭/损坏连接：尽力而为之 */ }
+    throw err
   }
-  return db
 }
 
 /** 关闭连接（幂等；已关闭不抛）。 */
