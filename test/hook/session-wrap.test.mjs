@@ -105,12 +105,12 @@ const VALID_OUTPUT = {
   ],
 }
 
-function setup(t, { overrides = {}, llm = llmOf(VALID_OUTPUT), selection = { provider: 'p', model: 'm' }, logLines = null } = {}) {
+function setup(t, { overrides = {}, llm = llmOf(VALID_OUTPUT), selection = { provider: 'p', model: 'm' }, logLines = null, sessionsList = [] } = {}) {
   const { dir, db } = fresh(t)
   const config = configOf(dir, overrides)
   const { backend, writes } = fakeBackend(t, dir, db)
   const keeper = fakeKeeper(db)
-  const captureRef = { current: { advanceCalls: [], advance(sid, seq) { this.advanceCalls.push([sid, seq]) }, async triggerRecent() { return { ok: true, runId: 99 } } } }
+  const captureRef = { current: { advanceCalls: [], advance(sid, seq) { this.advanceCalls.push([sid, seq]) }, async triggerRecent() { return { ok: true, runId: 99 } }, listSessions() { return sessionsList } } }
   const wrap = installSessionWrap({ effect: (fn) => fn() }, {
     backend, config, keeper, captureRef, log: logLines ? (line) => logLines.push(String(line)) : () => {},
     getLlm: () => llm, getSelection: () => selection,
@@ -577,7 +577,7 @@ test('S1b status.queued：有排队时 count/position/phase=null；无排队为 
   assert.equal(queued.position, 1)
   assert.equal(queued.phase, null)
   assert.ok(queued.materialHash.length > 0)
-  assert.deepEqual(s.wrap.status().auto, { enabled: false, idleMinutes: 0 }, 'S1b auto 固定 false/0')
+  assert.deepEqual(s.wrap.status().auto, { enabled: true, idleMinutes: 10 }, 'S2 auto 接配置（默认 idle=true）')
 })
 
 test('S1b 队首完成后自动推进下一条（handler finally → pump）', async (t) => {
@@ -620,4 +620,33 @@ test('S1b 重启后 queued 清空：reconcile 标 queue_cleared，status.lastSki
   const run = s.withDb((db) => getRun(db, a.runId))
   assert.equal(run.state, 'failed')
   assert.equal(run.error, 'queue_cleared')
+})
+
+test('S2 per-session skip：skipAuto=1 时自动触发被拒，手动不受影响；sessions 回填 skipAuto', async (t) => {
+  const sessionsList = [{ sessionId: 'skip-1', lastActivity: 1, materialTurns: 2, open: false, hasMaterial: true }]
+  const s = setup(t, { sessionsList })
+  const set = s.wrap.setSessionPrefs({ sessionId: 'skip-1', skipAuto: true })
+  assert.equal(set.ok, true)
+  const auto = await s.wrap.onTrigger({ sessionId: 'skip-1', trigger: 'idle', material: MATERIAL, identity: { userId: 'u1' }, header: {}, hash: 'sid-h', now: Date.now() / 1000 })
+  assert.equal(auto.ok, false)
+  assert.equal(auto.reason, 'session_skipped')
+  const manual = await s.wrap.onTrigger({ sessionId: 'skip-1', trigger: 'manual', material: MATERIAL, identity: { userId: 'u1' }, header: {}, hash: 'sid-h2', now: Date.now() / 1000 })
+  assert.equal(manual.ok, true, '手动必须不受 skip 影响')
+  const sessions = s.wrap.sessions()
+  assert.equal(sessions.items[0].skipAuto, true)
+  assert.deepEqual(sessions.auto, { enabled: true, idleMinutes: 10 }, 'S2 auto 接真实配置')
+})
+
+test('S2 retrying 投影：run=failed + job 退避 queued → {attempt,max}', async (t) => {
+  const s = setup(t, { overrides: { wrap: { ...configOf('/tmp').wrap, maxRunsPerDay: 2 } } })
+  const out = await s.wrap.onTrigger({ sessionId: 'rt', trigger: 'manual', material: MATERIAL, identity: { userId: 'u1' }, header: {}, hash: 'rt-h', now: Date.now() / 1000 })
+  s.withDb((db) => {
+    db.prepare("UPDATE jobs SET state='queued', attempts=1, next_at=? WHERE kind='wrap'").run(Date.now() / 1000 + 60)
+    db.prepare("UPDATE wrap_runs SET state='failed', attempts=1, error='model_timeout' WHERE id=?").run(out.runId)
+  })
+  const retrying = s.wrap.status().latest.retrying
+  assert.deepEqual(retrying, { attempt: 2, max: 4 })
+  // 耗尽（attempts=4）不再显示重试。
+  s.withDb((db) => db.prepare("UPDATE jobs SET attempts=4 WHERE kind='wrap'").run())
+  assert.equal(s.wrap.status().latest.retrying, false)
 })

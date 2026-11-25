@@ -30,6 +30,13 @@ const wrap = {
       auto: { enabled: false, idleMinutes: 10 },
     }
   },
+  setSessionPrefs(args) {
+    calls.prefs = calls.prefs || []
+    calls.prefs.push(args)
+    if (!args.sessionId) return { ok: false, error: 'invalid_session' }
+    if (typeof args.skipAuto !== 'boolean') return { ok: false, error: 'invalid_value' }
+    return { ok: true, sessionId: args.sessionId, skipAuto: args.skipAuto }
+  },
   report(id) { calls.report.push(id); return reportResult },
 }
 
@@ -198,4 +205,27 @@ test('S1b POST /wrap 矩阵：新 run=202 + position；同材料 existing=200', 
   assert.equal(existing.body.existing, true)
   assert.equal(existing.body.state, 'running')
   assert.equal(existing.body.queued, undefined, 'existing 不得伪装成新入队')
+})
+
+test('S2 PATCH /wrap/session：skipAuto 透传与错误码（invalid_session/invalid_value）', async () => {
+  const ok = await fetch(base + '/whale-memory/api/wrap/session', {
+    method: 'PATCH', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ sessionId: 's1', skipAuto: true }),
+  })
+  assert.equal(ok.status, 200)
+  const body = await ok.json()
+  assert.deepEqual(body, { ok: true, sessionId: 's1', skipAuto: true })
+  assert.deepEqual(calls.prefs.at(-1), { sessionId: 's1', skipAuto: true })
+
+  const badSession = await fetch(base + '/whale-memory/api/wrap/session', {
+    method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ skipAuto: true }),
+  })
+  assert.equal(badSession.status, 400)
+  assert.equal((await badSession.json()).error, 'invalid_session')
+
+  const badValue = await fetch(base + '/whale-memory/api/wrap/session', {
+    method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId: 's1', skipAuto: 'yes' }),
+  })
+  assert.equal(badValue.status, 400)
+  assert.equal((await badValue.json()).error, 'invalid_value')
 })

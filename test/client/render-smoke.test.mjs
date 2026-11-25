@@ -353,3 +353,27 @@ test('S1b 进度点与重试：running 显示阶段、retrying 显示 N/4', asyn
   walkTree(tree, (node) => { if (node.props && node.props['aria-current'] === 'step') current = node })
   assert.ok(current, '当前阶段必须有 aria-current=step')
 })
+
+test('S2 自动/跳过开关：auto 勾选反映服务端，选中会话后出现 skip 开关', async () => {
+  const sessions = {
+    ok: true, auto: { enabled: true, idleMinutes: 10 },
+    items: [{ sessionId: 's1', lastActivity: 2, materialTurns: 3, open: false, hasMaterial: true, skipAuto: true, lastRunState: 'done' }],
+  }
+  const { slots, mount } = loadSlots(
+    { panel: { ...DEFAULT_CONFIG.panel, tab: 'overview' } },
+    { wrapStatus: { ok: true, supported: true, enabled: true, latest: null, recent: [], lastSkip: null }, wrapSessions: sessions },
+  )
+  const tree = await mount(slots.main, { t: (key) => key, locale: 'zh', pollMs: 1 })
+  const inputs = new Map()
+  walkTree(tree, (node) => { if (node.type === 'input' && node.props.id) inputs.set(node.props.id, node) })
+  assert.equal(inputs.get('wrap-auto-switch')?.props.checked, true, '自动开关必须反映 wrap.idle=true')
+  assert.equal(inputs.has('wrap-skip-switch'), false, '未选会话时不显示 skip 开关')
+  // 选中会话 → 出现 skip 开关且带当前值。
+  let select = null
+  walkTree(tree, (node) => { if (node.type === 'select') select = node })
+  select.props.onChange({ target: { value: 's1' } })
+  const after = await mount(slots.main, { t: (key) => key, locale: 'zh', pollMs: 1 })
+  const inputs2 = new Map()
+  walkTree(after, (node) => { if (node.type === 'input' && node.props.id) inputs2.set(node.props.id, node) })
+  assert.equal(inputs2.get('wrap-skip-switch')?.props.checked, true, 'skipAuto=true 必须显示为勾选')
+})

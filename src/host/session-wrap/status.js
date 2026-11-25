@@ -22,10 +22,14 @@ export function projectQueued(queue, focusRunId = null) {
   }
 }
 
-/** 最新 run 的 retrying 投影：S1b 恒 false（keeper 重试归 S2，attempt/max 由 S2 填）。 */
-export function projectRetrying(latest) {
+/** 最新 run 的 retrying 投影（S2）：run=failed 但 keeper job 还在退避排队 → {attempt,max}。 */
+export function projectRetrying(latest, job = null) {
   if (!latest || latest.state !== 'failed') return false
-  return latest.retrying || false
+  if (!job || String(job.state) !== 'queued') return false
+  const attempts = Number(job.attempts || 0)
+  const max = Number(job.maxAttempts || 4)
+  if (attempts <= 0 || attempts >= max) return false
+  return { attempt: Math.min(max, attempts + 1), max }
 }
 
 /**
@@ -41,6 +45,7 @@ export function projectRetrying(latest) {
 export function buildWrapStatus({
   supported, enabled, maxRunsPerDay, jobs, latest, rows, spool, capture, queue,
   runsToday, lastSkip = null, lastManual = null, focusRunId = null,
+  auto = { enabled: false, idleMinutes: 0 }, job = null,
 }) {
   if (!supported) {
     return { ok: true, supported: false, enabled: false, latest: null, reason: 'unsupported_backend' }
@@ -67,13 +72,13 @@ export function buildWrapStatus({
       switchReady: latest.switchReady || null,
       error: latest.error || '',
       reportAvailable: Boolean(latest.report_path),
-      retrying: projectRetrying(latest),
+      retrying: projectRetrying(latest, job),
     } : null,
     recent: Array.isArray(rows) ? rows : [],
     spool: spool || { files: 0, bytes: 0 },
     capture: capture || null,
     // S1b 契约：auto 固定 {enabled:false,idleMinutes:0}；S2 才接配置（避免“面板勾了但没接线”）。
-    auto: { enabled: false, idleMinutes: 0 },
+    auto: { enabled: Boolean(auto?.enabled), idleMinutes: Number(auto?.idleMinutes || 0) },
     lastSkip: lastSkip || null,
     lastManual: lastManual || null,
   }

@@ -33,6 +33,23 @@ export async function handleWrap({
     }
 
 
+    if (path === `${PREFIX}/wrap/session` && req.method === 'PATCH') {
+      if (!wrap || typeof wrap.setSessionPrefs !== 'function') return sendJson(res, 502, { ok: false, error: 'wrap_unavailable' })
+      const body = await readJson(req)
+      if (!body.ok) return sendJson(res, body.status, { ok: false, error: body.error })
+      const got = wrap.setSessionPrefs({
+        sessionId: typeof body.value?.sessionId === 'string' ? body.value.sessionId : '',
+        skipAuto: body.value?.skipAuto,
+      })
+      if (!got?.ok) {
+        const error = String(got?.error || 'db_error')
+        const status = error === 'invalid_session' || error === 'invalid_value' ? 400
+          : error === 'unsupported_backend' ? 501 : 502
+        return sendJson(res, status, { ok: false, error })
+      }
+      return sendJson(res, 200, got)
+    }
+
     if (path === `${PREFIX}/wrap/sessions` && req.method === 'GET') {
       if (!wrap || typeof wrap.sessions !== 'function') return sendJson(res, 502, { ok: false, error: 'wrap_unavailable' })
       const params = new URL(req.url, 'http://127.0.0.1').searchParams

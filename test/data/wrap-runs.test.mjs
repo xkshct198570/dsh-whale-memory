@@ -15,7 +15,7 @@ function db0() {
 
 const IDENT = { userId: 'u1', roleId: '', workspace: '/w' }
 
-test('schema v5：wrap_runs 表/幂等键/状态列齐', () => {
+test('schema v6：wrap_runs 表/状态列齐 + 去唯一键（允许失败重试新建行）+ prefs 表', () => {
   const db = db0()
   const cols = db.prepare('PRAGMA table_info(wrap_runs)').all().map((c) => c.name)
   for (const name of [
@@ -25,7 +25,10 @@ test('schema v5：wrap_runs 表/幂等键/状态列齐', () => {
     'error', 'created_at', 'updated_at',
   ]) assert.ok(cols.includes(name), `wrap_runs 缺列 ${name}`)
   const idx = db.prepare('PRAGMA index_list(wrap_runs)').all()
-  assert.ok(idx.some((row) => Number(row.unique) === 1), '必须有 (session_id,material_hash) 唯一索引')
+  assert.equal(idx.some((row) => Number(row.unique) === 1), false, 'v6 去掉唯一约束：失败耗尽后允许新 run 行')
+  assert.ok(idx.some((row) => String(row.name) === 'idx_wrap_runs_material'), '必须有 (session_id,material_hash,id) 查询索引')
+  const prefs = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='wrap_session_prefs'").get()
+  assert.ok(prefs, 'v6 必须有 wrap_session_prefs')
   db.close()
 })
 
@@ -125,4 +128,33 @@ test('createRun：缺键拒绝；同材料不同会话/不同材料不同会话�
   const c = createRun(db, { sessionId: 's6', materialHash: 'h7', trigger: 'manual', now: 1 })
   assert.equal(new Set([a.run.id, b.run.id, c.run.id]).size, 3)
   db.close()
+})
+
+test('S2/v6：failed 且 attempts 耗尽 + reset → 新建 run（新 runId），历史行保留', () => {
+  const db = db0()
+  const first = createRun(db, { sessionId: 's-ex', materialHash: 'h-ex', trigger: 'manual', identity: IDENT, now: 10 }).run
+  updateRun(db, first.id, { state: 'failed', attempts: 4, error: 'bad_json:bad_json' })
+  const next = createRun(db, { sessionId: 's-ex', materialHash: 'h-ex', trigger: 'manual', identity: IDENT, now: 11, reset: true, maxAttempts: 4 })
+  assert.equal(next.ok, true)
+  assert.equal(next.created, true, '耗尽后必须新建行')
+  assert.notEqual(next.run.id, first.id, '必须是新 runId')
+  assert.equal(next.run.state, 'queued')
+  // 历史行仍可查（不物理删）。
+  const old = db.prepare('SELECT state,attempts FROM wrap_runs WHERE id=?').get(first.id)
+  assert.equal(old.state, 'failed')
+  assert.equal(Number(old.attempts), 4)
+  // 同材料再点仍是同一新 run（幂等）。
+  const again = createRun(db, { sessionId: 's-ex', materialHash: 'h-ex', trigger: 'manual', identity: IDENT, now: 12, reset: true })
+  assert.equal(again.run.id, next.run.id)
+})
+
+test('S2/v6：未耗尽的 failed + reset → 重置同一行（保留断点、attempts 归零）', () => {
+  const db = db0()
+  const run = createRun(db, { sessionId: 's-mid', materialHash: 'h-mid', trigger: 'manual', identity: IDENT, now: 20 }).run
+  updateRun(db, run.id, { state: 'failed', attempts: 2, error: 'model_timeout', distilled_json: { items: [] } })
+  const reset = createRun(db, { sessionId: 's-mid', materialHash: 'h-mid', trigger: 'manual', identity: IDENT, now: 21, reset: true, maxAttempts: 4 })
+  assert.equal(reset.run.id, run.id)
+  assert.equal(reset.reset, true)
+  assert.equal(reset.run.state, 'queued')
+  assert.equal(Number(reset.run.attempts), 0)
 })

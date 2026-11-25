@@ -86,7 +86,8 @@ export function getRun(db, id) {
  * @returns {object|null}
  */
 export function findRun(db, sessionId, materialHash) {
-  const row = db.prepare('SELECT * FROM wrap_runs WHERE session_id=? AND material_hash=?')
+  // v6 去掉了表级 UNIQUE：同 session+hash 允许多行（失败重试耗尽后新建），取最近一行判幂等。
+  const row = db.prepare('SELECT * FROM wrap_runs WHERE session_id=? AND material_hash=? ORDER BY id DESC LIMIT 1')
     .get(textOf(sessionId, 200), textOf(materialHash, 64))
   return decodeRun(row)
 }
@@ -108,7 +109,7 @@ export function findRun(db, sessionId, materialHash) {
  *   reset:boolean, error?:string }}
  */
 export function createRun(db, {
-  sessionId, materialHash, trigger, identity = {}, now, reset = false,
+  sessionId, materialHash, trigger, identity = {}, now, reset = false, maxAttempts = 4,
 } = {}) {
   const sid = textOf(sessionId, 200)
   const hash = textOf(materialHash, 64)
@@ -119,15 +120,16 @@ export function createRun(db, {
     roleId: textOf(identity.roleId, 64),
     workspace: textOf(identity.workspace, 64),
   }
-  const info = db.prepare(`INSERT OR IGNORE INTO wrap_runs
+  const insert = () => db.prepare(`INSERT INTO wrap_runs
     (session_id,material_hash,state,trigger,user_id,role_id,workspace,created_at,updated_at)
     VALUES (?,?,'queued',?,?,?,?,?,?)`).run(
     sid, hash, textOf(trigger, 32) || 'manual', ident.userId, ident.roleId, ident.workspace, ts, ts,
   )
   const existing = findRun(db, sid, hash)
-  if (!existing) return { ok: false, run: null, created: false, active: false, done: false, reset: false, error: 'insert_failed' }
-  if (Number(info?.changes || 0) > 0) {
-    return { ok: true, run: existing, created: true, active: true, done: false, reset: false }
+  if (!existing) {
+    const info = insert()
+    const run = getRun(db, Number(info.lastInsertRowid))
+    return { ok: true, run, created: true, active: true, done: false, reset: false }
   }
 
   if (existing.state === 'queued' || existing.state === 'running') {
@@ -138,6 +140,14 @@ export function createRun(db, {
   }
   if (!reset) {
     return { ok: true, run: existing, created: false, active: false, done: false, reset: false }
+  }
+
+  // S2 判据（总纲 §5.2）：失败且 attempts 已耗尽 → 新建 run（新 runId），历史行保留可回溯；
+  // attempts 未耗尽时重置同一行，继续享用已蒸馏断点，不重复烧模型。
+  if (existing.state === 'failed' && Number(existing.attempts || 0) >= Math.max(1, Number(maxAttempts) || 4)) {
+    const info = insert()
+    const run = getRun(db, Number(info.lastInsertRowid))
+    return { ok: true, run, created: true, active: true, done: false, reset: false, exhausted: true }
   }
 
   // 终态重试：保留 phase/distilled_json（若已蒸馏），清掉错误与 job 指针，attempts 归零重新拿预算。

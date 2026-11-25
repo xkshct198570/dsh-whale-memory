@@ -22,6 +22,7 @@ import { bool, num, value } from '../shared/config-values.js'
 import { createProposal } from '../core/rule-proposal.js'
 import { getRun, latestRun, markRunAttempt, countRunsToday } from '../core/wrap-runs.js'
 import { createWrapQueue } from '../core/wrap-queue.js'
+import { setSkipAuto, skipAutoMap, skipAutoOf } from '../core/wrap-prefs.js'
 import {
   createTriggerService, finishOrThrow, readJsonFile, reconcileRuns,
   spoolStats, spoolPathOf, sweepSpool as sweepSpoolFiles, resolveDataDir,
@@ -284,6 +285,10 @@ export function installSessionWrap(ctx, {
     const capture = captureRef?.current
     const items = capture && typeof capture.listSessions === 'function' ? capture.listSessions() : []
     const latestBySession = new Map()
+    let skipMap = new Map()
+    if (supported) {
+      try { skipMap = withDb((db) => skipAutoMap(db)) } catch { skipMap = new Map() }
+    }
     if (supported && items.length > 0) {
       try {
         const scoped = identity && typeof identity === 'object'
@@ -303,13 +308,12 @@ export function installSessionWrap(ctx, {
         const row = latestBySession.get(item.sessionId)
         return {
           ...item,
-          skipAuto: false, // S2：wrap_session_prefs 落地后回填
+          skipAuto: skipMap.get(item.sessionId) === true,
           lastRunId: row ? Number(row.id) : null,
           lastRunState: row ? String(row.state) : '',
         }
       }),
-      // S1b 契约：auto 固定 {false,0}；S2 接配置文件后回填真实开关。
-      auto: { enabled: false, idleMinutes: 0 },
+      auto: { enabled: bool(config?.wrap?.idle, false), idleMinutes: num(config?.wrap?.idleMinutes, 10) },
     }
   }
 
@@ -337,11 +341,17 @@ export function installSessionWrap(ctx, {
     } catch (err) {
       return { ok: false, error: 'db_error', detail: String(err?.message || err).slice(0, 160) }
     }
+    let job = null
+    if (latest && latest.job_id) {
+      try { job = withDb((db) => db.prepare('SELECT id,state,attempts FROM jobs WHERE id=?').get(Number(latest.job_id))) } catch { job = null }
+    }
     return buildWrapStatus({
       supported: true,
       enabled: wrapCfg().enabled,
       maxRunsPerDay: wrapCfg().maxRunsPerDay,
       jobs: trigger.activeWrapJobs(),
+      auto: { enabled: wrapCfg().idle, idleMinutes: wrapCfg().idleMinutes },
+      job,
       latest,
       rows,
       spool: spoolStats(spoolDir()),
@@ -352,6 +362,24 @@ export function installSessionWrap(ctx, {
       lastManual: state.lastManual,
       focusRunId,
     })
+  }
+
+  /**
+   * 设置“该会话跳过自动收尾”（S2）：落 wrap_session_prefs；缺表/坏库明确错误。
+   * 只影响空闲/会话关闭自动触发，手动不受影响。
+   */
+  function setSessionPrefs({ sessionId = '', skipAuto = undefined } = {}) {
+    if (!supported) return { ok: false, error: 'unsupported_backend' }
+    const sid = String(sessionId || '').trim()
+    if (!sid || sid.length > 200) return { ok: false, error: 'invalid_session' }
+    if (typeof skipAuto !== 'boolean') return { ok: false, error: 'invalid_value' }
+    let got = null
+    try { got = withDb((db) => setSkipAuto(db, sid, skipAuto, now())) } catch (err) {
+      return { ok: false, error: `db_error:${String(err?.message || err).slice(0, 120)}` }
+    }
+    if (!got || got.ok !== true) return { ok: false, error: got?.error || 'db_error' }
+    log(`[whale-memory] wrap session skipAuto=${skipAuto ? 1 : 0} session=${sid}`)
+    return { ok: true, sessionId: sid, skipAuto: Boolean(skipAuto) }
   }
 
   /** 报告读取：路径穿越防护在 reportRead 内。 */
@@ -444,7 +472,7 @@ export function installSessionWrap(ctx, {
   }
 
   return {
-    onTrigger: trigger.onTrigger, manual, status, sessions, report, sweepSpool, sweepStorage, reconcile, execute, pumpQueue,
+    onTrigger: trigger.onTrigger, manual, status, sessions, setSessionPrefs, report, sweepSpool, sweepStorage, reconcile, execute, pumpQueue,
     canAutoTrigger, supported, dispose,
   }
 }

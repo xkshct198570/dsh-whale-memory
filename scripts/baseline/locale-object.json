@@ -969,7 +969,13 @@
     "overview.wrapSkipRate": "已达今日自动收尾上限",
     "err.queue_cleared": "收尾队列已随重启清理，请重新发起",
     "err.session_queue_full": "本会话已有一条排队，完成后再试",
-    "err.busy_queue_full": "收尾队列已满，请稍后重试"
+    "err.busy_queue_full": "收尾队列已满，请稍后重试",
+    "overview.wrapAuto": "自动收尾",
+    "overview.wrapAutoDesc": "空闲 {n} 分钟触发 · 会花 token",
+    "overview.wrapSkipAuto": "跳过自动收尾",
+    "overview.wrapSkipAutoDesc": "只影响空闲/关闭自动触发，手动仍可收尾",
+    "overview.wrapSessionSkipped": "已跳过自动",
+    "err.invalid_session": "会话 id 不合法"
   },
   "en": {
     "meta.title": "Whale Memory",
@@ -1941,7 +1947,13 @@
     "overview.wrapSkipRate": "Daily auto-wrap limit reached",
     "err.queue_cleared": "The wrap queue was cleared by restart; start again",
     "err.session_queue_full": "This session already has one queued run",
-    "err.busy_queue_full": "The wrap queue is full; try again later"
+    "err.busy_queue_full": "The wrap queue is full; try again later",
+    "overview.wrapAuto": "Auto wrap",
+    "overview.wrapAutoDesc": "After {n} min idle · uses model tokens",
+    "overview.wrapSkipAuto": "Skip auto wrap",
+    "overview.wrapSkipAutoDesc": "Only affects idle/dispose triggers; manual still works",
+    "overview.wrapSessionSkipped": "auto skipped",
+    "err.invalid_session": "Invalid session id"
   },
   "ja": {
     "meta.title": "ホエールメモリ",
@@ -2913,6 +2925,12 @@
     "overview.wrapSkipRate": "本日の自動収尾上限に達しました",
     "err.queue_cleared": "再起動で収尾キューが消去されました。再度実行してください",
     "err.session_queue_full": "このセッションには既に待機中の実行があります",
-    "err.busy_queue_full": "収尾キューがいっぱいです。後で再試行してください"
+    "err.busy_queue_full": "収尾キューがいっぱいです。後で再試行してください",
+    "overview.wrapAuto": "自動収尾",
+    "overview.wrapAutoDesc": "{n} 分のアイドル後に実行 · トークンを消費",
+    "overview.wrapSkipAuto": "自動収尾をスキップ",
+    "overview.wrapSkipAutoDesc": "アイドル/クローズ時のみ。手動は常に可能",
+    "overview.wrapSessionSkipped": "自動スキップ中",
+    "err.invalid_session": "セッション ID が不正です"
   }
 }

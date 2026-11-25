@@ -25,7 +25,7 @@
  */
 import { qualityOrderSql } from './node-rank.js'
 
-export const SCHEMA_VERSION = 5
+export const SCHEMA_VERSION = 6
 
 /**
  * 对既有表的加法列：[表, 列, 类型]。迁移与 DDL 必须保持一致。
@@ -245,11 +245,18 @@ CREATE TABLE IF NOT EXISTS wrap_runs (
   switch_ready_json TEXT,
   error             TEXT NOT NULL DEFAULT '',
   created_at        REAL NOT NULL,
-  updated_at        REAL NOT NULL,
-  UNIQUE (session_id, material_hash)
+  updated_at        REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_wrap_runs_created ON wrap_runs(created_at);
 CREATE INDEX IF NOT EXISTS idx_wrap_runs_state   ON wrap_runs(state, updated_at);
+CREATE INDEX IF NOT EXISTS idx_wrap_runs_material ON wrap_runs(session_id, material_hash, id);
+
+-- v6：每会话的自动收尾开关（skip_auto=1 表示不参与空闲/关闭自动触发；手动不受影响）。
+CREATE TABLE IF NOT EXISTS wrap_session_prefs (
+  session_id TEXT PRIMARY KEY,
+  skip_auto  INTEGER NOT NULL DEFAULT 0,
+  updated_at REAL NOT NULL
+);
 `
 
 /**
@@ -351,6 +358,62 @@ function migrateAdditiveColumns(db) {
 }
 
 /**
+ * v6 迁移：去掉 wrap_runs 的 `UNIQUE(session_id, material_hash)`。
+ *
+ * 为什么必须去掉（S2 判据）：失败重试耗尽后用户再点，要“新建 run、新 runId”保留历史；
+ * 表级 UNIQUE 会把第二次插入直接拒绝。幂等改由代码判（同 session+hash 取最近一行）。
+ * SQLite 不支持 DROP CONSTRAINT，只能重建表：列顺序与原表一致，事务内完成，
+ * 索引重建；迁移前 openDb 已按版本差做整库快照（fail-closed 由调用方决定是否阻断）。
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @returns {{rebuilt:boolean}}
+ */
+export function migrateWrapRunsV6(db) {
+  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='wrap_runs'").get()
+  if (!row || !/UNIQUE\s*\(\s*session_id/i.test(String(row.sql || ''))) return { rebuilt: false }
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    db.exec(`CREATE TABLE wrap_runs_v6 (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id        TEXT NOT NULL,
+      material_hash     TEXT NOT NULL,
+      state             TEXT NOT NULL DEFAULT 'queued'
+                        CHECK (state IN ('queued','running','done','failed','skipped')),
+      trigger           TEXT NOT NULL DEFAULT 'manual',
+      user_id           TEXT NOT NULL DEFAULT '',
+      role_id           TEXT NOT NULL DEFAULT '',
+      workspace         TEXT NOT NULL DEFAULT '',
+      job_id            INTEGER,
+      attempts          INTEGER NOT NULL DEFAULT 0,
+      phase             TEXT NOT NULL DEFAULT 'created'
+                        CHECK (phase IN ('created','distilled','written','reported','done')),
+      summary           TEXT NOT NULL DEFAULT '',
+      distilled_json    TEXT,
+      candidates        INTEGER NOT NULL DEFAULT 0,
+      rule_proposals    INTEGER NOT NULL DEFAULT 0,
+      open_loops        INTEGER NOT NULL DEFAULT 0,
+      report_path       TEXT NOT NULL DEFAULT '',
+      hygiene_json      TEXT,
+      switch_ready_json TEXT,
+      error             TEXT NOT NULL DEFAULT '',
+      created_at        REAL NOT NULL,
+      updated_at        REAL NOT NULL
+    )`)
+    db.exec('INSERT INTO wrap_runs_v6 SELECT * FROM wrap_runs')
+    db.exec('DROP TABLE wrap_runs')
+    db.exec('ALTER TABLE wrap_runs_v6 RENAME TO wrap_runs')
+    db.exec('CREATE INDEX IF NOT EXISTS idx_wrap_runs_created ON wrap_runs(created_at)')
+    db.exec('CREATE INDEX IF NOT EXISTS idx_wrap_runs_state ON wrap_runs(state, updated_at)')
+    db.exec('CREATE INDEX IF NOT EXISTS idx_wrap_runs_material ON wrap_runs(session_id, material_hash, id)')
+    db.exec('COMMIT')
+    return { rebuilt: true }
+  } catch (err) {
+    try { db.exec('ROLLBACK') } catch { /* 回滚失败不遮蔽原始错误 */ }
+    throw err
+  }
+}
+
+/**
  * 执行完整 DDL 并写入 meta.schema_version。
  * 幂等：重复调用不报错；若库内版本高于本代码版本 → schema_incompatible（只增不减）。
  * @param {import('node:sqlite').DatabaseSync} db
@@ -366,6 +429,7 @@ export function ensureSchema(db) {
     throw new Error(`schema_incompatible: db version ${current} > code version ${SCHEMA_VERSION}`)
   }
   migrateAdditiveColumns(db)
+  migrateWrapRunsV6(db)
   db.exec(PINNED_INDEX_SQL)
   // v4：先收敛重复活跃行，再建唯一索引；索引建不起来时退化为普通索引（旧脏库不阻断启动），
   // 由 backend 把 deduped/unique 挂到 health 观测。

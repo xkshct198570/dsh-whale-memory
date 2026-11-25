@@ -10,6 +10,7 @@ import { dirname, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { value } from '../../shared/config-values.js'
 import { countRunsToday, createRun, getRun, updateRun } from '../../core/wrap-runs.js'
+import { skipAutoOf } from '../../core/wrap-prefs.js'
 
 /** 数据目录：优先真实库文件所在目录（dataDir 空时 openDb 会落到 DSH_HOME），
  * 这样 spool/reports 与 memory.db 永远同根，灾备/清理不会两处漂移。
@@ -204,6 +205,14 @@ export function createTriggerService({ withDb, keeper, captureRef, wrapCfg, spoo
     if (!cfg.enabled) return { ok: false, reason: 'wrap_disabled' }
     const tx = String(trigger || 'manual')
     const auto = tx === 'idle' || tx === 'disposed'
+    // S2：per-session 跳过只拦自动触发（空闲/关闭）；手动/显式始终可用。
+    if (auto) {
+      try {
+        if (withDb((db) => skipAutoOf(db, String(sessionId)))) {
+          return { ok: false, reason: 'session_skipped' }
+        }
+      } catch { /* 读 prefs 失败按不跳过（收尾不能被配置读失败拖死） */ }
+    }
     // 同会话恒定 ≤1 个未完成 run（不同 material）：队列只记“未开跑”的项，正在跑的已出队，
     // 所以这里必须查库（总纲 §5.2 的 session_queue_full 不能靠内存队列单独判）。
     if (!auto) {

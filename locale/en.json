@@ -972,5 +972,11 @@
   "overview.wrapSkipRate": "Daily auto-wrap limit reached",
   "err.queue_cleared": "The wrap queue was cleared by restart; start again",
   "err.session_queue_full": "This session already has one queued run",
-  "err.busy_queue_full": "The wrap queue is full; try again later"
+  "err.busy_queue_full": "The wrap queue is full; try again later",
+  "overview.wrapAuto": "Auto wrap",
+  "overview.wrapAutoDesc": "After {n} min idle · uses model tokens",
+  "overview.wrapSkipAuto": "Skip auto wrap",
+  "overview.wrapSkipAutoDesc": "Only affects idle/dispose triggers; manual still works",
+  "overview.wrapSessionSkipped": "auto skipped",
+  "err.invalid_session": "Invalid session id"
 }

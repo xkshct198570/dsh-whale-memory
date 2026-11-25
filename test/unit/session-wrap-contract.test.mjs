@@ -7,11 +7,11 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { installSessionWrap } from '../../src/host/session-wrap.js'
 
-test('返回契约：installSessionWrap 暴露 13 个键（含 sessions/pumpQueue/execute/onTrigger/sweepStorage）', () => {
+test('返回契约：installSessionWrap 暴露 14 个键（含 sessions/setSessionPrefs/pumpQueue/execute/onTrigger/sweepStorage）', () => {
   const wrap = installSessionWrap({}, { backend: null, config: {} })
   assert.equal(wrap.supported, false)
   const expected = [
-    'onTrigger', 'manual', 'status', 'sessions', 'report', 'sweepSpool', 'sweepStorage', 'pumpQueue',
+    'onTrigger', 'manual', 'status', 'sessions', 'report', 'sweepSpool', 'sweepStorage', 'pumpQueue', 'setSessionPrefs',
     'reconcile', 'execute', 'canAutoTrigger', 'supported', 'dispose',
   ]
   assert.deepEqual(Object.keys(wrap).sort(), expected.sort())

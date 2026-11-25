@@ -138,6 +138,8 @@ export const ERROR_TABLE = Object.freeze({
   session_queue_full: mapped(409, 'session_queue_full'),
   busy_queue_full: mapped(409, 'busy_queue_full'),
   queue_rejected: statusOnly(409),
+  invalid_session: mapped(400, 'invalid_session'),
+  invalid_value: mapped(400, 'invalid_value'),
   unsupported_backend: mapped(501, 'unsupported_backend'),
   wrap_disabled: mapped(409, 'wrap_disabled'),
   wrap_unavailable: mapped(502, 'wrap_unavailable'),

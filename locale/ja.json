@@ -972,5 +972,11 @@
   "overview.wrapSkipRate": "本日の自動収尾上限に達しました",
   "err.queue_cleared": "再起動で収尾キューが消去されました。再度実行してください",
   "err.session_queue_full": "このセッションには既に待機中の実行があります",
-  "err.busy_queue_full": "収尾キューがいっぱいです。後で再試行してください"
+  "err.busy_queue_full": "収尾キューがいっぱいです。後で再試行してください",
+  "overview.wrapAuto": "自動収尾",
+  "overview.wrapAutoDesc": "{n} 分のアイドル後に実行 · トークンを消費",
+  "overview.wrapSkipAuto": "自動収尾をスキップ",
+  "overview.wrapSkipAutoDesc": "アイドル/クローズ時のみ。手動は常に可能",
+  "overview.wrapSessionSkipped": "自動スキップ中",
+  "err.invalid_session": "セッション ID が不正です"
 }
