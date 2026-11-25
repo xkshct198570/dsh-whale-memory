@@ -73,25 +73,37 @@ before(() => {
 
 after(() => nodeFs.rmSync(dirname(root), { recursive: true, force: true }))
 
-test('apply 成功后清缓存，planHash 错不清', async () => {
+test('apply 成功后清缓存并落盘，plan_hash_mismatch 不清', async () => {
+  cleared = 0
+  const mdCount = () => nodeFs.readdirSync(root).filter((name) => name.endsWith('.md')).length
+  const before = mdCount()
   const made = await post('/whale-memory/api/rules/propose', { text: '以后都别把召回缓存当持久层' })
   assert.equal(made.status, 200, JSON.stringify(made.body))
   const id = made.body.proposal.id
   const planned = await post('/whale-memory/api/rules/plan', { id })
   assert.equal(planned.status, 200, JSON.stringify(planned.body))
+  // hash 必须先在 pending 状态下打错：accepted 后 apply 会先被 status 拦成 proposal_not_pending。
+  const bad = await post('/whale-memory/api/rules/apply', { id, planHash: 'deadbeefdeadbeef' })
+  assert.equal(bad.status, 409, JSON.stringify(bad.body))
+  assert.equal(bad.body.error, 'plan_hash_mismatch', JSON.stringify(bad.body))
+  assert.equal(cleared, 0, 'apply 失败不得清缓存')
   const ok = await post('/whale-memory/api/rules/apply', { id, planHash: planned.body.plan.planHash })
   assert.equal(ok.status, 200, JSON.stringify(ok.body))
+  assert.equal(nodeFs.existsSync(join(root, `${ok.body.applied.key}.md`)), true, 'apply 必须回写落盘 key')
+  assert.equal(mdCount(), before + 1, 'apply 成功必须真落盘一条规则（不是只清缓存）')
   assert.equal(cleared, 1, 'apply 成功后必须清召回缓存')
-  const bad = await post('/whale-memory/api/rules/apply', { id, planHash: 'deadbeefdeadbeef' })
-  assert.equal(bad.status, 409)
-  assert.equal(cleared, 1, 'apply 失败不得清缓存')
 })
 
-test('restore-default 成功后清缓存，非法 key 不清', async () => {
+test('restore-default 成功后清缓存并落盘，非法 key 不清', async () => {
+  cleared = 0
+  const target = join(root, 'iron-rule-9.md')
+  nodeFs.rmSync(target, { force: true })
   const ok = await post('/whale-memory/api/rules/restore-default', { key: 'iron-rule-9' })
   assert.equal(ok.status, 200, JSON.stringify(ok.body))
-  assert.equal(cleared, 2, 'restore-default 成功后必须清召回缓存')
+  assert.equal(ok.body.restored.key, 'iron-rule-9', 'restore 必须回写恢复的规则')
+  assert.equal(nodeFs.existsSync(target), true, 'restore 成功必须真写盘（不是只回 ok）')
+  assert.equal(cleared, 1, 'restore-default 成功后必须清召回缓存')
   const bad = await post('/whale-memory/api/rules/restore-default', { key: '../etc/passwd' })
   assert.equal(bad.status, 422)
-  assert.equal(cleared, 2, 'restore-default 失败不得清缓存')
+  assert.equal(cleared, 1, 'restore-default 失败不得清缓存')
 })
