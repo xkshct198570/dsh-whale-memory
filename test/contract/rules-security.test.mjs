@@ -3,7 +3,7 @@
  * - 非 JSON Content-Type → 415；跨源 Origin / 外部 Host → 403；本机 curl（无 Origin）放行。
  * - 拒绝必须发生在副作用之前（text/plain + Origin: evil 打 purge 不得删文件）。
  * - GET /rules 带 origin + capabilities；proposals 支持 pending,needs_manual；
- *   /rules/plan 与 /rules/restore-default 在 core 未上线时显式 501 降级，上线后按契约返回。
+ *   /rules/plan 与 /rules/restore-default：能力可探测且在线时按契约返回真实产物；模块缺失才显式 501。
  */
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
@@ -187,7 +187,8 @@ test('GET /rules：每条规则带 origin，响应带 capabilities', async () =>
   const caps = await rulesCapabilities()
   assert.deepEqual(got.body.capabilities, caps, 'capabilities 必须与能力探测同源')
   assert.equal(typeof caps.plan, 'boolean')
-  assert.equal(typeof caps.restoreDefault, 'boolean')
+  // 动态 import 路径必须真解析到 rule-defaults：写错时能力静默 false、restore 走 501。
+  assert.equal(caps.restoreDefault, true, 'restoreDefault 能力必须可用（loadDefaultRestore 路径正确）')
 })
 
 test('GET /rules/proposals：status=pending,needs_manual 同时返回；单值过滤仍生效', async () => {
@@ -217,39 +218,38 @@ test('GET /rules/proposals：status=pending,needs_manual 同时返回；单值�
   assert.equal(again.body.items.length >= 1, true)
 })
 
-test('POST /rules/plan：非法/缺失 id 404；core 未上线 501 降级，上线后按契约返回', async () => {
+test('POST /rules/plan：非法/缺失 id 404；能力在线必须 200 返回 plan（静默降级即红）', async () => {
   const missing = await call('POST', '/whale-memory/api/rules/plan', { id: 'p1234567890123_abcd1234' })
   assert.equal(missing.status, 404)
   assert.equal(missing.body.error, 'proposal_not_found')
 
   const made = await call('POST', '/whale-memory/api/rules/propose', { text: '以后都先写测试再改实现' })
   assert.equal(made.status, 200)
+  // 能力必须按当前树实测在线：模块路径搬家/缺失时 existsSync 会变 false，静默 501 即红。
+  const caps = await rulesCapabilities()
+  assert.equal(caps.plan, true, 'rule-plan.js 必须可探测（路径搬家不得静默降级）')
   const got = await call('POST', '/whale-memory/api/rules/plan', { id: made.body.proposal.id })
-  if (got.status === 501) {
-    assert.equal(got.body.error, 'plan_unavailable')
-    assert.equal(got.body.degraded, true)
-  } else {
-    assert.equal(got.status, 200, JSON.stringify(got.body))
-    assert.ok(got.body.plan && typeof got.body.plan === 'object', '上线后必须返回 plan')
-    assert.equal(typeof got.body.plan.planHash, 'string')
-    assert.ok(Array.isArray(got.body.plan.files))
-  }
+  assert.equal(got.status, 200, JSON.stringify(got.body))
+  assert.notEqual(got.body.degraded, true, '能力在线不得返回降级标记')
+  assert.ok(got.body.plan && typeof got.body.plan === 'object', '能力在线必须返回 plan')
+  assert.equal(typeof got.body.plan.planHash, 'string')
+  assert.ok(Array.isArray(got.body.plan.files))
 })
 
-test('POST /rules/restore-default：能力未上线 501；上线后 200；非法 key 422', async () => {
+test('POST /rules/restore-default：能力在线 200；非法 key 422；未登记 key 404', async () => {
   const caps = await rulesCapabilities()
+  assert.equal(caps.restoreDefault, true, 'rule-defaults.js 必须可探测（路径搬家不得静默降级）')
   const badKey = await call('POST', '/whale-memory/api/rules/restore-default', { key: '../etc/passwd' })
   assert.equal(badKey.status, 422)
   assert.equal(badKey.body.error, 'invalid_key')
 
-  const got = await call('POST', '/whale-memory/api/rules/restore-default', { key: 'rule-1' })
-  if (caps.restoreDefault) {
-    assert.ok([200, 404, 422].includes(got.status), `能力上线后返回 ${got.status}`)
-  } else {
-    assert.equal(got.status, 501)
-    assert.equal(got.body.error, 'restore_unavailable')
-    assert.equal(got.body.degraded, true)
-  }
+  const unknown = await call('POST', '/whale-memory/api/rules/restore-default', { key: 'iron-rule-999' })
+  assert.equal(unknown.status, 404)
+  assert.equal(unknown.body.error, 'default_not_found')
+
+  const got = await call('POST', '/whale-memory/api/rules/restore-default', { key: 'iron-rule-7' })
+  assert.equal(got.status, 200, JSON.stringify(got.body))
+  assert.equal(got.body.ok, true)
 })
 
 test('import-legacy 错误码分级：非法 key 422（不再一律 403）', async () => {

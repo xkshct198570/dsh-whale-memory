@@ -33,7 +33,11 @@
     "README.md",
     "README.zh.md",
     "LICENSE",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "lib/client-src",
+    "scripts/build-client.mjs",
+    "scripts/lint-size.mjs",
+    "scripts/check-deps.mjs"
   ],
   "engines": {
     "node": ">=22.13.0",
@@ -47,7 +51,7 @@
     "sqlite"
   ],
   "scripts": {
-    "test": "node --test test/unit/*.test.mjs test/contract/*.test.mjs test/hook/*.test.mjs test/data/*.test.mjs test/worker/*.test.mjs test/lifecycle/*.test.mjs test/sync/*.test.mjs test/client/*.test.mjs test/integration/*.test.mjs",
+    "test": "node scripts/run-tests.mjs",
     "test:unit": "node --test test/unit/*.test.mjs",
     "test:contract": "node --test test/contract/*.test.mjs",
     "test:hook": "node --test test/hook/*.test.mjs",
@@ -62,7 +66,14 @@
     "eval": "node scripts/eval.mjs",
     "test:integration": "node --test test/integration/*.test.mjs",
     "manual": "node scripts/manual-build.mjs",
-    "manual:check": "node scripts/manual-build.mjs --check"
+    "manual:check": "node scripts/manual-build.mjs --check",
+    "build:client": "node scripts/build-client.mjs",
+    "check:client": "node scripts/build-client.mjs --check",
+    "lint:size": "node scripts/lint-size.mjs",
+    "check:deps": "node scripts/check-deps.mjs",
+    "pretest": "node scripts/i18n-check.mjs --check && node scripts/manual-build.mjs --check && node scripts/build-client.mjs --check && node scripts/check-deps.mjs && node scripts/check-shared-drift.mjs --check && node scripts/compare-baseline.mjs --no-tests",
+    "posttest": "node scripts/check-test-counts.mjs",
+    "prepack": "node scripts/i18n-check.mjs --check 1>&2 && node scripts/manual-build.mjs --check 1>&2 && node scripts/build-client.mjs --check 1>&2"
   },
   "dsh": {
     "manifestVersion": 1,
@@ -82,7 +93,8 @@
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.1.0",
-    "@deepseek-ai/cordis-plugin-timer": "^1.2.0"
+    "@deepseek-ai/cordis-plugin-timer": "^1.2.0",
+    "acorn": "8.14.0"
   },
   "author": "大肥鱼",
   "repository": {

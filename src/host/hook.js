@@ -20,7 +20,7 @@
 import { readdirSync, realpathSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { deriveWorkspace, resolveIdentity } from './identity.js'
-import { bool, num, value } from './config-values.js'
+import { bool, num, value } from '../shared/config-values.js'
 import { judgeReply } from '../core/adoption.js'
 import { listRules } from '../core/rule-store.js'
 import { isRuleStatement } from '../core/rules.js'

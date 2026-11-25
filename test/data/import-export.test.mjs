@@ -8,9 +8,8 @@
  * - >500 字：多规则按边界拆分（tags 带 split_from、writes(SPLIT)），单规则拒绝并给出 reasons。
  * - 导入事务末尾 FTS 一致性闸：nodes 与两张 FTS 行数不等则整批回滚。
  * - schema v1 → v2 幂等迁移（writes.payload），高版本仍拒绝。
- * - 内存闸门优先 MemAvailable（含 page cache），压力判定的边界可注入。
  *
- * 说明：memory-guard 的两条用例也放这里，因为本次修复的文件白名单只允许新建本测试文件。
+ * 内存闸门用例在 test/unit/shared-memory-guard.test.mjs（P2a 搬迁后独立）。
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -21,7 +20,6 @@ import { DatabaseSync } from 'node:sqlite'
 import { LocalBackend } from '../../src/core/backend.js'
 import { ensureSchema, SCHEMA_VERSION } from '../../src/core/schema.js'
 import { now } from '../../src/core/db.js'
-import { availableBytes, memoryPressure, FREE_FLOOR, RSS_CEIL } from '../../src/host/memory-guard.js'
 
 const ident = { userId: 'u1', roleId: '', workspace: 'web' }
 
@@ -281,34 +279,6 @@ test('ensureSchema：v1 库补 writes.payload 并升到 v2；重复执行幂等�
   } finally {
     db.close()
   }
-})
-
-// ---------------------------------------------------------------------------
-// 6. 内存闸门口径（Fix 9）
-// ---------------------------------------------------------------------------
-
-test('内存闸门：优先解析 /proc/meminfo 的 MemAvailable，读不到回落 freemem', () => {
-  const meminfo = 'MemTotal:       16384000 kB\nMemFree:         1000000 kB\nMemAvailable:    4096000 kB\n'
-  assert.equal(availableBytes(() => meminfo), 4096000 * 1024)
-
-  // 没有 MemAvailable 行 / 读取抛错：回落 os.freemem()（非负数值）
-  for (const reader of [() => 'MemTotal: 1000 kB\n', () => { throw new Error('no proc') }]) {
-    const fallback = availableBytes(reader)
-    assert.equal(Number.isFinite(fallback), true)
-    assert.ok(fallback >= 0)
-  }
-})
-
-test('内存闸门：压力判定边界（free < 500MB 或 rss > 2GB，等号不算压力）', () => {
-  const noRss = () => 1
-  assert.equal(memoryPressure({ freeBytes: () => FREE_FLOOR - 1, rssBytes: noRss }).stress, true)
-  assert.equal(memoryPressure({ freeBytes: () => FREE_FLOOR, rssBytes: noRss }).stress, false)
-  assert.equal(memoryPressure({ freeBytes: () => FREE_FLOOR * 10, rssBytes: () => RSS_CEIL + 1 }).stress, true)
-  assert.equal(memoryPressure({ freeBytes: () => FREE_FLOOR * 10, rssBytes: () => RSS_CEIL }).stress, false)
-
-  const pressure = memoryPressure({ freeBytes: FREE_FLOOR - 1024, rssBytes: 1024 })
-  assert.equal(pressure.stress, true)
-  assert.equal(pressure.freeMB, Math.round((FREE_FLOOR - 1024) / 1048576))
 })
 
 test('error_details 最多 20 条（不塞全文，只留序号/原因/哈希前缀）', async () => {

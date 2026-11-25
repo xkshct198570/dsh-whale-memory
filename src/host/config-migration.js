@@ -17,6 +17,7 @@
  *   AI_ROUTER_HUB_ALLOW_REMOTE     → panel.allowRemote
  */
 import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { resolveRefsDeep } from '../shared/resolve-refs.js'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { getMeta, setMeta } from '../core/db.js'
@@ -111,20 +112,6 @@ export function readLegacyEnv(env = process.env) {
   }
 
   return keys.length > 0 ? { patch, keys } : null
-}
-
-/** schemastery 的 `.volatile()` 值可能是 Ref：迁移只写纯值。 */
-function plainTree(input) {
-  if (input && typeof input === 'object' && typeof input.get === 'function' && !Array.isArray(input)) {
-    return plainTree(input.get())
-  }
-  if (Array.isArray(input)) return input.map((item) => plainTree(item))
-  if (input && typeof input === 'object') {
-    const out = {}
-    for (const [key, val] of Object.entries(input)) out[key] = plainTree(val)
-    return out
-  }
-  return input
 }
 
 /** 叶子深合并：只覆盖补丁里提交的叶子，未提交字段原样保留（与 /config POST 同口径）。 */
@@ -250,7 +237,7 @@ export function installConfigMigration(ctx, {
       }
 
       await editor.edit(entry, (current) => {
-        const plain = plainTree(current || {})
+        const plain = resolveRefsDeep(current || {})
         return leafMerge(plain, withMode(legacy.patch, plain?.backend?.mode))
       })
 

@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /**
- * i18n 校验/生成：locale/{zh,en,ja}.json 是唯一真源，lib/client.js 只保留由它生成的常量块。
+ * i18n 校验/生成：locale/{zh,en,ja}.json 是唯一真源，lib/client-src/generated/locale.js 只保留由它生成的常量块。
  *
  * 用法：
  *   node scripts/i18n-check.mjs          # 默认 --check：三语键集/占位符一致 + ja 质量门禁 + 标记块与 JSON 一致
  *   node scripts/i18n-check.mjs --check  # 同上
- *   node scripts/i18n-check.mjs --write  # 从 JSON 重生成 client 标记块
+ *   node scripts/i18n-check.mjs --write  # 从 JSON 重生成 generated/locale.js，再调用 build-client
  *
  * 校验顺序（任一项失败即 exit 1；③–⑤ 逐条打印可定位的键名，最多 12 个 + 总数）：
  *   ① 三语键集完全一致；
@@ -13,7 +13,7 @@
  *   ③ ja 不许照抄 en：人类文案值中 ja≡en 的比例 < 5%；
  *   ④ ja 必须真的写成日语：人类文案值中含假名的比例 > 90%；
  *   ⑤ 三语 meta.detail 都是仓库内存在的本语言相对路径（docs/DETAIL.<lang>.md）；
- *   ⑥ client 标记块与 locale JSON 逐字一致（`--write` 重生成）。
+ *   ⑥ generated/locale.js 标记块与 locale JSON 逐字一致（`--write` 重生成并重建产物）。
  * 「人类文案值」的口径、阈值、排除项都写成本文件的常量与注释（见 isHumanCopy 处），
  * 不在报告或文档里写会漂移的过程数字。
  *
@@ -21,10 +21,12 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
+import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-const CLIENT = path.join(ROOT, 'lib/client.js')
+const CLIENT = path.join(ROOT, 'lib/client-src/generated/locale.js')
+const BUILD = path.join(ROOT, 'scripts/build-client.mjs')
 const LANGS = ['zh', 'en', 'ja']
 /** 标记块必须逐字一致：生成器与校验器共用这一对常量。 */
 const MARK_START = '// >>> locale:generated（由 scripts/i18n-check.mjs --write 生成，勿手改）'
@@ -191,7 +193,7 @@ console.log(
 
 /** 客户端标记块期望内容（与 --write 生成结果逐字一致）。 */
 function expectedBlock() {
-  // 生成块是构建产物，不是人读源码：紧凑 JSON 避免 2.7k 行数据淹没 client.js 的真实逻辑。
+  // 生成块是构建产物，不是人读源码：紧凑 JSON 避免 2.7k 行数据淹没源片段的真实逻辑。
   const json = JSON.stringify(dicts)
   return `${MARK_START}\n    const dict = ${json}\n    ${MARK_END}`
 }
@@ -200,7 +202,7 @@ let clientText
 try {
   clientText = fs.readFileSync(CLIENT, 'utf8')
 } catch (err) {
-  console.error(`[i18n] 读取 lib/client.js 失败：${err.message}`)
+  console.error(`[i18n] 读取 lib/client-src/generated/locale.js 失败：${err.message}`)
   process.exit(1)
 }
 
@@ -219,7 +221,13 @@ if (start >= 0 && end >= 0) {
     process.exit(1)
   }
   fs.writeFileSync(CLIENT, clientText.slice(0, start) + expected + clientText.slice(end + MARK_END.length))
-  console.log(`[i18n] 已重生成 client 标记块（三语各 ${zhKeys.size} 键）。`)
+  console.log(`[i18n] 已重生成 generated/locale.js 标记块（三语各 ${zhKeys.size} 键）。`)
+  try {
+    execFileSync(process.execPath, [BUILD], { stdio: 'inherit' })
+  } catch {
+    console.error('[i18n] 生成后 build-client 失败')
+    process.exit(1)
+  }
   process.exit(0)
 }
 
@@ -228,19 +236,6 @@ if (start >= 0 || end >= 0) {
   process.exit(1)
 }
 
-// 兼容首次迁移：还没有标记块时，--write 可把旧的 `const dict = {...}` 整体替换掉。
-if (!write) {
-  console.error('[i18n] lib/client.js 缺少 locale:generated 标记块。')
-  process.exit(1)
-}
-const legacyStart = clientText.indexOf('    const dict = ')
-const legacyEnd = clientText.indexOf('\n    }\n\n    // ---------------------------------------------------------------- runtime', legacyStart)
-if (legacyStart < 0 || legacyEnd < 0) {
-  console.error('[i18n] 找不到旧的 const dict 块，无法 --write。')
-  process.exit(1)
-}
-fs.writeFileSync(
-  CLIENT,
-  clientText.slice(0, legacyStart) + expected + clientText.slice(legacyEnd + '\n    }'.length),
-)
-console.log(`[i18n] 已用标记块替换旧 dict（三语各 ${zhKeys.size} 键）。`)
+// 生成块已固定在 generated/locale.js；缺标记块说明源骨架未建好，直接停，不做旧版迁移。
+console.error('[i18n] lib/client-src/generated/locale.js 缺少 locale:generated 标记块；先跑 scripts/split-client.mjs 生成源片段。')
+process.exit(1)

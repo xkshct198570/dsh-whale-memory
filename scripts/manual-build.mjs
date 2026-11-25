@@ -1,21 +1,23 @@
 #!/usr/bin/env node
 /**
- * 说明书生成/校验：docs/MANUAL.<lang>.md 是唯一真源，lib/client.js 只保留生成块。
+ * 说明书生成/校验：docs/MANUAL.<lang>.md 是唯一真源，lib/client-src/generated/manual.js 只保留生成块。
  *
  * 用法：
  *   node scripts/manual-build.mjs           # 默认 --check
  *   node scripts/manual-build.mjs --check   # 生成块与 MD 不一致则 exit 1
- *   node scripts/manual-build.mjs --write   # 从 MD 重生成 client 标记块
+ *   node scripts/manual-build.mjs --write   # 从 MD 重生成 generated/manual.js，再调用 build-client
  *
  * 为什么零构建：说明书必须离线可读；面板运行时不能读文件，只能读打进 client 的常量。
  * 与 locale 生成块同一模式：唯一真源 + 标记块 + 逐字校验，避免"改了 MD 面板没更新"。
  */
 import fs from 'node:fs'
 import path from 'node:path'
+import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-const CLIENT = path.join(ROOT, 'lib/client.js')
+const CLIENT = path.join(ROOT, 'lib/client-src/generated/manual.js')
+const BUILD = path.join(ROOT, 'scripts/build-client.mjs')
 const LANGS = ['zh', 'en', 'ja']
 const MARK_START = '// >>> manual:generated（由 scripts/manual-build.mjs 生成，勿手改）'
 const MARK_END = '// <<< manual:generated'
@@ -46,29 +48,26 @@ if (!docs.zh) {
 const block = `${MARK_START}\n    const MANUAL_DOC = ${JSON.stringify(docs, null, 2).replace(/\n/g, '\n    ')}\n    ${MARK_END}`
 const client = fs.readFileSync(CLIENT, 'utf8')
 const start = client.indexOf(MARK_START)
-const end = client.indexOf(MARK_END)
+const end = start < 0 ? -1 : client.indexOf(MARK_END, start + MARK_START.length)
 
 if (write) {
-  let next
   if (start < 0 || end < start) {
-    // 首次生成：插在 locale 生成块之后（保持 client 顶部生成块相邻，便于对照）。
-    const anchor = '// <<< locale:generated'
-    const at = client.indexOf(anchor)
-    if (at < 0) {
-      console.error('[manual] client.js 缺少 locale 生成块结束标记，找不到插入点')
-      process.exit(1)
-    }
-    const lineEnd = client.indexOf('\n', at) + 1
-    next = `${client.slice(0, lineEnd)}\n${block}\n${client.slice(lineEnd)}`
-  } else {
-    const lineEnd = client.indexOf('\n', end) + 1
-    next = client.slice(0, start) + block + '\n' + client.slice(lineEnd)
+    console.error('[manual] generated/manual.js 缺少 manual:generated 标记块；先跑 scripts/split-client.mjs 生成源片段。')
+    process.exit(1)
   }
+  const lineEnd = client.indexOf('\n', end) + 1
+  const next = client.slice(0, start) + block + '\n' + client.slice(lineEnd)
   fs.writeFileSync(CLIENT, next)
-  console.log(`[manual] 已重生成 client 标记块（zh ${docs.zh.split('\n').length} 行）`)
+  console.log(`[manual] 已重生成 generated/manual.js 标记块（zh ${docs.zh.split('\n').length} 行）`)
+  try {
+    execFileSync(process.execPath, [BUILD], { stdio: 'inherit' })
+  } catch {
+    console.error('[manual] 生成后 build-client 失败')
+    process.exit(1)
+  }
 } else {
   if (start < 0 || end < start) {
-    console.error('[manual] client.js 缺少 manual:generated 标记块；运行 node scripts/manual-build.mjs --write')
+    console.error('[manual] generated/manual.js 缺少 manual:generated 标记块；运行 node scripts/manual-build.mjs --write')
     process.exit(1)
   }
   const lineEnd = client.indexOf('\n', end) + 1

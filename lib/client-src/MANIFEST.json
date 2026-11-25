@@ -1,0 +1,78 @@
+[
+  {
+    "file": "00-core.js",
+    "responsibility": "客户端前缀：文件头注释 + __ModuleLoader__.load(id) + factory 头与顶层常量（React/h/NS/PANEL_ID/TABS 等）"
+  },
+  {
+    "file": "generated/locale.js",
+    "responsibility": "生成块：locale 三语字典（scripts/i18n-check.mjs --write 生成，勿手改）"
+  },
+  {
+    "file": "generated/manual.js",
+    "responsibility": "生成块：离线说明书（scripts/manual-build.mjs 生成，勿手改）"
+  },
+  {
+    "file": "10-format.js",
+    "responsibility": "运行时 hook（locale/可见性）+ 格式化与观测 helper（状态码/日期/指标）"
+  },
+  {
+    "file": "20-ui-kit.js",
+    "responsibility": "通用 UI 原子：Card/Switch/输入/字段/滚动/焦点/图标/简易 Markdown"
+  },
+  {
+    "file": "30-panel.js",
+    "responsibility": "面板壳：页头、页签导航、弹层与公共事件"
+  },
+  {
+    "file": "50-overview.js",
+    "responsibility": "概览页：KPI、趋势、失败作业、收尾卡"
+  },
+  {
+    "file": "60-memory.js",
+    "responsibility": "记忆库页：检索、表格、新增表单、详情抽屉"
+  },
+  {
+    "file": "70-rules-01.js",
+    "responsibility": "规则页 helper 第 1 段：Git 状态/列表筛选/摘要/字段文本/版本 diff"
+  },
+  {
+    "file": "70-rules-02.js",
+    "responsibility": "规则页 helper 第 2 段：编辑/校验/提案决策与草稿"
+  },
+  {
+    "file": "70-rules-03.js",
+    "responsibility": "规则页 UI 第 1 段：规则视图与提案徽标/风险/编辑器"
+  },
+  {
+    "file": "70-rules-04.js",
+    "responsibility": "规则页 UI 第 2 段：规则表/空态/Git 指南/新建弹层"
+  },
+  {
+    "file": "70-rules-05.js",
+    "responsibility": "规则页 UI 第 3 段：编辑弹层与详情抽屉"
+  },
+  {
+    "file": "80-recall.js",
+    "responsibility": "召回页：命中解释与召回记录"
+  },
+  {
+    "file": "90-writes.js",
+    "responsibility": "写入与关系页：审计流水、候选审核、边统计"
+  },
+  {
+    "file": "95-settings-01.js",
+    "responsibility": "设置元数据与配置归一第 1 段"
+  },
+  {
+    "file": "95-settings-02.js",
+    "responsibility": "设置页第 2 段：问题提示、分组卡、设置页主体"
+  },
+  {
+    "file": "99-css.js",
+    "responsibility": "全局样式对象（整片，不拆 CSS）"
+  },
+  {
+    "file": "999-footer.js",
+    "responsibility": "factory 收尾：导出/注册页签/return 与闭合"
+  }
+]

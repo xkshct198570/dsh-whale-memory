@@ -23,7 +23,7 @@
 import { privacyCheck } from '../core/writer.js'
 import { detectWrapIntent } from '../core/wrap-intent.js'
 import { materialHash, normalizeMaterial } from '../core/wrap-material.js'
-import { bool, num } from './config-values.js'
+import { bool, num } from '../shared/config-values.js'
 
 /** 单条消息缓冲上限（码点）：一次长粘贴不应挤掉整轮对话。 */
 const MAX_MESSAGE_CHARS = 2000

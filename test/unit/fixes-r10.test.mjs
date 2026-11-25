@@ -22,7 +22,7 @@ import { listRules, purgeRule, writeRule } from '../../src/core/rule-store.js'
 import { mirrorRules } from '../../src/core/rule-mirror.js'
 import { restoreDefaultRule } from '../../src/core/rule-defaults.js'
 import { lockState } from '../../src/core/rule-lock.js'
-import { mergePreservingVolatile, isVolatileRef } from '../../src/host/config-values.js'
+import { mergePreservingVolatile, isVolatileRef } from '../../src/shared/config-values.js'
 import { statusOf, localeKeyOf } from '../../src/shared/error-table.mjs'
 
 function tmp(t, prefix = 'whale-r10-') {

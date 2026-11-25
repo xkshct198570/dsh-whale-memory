@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 上架静态门：E1–E15（计划书 §6 + R9-06 错误码单一真源）+ 禁区扫描 + waterfall 守卫。
+ * 上架静态门：E1–E17（计划书 §6 + R9-06 错误码单一真源 + E17 门面纯 re-export 与导出面）+ 禁区扫描 + waterfall 守卫。
  *
  * 为什么要有这一份：市场安装失败大多不是功能问题，而是 manifest/导出/文件清单/
  * 文档产物这类机械问题；这里把可机检的部分前置，让每次改动当场红，而不是到 S5
@@ -37,11 +37,11 @@ function flattenLocale(node, prefix = '') {
 }
 const isFile = (p) => existsSync(join(root, p)) && statSync(join(root, p)).isFile()
 const isDir = (p) => existsSync(join(root, p)) && statSync(join(root, p)).isDirectory()
-const isNonEmptyDir = (p) => isDir(p) && readdirSync(join(root, p)).some((x) => x !== '.gitkeep')
 
 /** 一个 gate = 一个 E 项；返回原因数组（空数组=通过）。抛错也算失败。 */
 const gates = []
 const gate = (id, fn) => gates.push([id, fn])
+gates.push(['E17', async () => (await import('./gate-facade-exports.mjs')).checkFacadeExports(root)])
 
 // ---------------------------------------------------------------------------
 // 公共解析
@@ -221,8 +221,8 @@ gate('E7', async () => {
   }
 
   // volatile 是 Ref：必须经 config-values 的 .get() 解包，且不得在别处再声明 volatile
-  const helperPath = 'src/host/config-values.js'
-  if (!isFile(helperPath)) r.push('缺 src/host/config-values.js（Ref 解包单一真源）')
+  const helperPath = 'src/shared/config-values.js'
+  if (!isFile(helperPath)) r.push('缺 src/shared/config-values.js（Ref 解包单一真源）')
   else {
     const helper = read(helperPath)
     if (!/\.get\s*\(\s*\)/.test(helper)) r.push('config-values.js 必须用 .get() 解包 volatile Ref')
@@ -366,14 +366,15 @@ gate('E10', () => {
 // ---------------------------------------------------------------------------
 gate('E11', () => {
   const r = []
-  const routesPath = 'src/host/routes.js'
+  const routesPath = 'src/host/routes/router.js'
   if (!isFile(routesPath)) return [`${routesPath} 不存在`]
   const routes = read(routesPath)
-  if (!/isLoopback\(/.test(routes)) r.push('routes.js 未做回环判定 isLoopback()')
-  if (!/not_loopback/.test(routes)) r.push('routes.js 缺 not_loopback 错误码')
-  if (!/403/.test(routes)) r.push('routes.js 非回环未返回 403')
-  if (!/bool\([^)]*allowRemote[^)]*,\s*false\s*\)/.test(routes)) {
-    r.push('routes.js 的 allowRemote 必须默认 false（bool(..., false)）')
+  if (!/isLoopback\(/.test(routes)) r.push('routes/router.js 未做回环判定 isLoopback()')
+  if (!/not_loopback/.test(routes)) r.push('routes/router.js 缺 not_loopback 错误码')
+  if (!/403/.test(routes)) r.push('routes/router.js 非回环未返回 403')
+  // 要求 dispatch 运行时闸本身默认 false（不只靠 boundHosts 的第二处 false 满足正则）。
+  if (!/const allowRemote = bool\(config\?\.panel\?\.allowRemote,\s*false\)/.test(routes)) {
+    r.push('routes/router.js 的 request-time allowRemote 必须默认 false（const allowRemote = bool(..., false)）')
   }
   const configSrc = isFile('src/host/config.js') ? read('src/host/config.js') : ''
   if (!/allowRemote:\s*z\.boolean\(\)\.default\(false\)/.test(configSrc)) {
@@ -388,8 +389,10 @@ gate('E11', () => {
 gate('E12', () => {
   const r = []
   const scripts = pkg.scripts || {}
-  for (const key of ['prepare', 'prepack', 'postinstall']) {
-    if (key in scripts) r.push(`scripts 不得含 ${key}（市场安装会执行生命周期脚本）`)
+  // prepare/postinstall 等是市场安装/发布会执行的钩子，必须为空；prepack 只在开发者 npm pack/publish
+  // 时执行，不是安装期脚本，允许用于发布前强制 build --check（P1 起产物由源重建）。
+  for (const key of ['prepare', 'preinstall', 'install', 'postinstall', 'prepublish', 'prepublishOnly']) {
+    if (key in scripts) r.push(`scripts 不得含 ${key}（市场安装/发布会执行生命周期脚本）`)
   }
   return r
 })
@@ -495,13 +498,12 @@ gate('E15', async () => {
   for (const code of [...refs].sort()) {
     if (!Object.prototype.hasOwnProperty.call(table, code)) r.push(`代码引用错误码 ${code} 未在 error-table 登记`)
   }
-  // 路由必须查表，不能又长出本地 if 链。
-  const routesSrc = read('src/host/rules-routes.js')
-  const sfStart = routesSrc.indexOf('function statusForError')
-  if (sfStart < 0) r.push('rules-routes.js 缺 statusForError')
+  // 路由必须查表，不能又长出本地 if 链：状态映射在 rules-routes 域内只准一份（门面或任一子文件）。
+  const sfFiles = ['src/host/rules-routes.js', ...walk('src/host/rules-routes').map((f) => rel(f))]
+  const sfOwners = sfFiles.filter((f) => isFile(f) && /^(?:export\s+)?function\s+statusForError\b/m.test(read(f)))
+  if (sfOwners.length !== 1) r.push(sfOwners.length ? 'statusForError 存在多份定义（状态码判据只能一处）' : 'rules-routes 域缺 statusForError')
   else {
-    const sfEnd = routesSrc.indexOf('\n}', sfStart)
-    const sf = routesSrc.slice(sfStart, sfEnd < 0 ? undefined : sfEnd)
+    const sf = read(sfOwners[0]).split(/function\s+statusForError/)[1]?.split('\n}')[0] || ''
     if (!/statusOf\(/.test(sf)) r.push('statusForError 未查 error-table（statusOf）')
     if (/code === ['"]/.test(sf)) r.push('statusForError 仍有本地 if 链（状态码未单一真源）')
   }
@@ -584,10 +586,11 @@ gate('E16', () => {
   try {
     execFileSync(process.execPath, [join(root, 'scripts/manual-build.mjs'), '--check'], { stdio: 'pipe' })
   } catch {
-    reasons.push('client 说明书生成块与 docs/MANUAL.*.md 不一致（运行 node scripts/manual-build.mjs --write）')
+    reasons.push('generated/manual.js 说明书生成块与 docs/MANUAL.*.md 不一致（运行 node scripts/manual-build.mjs --write）')
   }
   return reasons
 })
+
 
 // ---------------------------------------------------------------------------
 for (const [id, fn] of gates) {
@@ -603,5 +606,5 @@ if (failed) {
   console.error(`[gate] FAILED：${failed} 项未过（见上）`)
   process.exitCode = 1
 } else {
-  console.log(`[gate] OK ${pkg.name}@${pkg.version}：E1–E16 全通过（禁区/waterfall 守卫也过）`)
+  console.log(`[gate] OK ${pkg.name}@${pkg.version}：E1–E17 全通过（禁区/waterfall 守卫也过）`)
 }

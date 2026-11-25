@@ -17,7 +17,7 @@
  * 返回 `source`（汇总标记）与 `sources`（逐字段标记）供面板显示：
  * 'hint' | 'host' | 'session' | 'config' | 'default'。
  */
-import { value } from './config-values.js'
+import { value } from '../shared/config-values.js'
 
 export { deriveWorkspace } from './identity-source.js'
 

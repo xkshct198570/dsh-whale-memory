@@ -17,6 +17,7 @@
  * 持久化：outbox 行在 SQLite 里，进程重启后重建 backend 仍会续跑未完成的行；
  * 构造时把上次崩溃遗留的 running 行复位成 queued（同一 dataDir 只允许一个实例在跑）。
  */
+import { value } from '../shared/config-values.js'
 import { now } from './db.js'
 
 /** 同步任务重试上限：8 次后判 failed（与 keeper/jobs 的口径一致：可观测、不无限重试）。 */
@@ -29,11 +30,6 @@ const DEFAULT_HTTP_TIMEOUT_MS = 800
 export const OUTBOX_WATCHDOG_INTERVAL_MS = 30_000
 /** 指数退避秒：attempts=1 → 1s，2 → 2s，3 → 4s … 封顶 300s。 */
 const BACKOFF_CAP_SEC = 300
-
-/** schemastery Ref 解包（core 不 import host，与 backend.js 同一口径）。 */
-function plain(value) {
-  return value && typeof value.get === 'function' ? value.get() : value
-}
 
 /** 读接口第二参数兼容：AbortSignal（hook 旧写法）或 { signal, timeoutMs, identity } 选项对象。 */
 function callOpts(opts) {
@@ -112,7 +108,7 @@ export class HybridBackend {
   /** 本次 HTTP 调用预算：显式覆盖 > 实时 Config.sync.httpTimeoutMs > 800ms。 */
   _timeoutMs() {
     if (this._timeoutOverride > 0) return this._timeoutOverride
-    const n = Number(plain(this._config()?.sync?.httpTimeoutMs))
+    const n = Number(value(this._config()?.sync?.httpTimeoutMs))
     return Number.isFinite(n) && n > 0 ? n : DEFAULT_HTTP_TIMEOUT_MS
   }
 
