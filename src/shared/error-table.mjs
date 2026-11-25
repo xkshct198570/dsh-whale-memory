@@ -133,6 +133,11 @@ export const ERROR_TABLE = Object.freeze({
   report_path_outside: mapped(403, 'report_path_outside'),
   report_unreadable: statusOnly(502),
   spool_missing: statusOnly(500),
+  // S1b 队列语义：重启清空/同会话满/全局满都是可判定状态，不是“未知错误”。
+  queue_cleared: mapped(409, 'queue_cleared'),
+  session_queue_full: mapped(409, 'session_queue_full'),
+  busy_queue_full: mapped(409, 'busy_queue_full'),
+  queue_rejected: statusOnly(409),
   unsupported_backend: mapped(501, 'unsupported_backend'),
   wrap_disabled: mapped(409, 'wrap_disabled'),
   wrap_unavailable: mapped(502, 'wrap_unavailable'),

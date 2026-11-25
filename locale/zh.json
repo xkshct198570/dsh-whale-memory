@@ -957,5 +957,20 @@
   "overview.wrapErrorBadJson": "模型输出不是 JSON，已重试仍失败",
   "overview.wrapErrorTimeout": "模型调用超时",
   "overview.wrapErrorSpool": "会话材料丢失，请重试",
-  "overview.wrapErrorWrite": "候选写入失败"
+  "overview.wrapErrorWrite": "候选写入失败",
+  "overview.wrapProgress": "收尾进度",
+  "overview.wrapPhaseQueued": "排队",
+  "overview.wrapPhaseCapture": "采集",
+  "overview.wrapPhaseDistill": "蒸馏",
+  "overview.wrapPhaseDispatch": "分流",
+  "overview.wrapPhaseReport": "报告",
+  "overview.wrapRetrying": "正在重试 {n}/{max}",
+  "overview.wrapSkipCleared": "队列已清理，如需收尾请再点",
+  "overview.wrapSkipTimeout": "排队超时已取消，请重试",
+  "overview.wrapSkipDisposed": "会话已关闭，排队取消",
+  "overview.wrapSkipBusy": "已有任务在跑，本次跳过",
+  "overview.wrapSkipRate": "已达今日自动收尾上限",
+  "err.queue_cleared": "收尾队列已随重启清理，请重新发起",
+  "err.session_queue_full": "本会话已有一条排队，完成后再试",
+  "err.busy_queue_full": "收尾队列已满，请稍后重试"
 }

@@ -74,6 +74,9 @@ test('POST /wrap：可判定错误码映射（409/501/502），不透内部异�
     [{ ok: false, reason: 'turn_in_progress' }, 409, 'turn_in_progress'],
     [{ ok: false, reason: 'busy' }, 409, 'busy'],
     [{ ok: false, reason: 'unsupported_backend' }, 501, 'unsupported_backend'],
+    [{ ok: false, reason: 'session_queue_full' }, 409, 'session_queue_full'],
+    [{ ok: false, reason: 'busy_queue_full' }, 409, 'busy_queue_full'],
+    [{ ok: false, reason: 'no_session' }, 409, 'no_session'],
     [{ ok: false, reason: 'db_error' }, 502, 'db_error'],
     [{ ok: false, reason: 'identity_required' }, 400, 'identity_required'],
   ]
@@ -179,4 +182,20 @@ test('GET /wrap/sessions：显式身份参数按分区过滤（透传 identity�
   const res = await fetch(base + '/whale-memory/api/wrap/sessions?workspace=web')
   assert.equal(res.status, 200)
   assert.deepEqual(calls.sessions.at(-1).identity, { userId: 'u1', roleId: '', workspace: 'web' })
+})
+
+test('S1b POST /wrap 矩阵：新 run=202 + position；同材料 existing=200', async () => {
+  manualResult = { ok: true, queued: true, runId: 21, position: 2, state: 'queued' }
+  const created = await postJson('/whale-memory/api/wrap', { trigger: 'manual' })
+  assert.equal(created.status, 202)
+  assert.equal(created.body.queued, true)
+  assert.equal(created.body.position, 2)
+  assert.equal(created.body.runId, 21)
+
+  manualResult = { ok: true, existing: true, runId: 21, state: 'running' }
+  const existing = await postJson('/whale-memory/api/wrap', { trigger: 'manual' })
+  assert.equal(existing.status, 200)
+  assert.equal(existing.body.existing, true)
+  assert.equal(existing.body.state, 'running')
+  assert.equal(existing.body.queued, undefined, 'existing 不得伪装成新入队')
 })

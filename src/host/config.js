@@ -71,6 +71,8 @@ export const Config = z.object({
     // 终态 run/报告的保留天数；0=永久。queued/running 永不删。
     retentionDays: z.natural().min(0).max(3650).default(180),
     maxRunsPerDay: z.natural().min(1).max(96).default(6),
+    // S1b：点击即排队的全局上限（同会话恒 ≤1）；进程内存队列，重启清空。
+    maxQueued: z.natural().min(1).max(32).default(8),
     report: z.boolean().default(true).volatile(),
     // 收尾模型可与对话模型分离：推理档模型会把预算烧在思考上（真机 textLen=0/2526、reasoning=9k+），
     // 建议收尾走非推理/低成本模型；空=沿用当前会话选择。

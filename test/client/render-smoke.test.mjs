@@ -327,3 +327,29 @@ test('S1 警告与失败折叠：warnings 可见；失败默认只显示计数�
   assert.match(text, /overview\.wrapFailureCount/, '失败默认折叠成计数')
   assert.equal(text.includes('bad_json'), false, '折叠态不得刷原始错误码')
 })
+
+test('S1b 进度点与重试：running 显示阶段、retrying 显示 N/4', async () => {
+  const { slots, mount } = loadSlots(
+    { panel: { ...DEFAULT_CONFIG.panel, tab: 'overview' } },
+    {
+      wrapStatus: {
+        ok: true, supported: true, enabled: true, jobs: 1,
+        latest: {
+          id: 9, state: 'running', trigger: 'manual', phase: 'distill', attempts: 2,
+          createdAt: 1, updatedAt: 2, candidates: 0, ruleProposals: 0, openLoops: 0,
+          switchReady: null, error: '', reportAvailable: false,
+          retrying: { attempt: 2, max: 4 },
+        },
+        recent: [], lastSkip: null, queued: { count: 1, position: 1, phase: null, materialHash: 'abc' },
+      },
+      wrapSessions: { ok: true, auto: { enabled: false, idleMinutes: 0 }, items: [] },
+    },
+  )
+  const tree = await mount(slots.main, { t: (key) => key, locale: 'zh', pollMs: 1 })
+  const text = treeText(tree)
+  assert.match(text, /overview\.wrapPhaseDistill/)
+  assert.match(text, /overview\.wrapRetrying/)
+  let current = null
+  walkTree(tree, (node) => { if (node.props && node.props['aria-current'] === 'step') current = node })
+  assert.ok(current, '当前阶段必须有 aria-current=step')
+})

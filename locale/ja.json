@@ -957,5 +957,20 @@
   "overview.wrapErrorBadJson": "モデル出力が JSON ではありません。再試行も失敗しました",
   "overview.wrapErrorTimeout": "モデル呼び出しがタイムアウトしました",
   "overview.wrapErrorSpool": "セッション素材が失われました。再試行してください",
-  "overview.wrapErrorWrite": "候補の書き込みに失敗しました"
+  "overview.wrapErrorWrite": "候補の書き込みに失敗しました",
+  "overview.wrapProgress": "収尾の進捗",
+  "overview.wrapPhaseQueued": "待機",
+  "overview.wrapPhaseCapture": "収集",
+  "overview.wrapPhaseDistill": "蒸留",
+  "overview.wrapPhaseDispatch": "振り分け",
+  "overview.wrapPhaseReport": "レポート",
+  "overview.wrapRetrying": "再試行中 {n}/{max}",
+  "overview.wrapSkipCleared": "キューは再起動で消去されました。必要なら再度実行してください",
+  "overview.wrapSkipTimeout": "待機がタイムアウトしました。再試行してください",
+  "overview.wrapSkipDisposed": "セッションが閉じられたため待機を取り消しました",
+  "overview.wrapSkipBusy": "実行中のタスクがあるため今回はスキップしました",
+  "overview.wrapSkipRate": "本日の自動収尾上限に達しました",
+  "err.queue_cleared": "再起動で収尾キューが消去されました。再度実行してください",
+  "err.session_queue_full": "このセッションには既に待機中の実行があります",
+  "err.busy_queue_full": "収尾キューがいっぱいです。後で再試行してください"
 }

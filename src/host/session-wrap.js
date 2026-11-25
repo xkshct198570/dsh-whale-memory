@@ -17,21 +17,26 @@
  *   failed/no_model 保留到 TTL 供手动重试。
  */
 import { join } from 'node:path'
+import { existsSync } from 'node:fs'
 import { bool, num, value } from '../shared/config-values.js'
 import { createProposal } from '../core/rule-proposal.js'
 import { getRun, latestRun, markRunAttempt, countRunsToday } from '../core/wrap-runs.js'
+import { createWrapQueue } from '../core/wrap-queue.js'
 import {
   createTriggerService, finishOrThrow, readJsonFile, reconcileRuns,
-  spoolStats, sweepSpool as sweepSpoolFiles, resolveDataDir,
+  spoolStats, spoolPathOf, sweepSpool as sweepSpoolFiles, resolveDataDir,
 } from './session-wrap/spool-run.js'
 import { distillPhase } from './session-wrap/distill.js'
 import { countsOf, dispatchPhase } from './session-wrap/dispatch.js'
+import { buildWrapStatus } from './session-wrap/status.js'
 import { reportPhase, reportRead, sweepStorage as sweepStorageFiles } from './session-wrap/report.js'
 
 export { resolveDataDir } from './session-wrap/spool-run.js'
 
 /** spool 清扫间隔：30 分钟；定时器 unref，不拖住宿主退出。 */
 const SWEEP_INTERVAL_MS = 30 * 60 * 1000
+/** 队列守护间隔：2s 推进 + 排队超时/销毁清理（30 分钟阈值由 wrap-queue 内判）。 */
+const QUEUE_TICK_MS = 2 * 1000
 
 /**
  * 安装 Session Wrap 服务。
@@ -66,6 +71,7 @@ export function installSessionWrap(ctx, {
       spoolTtlHours: num(w.spoolTtlHours, 24),
       retentionDays: num(w.retentionDays, 180),
       maxRunsPerDay: num(w.maxRunsPerDay, 6),
+      maxQueued: num(w.maxQueued, 8),
       report: reportOverride === null ? bool(w.report, true) : Boolean(reportOverride),
       // 0.6.8：provider 曾漏投影，导致 wrap.provider 配了也被 selection 覆盖（真机 01:44 证据）。
       provider: String(value(w.provider, '') || ''),
@@ -80,11 +86,63 @@ export function installSessionWrap(ctx, {
 
   /** 共享可变状态：dispose 后触发短路；status 只读最近一次 skip/manual。 */
   const state = { disposed: false, lastSkip: null, lastManual: null }
+  /** 点击即排队（S1b）：内存队列 + 单会话 1 / 全局上限；重启即清空（启动清扫标 queue_cleared）。 */
+  const wrapQueue = createWrapQueue({ maxQueued: wrapCfg().maxQueued })
   const trigger = createTriggerService({
-    withDb, keeper, captureRef, wrapCfg, spoolDir, now, log, supported, state,
+    withDb, keeper, captureRef, wrapCfg, spoolDir, now, log, supported, state, wrapQueue, pumpQueue,
   })
   /** 终态落库的统一入口：只在写库成功时删 spool，失败抛给 keeper 重试。 */
   const finalize = (runId, nextState, patch, opts) => finishOrThrow({ withDb, log }, runId, nextState, patch, opts)
+
+  /**
+   * 推进队列：队首且当前没有 wrap job 在跑时，踢一条 keeper job。
+   * keeper 全局串行（同 kind 单飞），所以一次只推进一条；完成/失败后由 handler finally 再踢。
+   * @returns {{started:number, skipped?:string}}
+   */
+  let queuePumping = false
+  function pumpQueue() {
+    if (!supported || state.disposed) return { started: 0, skipped: 'disposed' }
+    if (queuePumping) return { started: 0, skipped: 'busy' }
+    if (trigger.activeWrapJobs() > 0) return { started: 0, skipped: 'running' }
+    queuePumping = true
+    try {
+      let started = 0
+      while (!state.disposed) {
+        const entry = wrapQueue.head()
+        if (!entry) break
+        let run = null
+        try { run = withDb((db) => getRun(db, entry.runId)) } catch { run = null }
+        if (!run || run.state !== 'queued') { wrapQueue.removeByRun(entry.runId); continue }
+        const spoolPath = spoolPathOf(spoolDir(), run)
+        if (!existsSync(spoolPath)) {
+          try {
+            withDb((db) => db.prepare("UPDATE wrap_runs SET state='failed', error='spool_missing', updated_at=? WHERE id=? AND state='queued'")
+              .run(now(), run.id))
+          } catch { /* 下一次 pump 再试 */ }
+          wrapQueue.removeByRun(entry.runId)
+          state.lastSkip = { at: now(), reason: 'spool_missing', runId: run.id }
+          continue
+        }
+        try {
+          trigger.enqueueJob(run, spoolPath)
+          wrapQueue.removeByRun(entry.runId)
+          started += 1
+          log(`[whale-memory] wrap queue start run=${run.id} session=${entry.sessionId}`)
+        } catch (err) {
+          log(`[whale-memory] wrap queue start failed run=${run.id}: ${err?.message || err}`)
+          try {
+            withDb((db) => db.prepare("UPDATE wrap_runs SET state='failed', error='enqueue_failed', updated_at=? WHERE id=? AND state='queued'")
+              .run(now(), run.id))
+          } catch { /* 可见失败已进日志 */ }
+          wrapQueue.removeByRun(entry.runId)
+        }
+        break // 一次只踢一条，其余等 handler 完成
+      }
+      return { started }
+    } finally {
+      queuePumping = false
+    }
+  }
 
   /**
    * keeper `wrap` handler：真正的执行入口。
@@ -177,7 +235,22 @@ export function installSessionWrap(ctx, {
 
   // keeper handler 注册：失败只记日志（wrap 不可用不能拖垮插件其它能力）。
   if (supported && keeper && typeof keeper.register === 'function') {
-    try { keeper.register('wrap', execute) } catch (err) {
+    try {
+      keeper.register('wrap', async (payload, api) => {
+        const runId = Number(payload?.runId)
+        try {
+          return await execute(payload, api)
+        } finally {
+          // 无论终态如何都出队并推进下一条（失败已由 execute/finalize 落失败态）。
+          if (Number.isInteger(runId)) wrapQueue.removeByRun(runId)
+          // 延到下一轮事件循环：keeper 在 handler resolve 后才把 job 置 done，
+          // 立即 pump 会看到自己仍 running 而被跳过。
+          setImmediate(() => {
+            try { pumpQueue() } catch (err) { log(`[whale-memory] wrap pump after run fail-open: ${err?.message || err}`) }
+          })
+        }
+      })
+    } catch (err) {
       log(`[whale-memory] wrap handler not registered: ${err?.message || err}`)
     }
   }
@@ -193,7 +266,6 @@ export function installSessionWrap(ctx, {
     if (!wrapCfg().enabled) return { ok: false, reason: 'wrap_disabled' }
     const sid = String(sessionId || '').trim()
     if (!sid) {
-      if (trigger.activeWrapJobs() > 0) return { ok: false, reason: 'busy_wrap' }
       const out = await capture.triggerRecent('manual')
       if (out?.ok) state.lastManual = { at: now(), trigger: 'manual', runId: out.runId }
       return out
@@ -236,12 +308,13 @@ export function installSessionWrap(ctx, {
           lastRunState: row ? String(row.state) : '',
         }
       }),
-      auto: { enabled: bool(config?.wrap?.idle, false), idleMinutes: num(config?.wrap?.idleMinutes, 10) },
+      // S1b 契约：auto 固定 {false,0}；S2 接配置文件后回填真实开关。
+      auto: { enabled: false, idleMinutes: 0 },
     }
   }
 
-  /** 状态视图：只暴露计数/状态/可切会话，不返回候选正文。 */
-  function status({ identity = null } = {}) {
+  /** 状态视图：只暴露计数/状态/可切会话/队列位次，不返回候选正文。 */
+  function status({ identity = null, focusRunId = null } = {}) {
     if (!supported) return { ok: true, supported: false, enabled: false, latest: null, reason: 'unsupported_backend' }
     let latest = null
     let today = 0
@@ -264,27 +337,21 @@ export function installSessionWrap(ctx, {
     } catch (err) {
       return { ok: false, error: 'db_error', detail: String(err?.message || err).slice(0, 160) }
     }
-    return {
-      ok: true,
+    return buildWrapStatus({
       supported: true,
       enabled: wrapCfg().enabled,
-      runsToday: today,
       maxRunsPerDay: wrapCfg().maxRunsPerDay,
       jobs: trigger.activeWrapJobs(),
-      latest: latest ? {
-        id: latest.id, state: latest.state, trigger: latest.trigger,
-        phase: latest.phase, attempts: latest.attempts,
-        createdAt: latest.created_at, updatedAt: latest.updated_at,
-        candidates: latest.candidates, ruleProposals: latest.rule_proposals, openLoops: latest.open_loops,
-        switchReady: latest.switchReady, error: latest.error || '',
-        reportAvailable: Boolean(latest.report_path),
-      } : null,
-      recent: rows,
+      latest,
+      rows,
       spool: spoolStats(spoolDir()),
       capture: captureRef?.current?.status ? captureRef.current.status() : null,
+      queue: wrapQueue,
+      runsToday: today,
       lastSkip: state.lastSkip,
       lastManual: state.lastManual,
-    }
+      focusRunId,
+    })
   }
 
   /** 报告读取：路径穿越防护在 reportRead 内。 */
@@ -304,15 +371,26 @@ export function installSessionWrap(ctx, {
   }
 
   function reconcile() {
-    if (!supported) return { checked: 0, requeued: 0, failed: 0 }
-    return reconcileRuns({
+    if (!supported) return { checked: 0, requeued: 0, failed: 0, abandoned: 0 }
+    // 进程重启后内存队列必为空：先清一次（防本进程内重复 reconcile 残留），
+    // queued 且无活 job 的 run 由 reconcileRuns 标 failed/queue_cleared（不静默续跑）。
+    const hadQueued = wrapQueue.size()
+    wrapQueue.clear()
+    const out = reconcileRuns({
       withDb, log, jobLive: trigger.jobLive, enqueueJob: trigger.enqueueJob, spoolDir: spoolDir(),
     })
+    if (out.abandoned > 0) {
+      state.lastSkip = { at: now(), reason: 'queue_cleared', count: out.abandoned }
+      log(`[whale-memory] wrap queue cleared abandoned=${out.abandoned}${hadQueued ? ` memory=${hadQueued}` : ''}`)
+    }
+    try { pumpQueue() } catch (err) { log(`[whale-memory] wrap pump after reconcile fail-open: ${err?.message || err}`) }
+    return out
   }
 
   // 启动对账延后执行：不阻塞插件 init，也给 keeper 的启动补偿让路。
   let bootTimer = null
   let timer = null
+  let queueTimer = null
   if (supported) {
     bootTimer = setTimeout(() => {
       try { reconcile() } catch (err) { log(`[whale-memory] wrap reconcile fail-open: ${err?.message || err}`) }
@@ -325,12 +403,37 @@ export function installSessionWrap(ctx, {
       try { sweepStorage() } catch (err) { log(`[whale-memory] wrap retention fail-open: ${err?.message || err}`) }
     }, SWEEP_INTERVAL_MS)
     if (typeof timer.unref === 'function') timer.unref()
+    // 队列守护（铁律 3）：sweep 超时/已销毁会话，pump 保证“handler 完成后/进程空闲”仍会推进。
+    queueTimer = setInterval(() => {
+      try {
+        const removed = wrapQueue.sweep({
+          now: Date.now(),
+          disposed: (sid) => {
+            const capture = captureRef?.current
+            const list = capture && typeof capture.listSessions === 'function' ? capture.listSessions() : null
+            return Array.isArray(list) ? !list.some((item) => item.sessionId === sid) : false
+          },
+        })
+        for (const item of removed) {
+          try {
+            withDb((db) => db.prepare("UPDATE wrap_runs SET state='failed', error=?, updated_at=? WHERE id=? AND state='queued'")
+              .run(item.reason, now(), item.runId))
+          } catch { /* 下一轮 sweep 再试 */ }
+          state.lastSkip = { at: now(), reason: item.reason, runId: item.runId }
+          log(`[whale-memory] wrap queue drop run=${item.runId} reason=${item.reason}`)
+        }
+      } catch (err) { log(`[whale-memory] wrap queue sweep fail-open: ${err?.message || err}`) }
+      try { pumpQueue() } catch (err) { log(`[whale-memory] wrap queue pump fail-open: ${err?.message || err}`) }
+    }, QUEUE_TICK_MS)
+    if (typeof queueTimer.unref === 'function') queueTimer.unref()
   }
 
   const dispose = () => {
     state.disposed = true
     if (bootTimer) { clearTimeout(bootTimer); bootTimer = null }
     if (timer) { clearInterval(timer); timer = null }
+    if (queueTimer) { clearInterval(queueTimer); queueTimer = null }
+    wrapQueue.clear()
   }
   if (typeof ctx.effect === 'function') ctx.effect(() => () => dispose(), 'whale-memory: session wrap')
 
@@ -341,7 +444,7 @@ export function installSessionWrap(ctx, {
   }
 
   return {
-    onTrigger: trigger.onTrigger, manual, status, sessions, report, sweepSpool, sweepStorage, reconcile, execute,
+    onTrigger: trigger.onTrigger, manual, status, sessions, report, sweepSpool, sweepStorage, reconcile, execute, pumpQueue,
     canAutoTrigger, supported, dispose,
   }
 }

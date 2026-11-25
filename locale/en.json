@@ -957,5 +957,20 @@
   "overview.wrapErrorBadJson": "Model output was not JSON; the retry also failed",
   "overview.wrapErrorTimeout": "Model call timed out",
   "overview.wrapErrorSpool": "Session material is missing; retry",
-  "overview.wrapErrorWrite": "Candidate write failed"
+  "overview.wrapErrorWrite": "Candidate write failed",
+  "overview.wrapProgress": "Wrap progress",
+  "overview.wrapPhaseQueued": "Queued",
+  "overview.wrapPhaseCapture": "Capture",
+  "overview.wrapPhaseDistill": "Distill",
+  "overview.wrapPhaseDispatch": "Dispatch",
+  "overview.wrapPhaseReport": "Report",
+  "overview.wrapRetrying": "Retrying {n}/{max}",
+  "overview.wrapSkipCleared": "Queue was cleared after restart; click wrap again if needed",
+  "overview.wrapSkipTimeout": "Queue wait timed out; please retry",
+  "overview.wrapSkipDisposed": "The session was closed; queued run cancelled",
+  "overview.wrapSkipBusy": "Another run is active; skipped this time",
+  "overview.wrapSkipRate": "Daily auto-wrap limit reached",
+  "err.queue_cleared": "The wrap queue was cleared by restart; start again",
+  "err.session_queue_full": "This session already has one queued run",
+  "err.busy_queue_full": "The wrap queue is full; try again later"
 }

@@ -142,7 +142,7 @@ function snapshotTurns(material) {
  *   state:{disposed:boolean,lastSkip:any,lastManual:any},
  * }} deps
  */
-export function createTriggerService({ withDb, keeper, captureRef, wrapCfg, spoolDir, now, log = () => {}, supported, state }) {
+export function createTriggerService({ withDb, keeper, captureRef, wrapCfg, spoolDir, now, log = () => {}, supported, state, wrapQueue = null, pumpQueue = () => {} }) {
   const jobLive = (jobId) => {
     if (!jobId) return false
     try {
@@ -204,6 +204,18 @@ export function createTriggerService({ withDb, keeper, captureRef, wrapCfg, spoo
     if (!cfg.enabled) return { ok: false, reason: 'wrap_disabled' }
     const tx = String(trigger || 'manual')
     const auto = tx === 'idle' || tx === 'disposed'
+    // 同会话恒定 ≤1 个未完成 run（不同 material）：队列只记“未开跑”的项，正在跑的已出队，
+    // 所以这里必须查库（总纲 §5.2 的 session_queue_full 不能靠内存队列单独判）。
+    if (!auto) {
+      try {
+        const active = withDb((db) => db.prepare(
+          "SELECT id,material_hash FROM wrap_runs WHERE session_id=? AND state IN ('queued','running') LIMIT 1",
+        ).get(String(sessionId)))
+        if (active && String(active.material_hash || '') !== String(hash || '')) {
+          return { ok: false, reason: 'session_queue_full' }
+        }
+      } catch { /* 读库失败不阻断：后续 createRun/容量闸仍会再判 */ }
+    }
     if (auto) {
       const gate = autoGate()
       if (!gate.ok) { state.lastSkip = { at: now(), trigger: tx, reason: gate.reason }; return gate }
@@ -227,8 +239,20 @@ export function createTriggerService({ withDb, keeper, captureRef, wrapCfg, spoo
     if (!created.active && !created.reset) {
       return { ok: true, runId: run.id, existing: true, done: false, state: run.state }
     }
+    // 同材料已在内存队列里排队 → 幂等返回 existing（不重复占位/建 job）。
+    if (run.state === 'queued' && wrapQueue && wrapQueue.hasSession(String(sessionId))) {
+      return {
+        ok: true, runId: run.id, existing: true, queued: true, state: run.state,
+        position: wrapQueue.positionOf(run.id),
+      }
+    }
     if (run.state === 'queued' || run.state === 'running') {
       if (jobLive(run.job_id)) return { ok: true, runId: run.id, existing: true, state: run.state }
+    }
+    // 容量闸必须在写 spool/建 job 之前：队列满时明确 409，不落半成品材料。
+    if (wrapQueue && !auto) {
+      const gate = wrapQueue.canAccept(String(sessionId))
+      if (!gate.ok) return { ok: false, reason: gate.reason || 'busy_queue_full' }
     }
 
     let spoolPath
@@ -243,16 +267,29 @@ export function createTriggerService({ withDb, keeper, captureRef, wrapCfg, spoo
       } catch { /* 可见失败已进日志 */ }
       return { ok: false, reason: 'spool_write_failed' }
     }
-    try {
-      enqueueJob(run, spoolPath)
-      run = withDb((db) => getRun(db, run.id))
-    } catch (err) {
-      log(`[whale-memory] wrap enqueue failed: ${err?.message || err}`)
-      return { ok: false, reason: 'enqueue_failed' }
+    // 入内存队列；真正踢 keeper 由 pumpQueue 决定（队首且无 wrap job 在跑）。
+    let position = null
+    if (wrapQueue) {
+      const queued = wrapQueue.enqueue({ sessionId: String(sessionId), runId: run.id, materialHash: hash, at: Date.now() })
+      if (!queued.ok) {
+        try { withDb((db) => updateRun(db, run.id, { state: 'failed', error: `queue_rejected:${queued.reason || 'unknown'}` })) } catch { /* 日志已可见 */ }
+        return { ok: false, reason: queued.reason || 'busy_queue_full' }
+      }
+      position = queued.position
+    } else {
+      // 无队列（单测/旧装配）：直接入队 keeper，行为与 0.6.x 一致。
+      try { enqueueJob(run, spoolPath) } catch (err) {
+        log(`[whale-memory] wrap enqueue failed: ${err?.message || err}`)
+        return { ok: false, reason: 'enqueue_failed' }
+      }
     }
+    run = withDb((db) => getRun(db, run.id))
     state.lastManual = { at: now(), trigger: tx, runId: run.id }
-    log(`[whale-memory] wrap queued run=${run.id} trigger=${tx} turns=${snapshotTurns(material)} hash=${String(hash).slice(0, 12)}`)
-    return { ok: true, runId: run.id, existing: Boolean(created.existing), state: run.state }
+    log(`[whale-memory] wrap queued run=${run.id} trigger=${tx} turns=${snapshotTurns(material)} hash=${String(hash).slice(0, 12)} position=${position ?? '-'}`)
+    if (wrapQueue) {
+      try { pumpQueue() } catch (err) { log(`[whale-memory] wrap pump fail-open: ${err?.message || err}`) }
+    }
+    return { ok: true, queued: true, runId: run.id, existing: Boolean(created.existing), state: run.state, position }
   }
 
   return { onTrigger, autoGate, activeWrapJobs, jobLive, enqueueJob }
@@ -269,13 +306,24 @@ export function reconcileRuns({ withDb, log = () => {}, jobLive, enqueueJob, spo
       WHERE state IN ('queued','running') ORDER BY id LIMIT 100`).all())
   } catch (err) {
     log(`[whale-memory] wrap reconcile read failed: ${err?.message || err}`)
-    return { checked: 0, requeued: 0, failed: 0 }
+    return { checked: 0, requeued: 0, failed: 0, abandoned: 0 }
   }
   let requeued = 0
   let failed = 0
+  let abandoned = 0
   for (const row of rows) {
     if (jobLive(row.job_id)) continue
     const path = spoolPathOf(spoolDir, row)
+    if (row.state === 'queued') {
+      // S1b 队列是内存态：重启后 queued 且没有活 job = 队列已清空，不静默续跑，
+      // 明确标 failed/queue_cleared 并删 spool（UI 提示“队列已清理，如需收尾请再点”）。
+      try {
+        withDb((db) => updateRun(db, row.id, { state: 'failed', error: 'queue_cleared' }))
+        removeSpool(path)
+        abandoned += 1
+      } catch { /* 下一次启动再试 */ }
+      continue
+    }
     if (!existsSync(path)) {
       try {
         withDb((db) => updateRun(db, row.id, { state: 'failed', error: 'spool_missing' }))
@@ -290,6 +338,6 @@ export function reconcileRuns({ withDb, log = () => {}, jobLive, enqueueJob, spo
       log(`[whale-memory] wrap reconcile enqueue failed: ${err?.message || err}`)
     }
   }
-  if (requeued || failed) log(`[whale-memory] wrap reconcile requeued=${requeued} failed=${failed}`)
-  return { checked: rows.length, requeued, failed }
+  if (requeued || failed || abandoned) log(`[whale-memory] wrap reconcile requeued=${requeued} failed=${failed} abandoned=${abandoned}`)
+  return { checked: rows.length, requeued, failed, abandoned }
 }

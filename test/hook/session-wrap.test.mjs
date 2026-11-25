@@ -105,14 +105,14 @@ const VALID_OUTPUT = {
   ],
 }
 
-function setup(t, { overrides = {}, llm = llmOf(VALID_OUTPUT), selection = { provider: 'p', model: 'm' } } = {}) {
+function setup(t, { overrides = {}, llm = llmOf(VALID_OUTPUT), selection = { provider: 'p', model: 'm' }, logLines = null } = {}) {
   const { dir, db } = fresh(t)
   const config = configOf(dir, overrides)
   const { backend, writes } = fakeBackend(t, dir, db)
   const keeper = fakeKeeper(db)
   const captureRef = { current: { advanceCalls: [], advance(sid, seq) { this.advanceCalls.push([sid, seq]) }, async triggerRecent() { return { ok: true, runId: 99 } } } }
   const wrap = installSessionWrap({ effect: (fn) => fn() }, {
-    backend, config, keeper, captureRef, log: () => {},
+    backend, config, keeper, captureRef, log: logLines ? (line) => logLines.push(String(line)) : () => {},
     getLlm: () => llm, getSelection: () => selection,
   })
   return { dir, db, withDb: (fn) => fn(db), config, backend, writes, keeper, captureRef, wrap }
@@ -326,23 +326,33 @@ test('status：只给计数/状态，不返回候选正文；report 只读 run �
   assert.equal(bad.error, 'report_path_outside')
 })
 
-test('TTL 清扫：只删超期 spool；对账：queued run 没有活 job 时补一条', async (t) => {
+test('TTL 清扫：只删超期 spool；对账：queued 不续跑（queue_cleared）、running 才补 job', async (t) => {
   const s = setup(t)
   const { out, job } = await queueRun(s, {})
-  // 把 job 标 done 模拟“入队后进程死掉、job 丢了”
+  // 模拟“入队后进程死掉、job 丢了” + 内存队列清空（重启）。
   s.withDb((db) => db.prepare("UPDATE jobs SET state='done' WHERE id=?").run(job.id))
   const recon = s.wrap.reconcile()
-  assert.equal(recon.requeued, 1)
-  assert.equal(s.keeper.jobs.filter((item) => item.kind === 'wrap').length, 2)
+  assert.equal(recon.abandoned, 1, 'queued 且无活 job 必须按队列已清理处理')
+  assert.equal(recon.requeued, 0, 'S1b 不再静默续跑 queued')
+  const cleared = s.withDb((db) => getRun(db, out.runId))
+  assert.equal(cleared.state, 'failed')
+  assert.equal(cleared.error, 'queue_cleared')
+  assert.equal(existsSync(job.payload.spoolPath), false, '清理必须删 spool')
+
+  // running（执行中进程被杀）仍要补 job（铁律 3 的续跑面）。
+  const second = await queueRun(s, { sessionId: 's-running' })
+  s.withDb((db) => db.prepare("UPDATE wrap_runs SET state='running' WHERE id=?").run(second.out.runId))
+  s.withDb((db) => db.prepare("UPDATE jobs SET state='done' WHERE id=?").run(second.job.id))
+  const recon2 = s.wrap.reconcile()
+  assert.equal(recon2.requeued, 1)
+  assert.equal(s.keeper.jobs.filter((item) => item.kind === 'wrap').length >= 2, true)
 
   const old = Date.now() / 1000 - 48 * 3600
-  s.withDb((db) => db.prepare('UPDATE wrap_runs SET created_at=?, updated_at=? WHERE id=?').run(old, old, out.runId))
-  // 手动把 spool mtime 改旧（fs.utimes）
   const { utimesSync } = await import('node:fs')
-  utimesSync(job.payload.spoolPath, old, old)
+  utimesSync(second.job.payload.spoolPath, old, old)
   const swept = s.wrap.sweepSpool({ ttlHours: 24 })
   assert.equal(swept.deleted, 1)
-  assert.equal(existsSync(job.payload.spoolPath), false)
+  assert.equal(existsSync(second.job.payload.spoolPath), false)
 })
 
 test('resolveDataDir：优先真实 dbFile 目录，其次 config.dataDir', () => {
@@ -414,12 +424,13 @@ test('P2 报告目录缺失时的错误码口径：词法越界仍报 outside，
   void out
 })
 
-test('P2 手动 busy：已有 wrap job 排队时 manual 直接拒绝，不重复蒸馏', async (t) => {
+test('S1b 手动不再 busy_wrap：运行中可回答，且不重复蒸馏（busy_wrap 错误码删除）', async (t) => {
   const s = setup(t, { overrides: { wrap: { ...configOf('/tmp').wrap, idle: true, disposed: true } } })
   await queueRun(s, {})
+  const before = s.withDb((db) => Number(db.prepare('SELECT count(*) AS n FROM wrap_runs').get().n))
   const out = await s.wrap.manual()
-  assert.equal(out.ok, false)
-  assert.equal(out.reason, 'busy_wrap')
+  assert.equal(out.reason === 'busy_wrap', false, 'busy_wrap 已删除：运行中点击不得报“已有任务在跑”')
+  assert.equal(s.withDb((db) => Number(db.prepare('SELECT count(*) AS n FROM wrap_runs').get().n)), before, '不得重复建 run')
 })
 
 test('P2 自动额度只算 idle/disposed；手动/显式不吃后台预算', async (t) => {
@@ -518,4 +529,95 @@ test('保留策略：只删超期终态 run 与不再被引用的旧报告；que
   assert.equal(existsSync(keptReport), true, '仍在册（queued）的报告不得删')
   assert.equal(s.withDb((db) => db.prepare('SELECT count(*) n FROM wrap_runs WHERE id=?').get(keptRun).n), 1)
   assert.equal(s.withDb((db) => db.prepare('SELECT count(*) n FROM wrap_runs WHERE id=?').get(newRun).n), 1)
+})
+
+// ---------------------------------------------------------------------------
+// S1b 点击即排队：202/200/409、位次、队首推进、重启清空
+// ---------------------------------------------------------------------------
+
+test('S1b 连点同材料：1 个 run/job，后两次 existing（不重复建）', async (t) => {
+  const s = setup(t)
+  const first = await s.wrap.onTrigger({ sessionId: 's1', trigger: 'manual', material: MATERIAL, identity: { userId: 'u1' }, header: {}, hash: 'same-h', now: Date.now() / 1000 })
+  assert.equal(first.queued, true, '首次点击必须 202 语义入队')
+  assert.ok(Number.isInteger(first.position) && first.position >= 1)
+  const jobCount = () => s.keeper.jobs.filter((item) => item.kind === 'wrap').length
+  assert.equal(jobCount(), 1)
+  for (let i = 0; i < 2; i += 1) {
+    const again = await s.wrap.onTrigger({ sessionId: 's1', trigger: 'manual', material: MATERIAL, identity: { userId: 'u1' }, header: {}, hash: 'same-h', now: Date.now() / 1000 })
+    assert.equal(again.existing, true)
+    assert.equal(again.ok, true)
+  }
+  assert.equal(s.withDb((db) => Number(db.prepare('SELECT count(*) AS n FROM wrap_runs').get().n)), 1)
+  assert.equal(jobCount(), 1, '幂等点击不得新增 job')
+})
+
+test('S1b 同会话第二条不同材料 → session_queue_full；全局满 → busy_queue_full', async (t) => {
+  const s = setup(t, { overrides: { wrap: { ...configOf('/tmp').wrap, maxQueued: 1 } } })
+  // 第一条开跑（job 已在跑）→ 队列空；第二条不同材料进队列；第三条撞全局上限。
+  const first = await s.wrap.onTrigger({ sessionId: 's1', trigger: 'manual', material: MATERIAL, identity: { userId: 'u1' }, header: {}, hash: 'h-a', now: Date.now() / 1000 })
+  assert.equal(first.queued, true)
+  const second = await s.wrap.onTrigger({ sessionId: 's1', trigger: 'manual', material: { ...MATERIAL, seqTo: 9 }, identity: { userId: 'u1' }, header: {}, hash: 'h-b', now: Date.now() / 1000 })
+  assert.equal(second.ok, false)
+  assert.equal(second.reason, 'session_queue_full')
+
+  const other = await s.wrap.onTrigger({ sessionId: 's2', trigger: 'manual', material: { ...MATERIAL, seqTo: 11 }, identity: { userId: 'u1' }, header: {}, hash: 'h-c', now: Date.now() / 1000 })
+  assert.equal(other.ok, true, '不同会话应能排队')
+  const third = await s.wrap.onTrigger({ sessionId: 's3', trigger: 'manual', material: { ...MATERIAL, seqTo: 12 }, identity: { userId: 'u1' }, header: {}, hash: 'h-d', now: Date.now() / 1000 })
+  assert.equal(third.ok, false)
+  assert.equal(third.reason, 'busy_queue_full')
+})
+
+test('S1b status.queued：有排队时 count/position/phase=null；无排队为 null', async (t) => {
+  const s = setup(t, { overrides: { wrap: { ...configOf('/tmp').wrap, maxQueued: 2 } } })
+  await s.wrap.onTrigger({ sessionId: 'run-a', trigger: 'manual', material: MATERIAL, identity: { userId: 'u1' }, header: {}, hash: 'h1', now: Date.now() / 1000 })
+  assert.equal(s.wrap.status().queued, null, '首条已开跑，队列为空')
+  await s.wrap.onTrigger({ sessionId: 'queue-b', trigger: 'manual', material: { ...MATERIAL, seqTo: 8 }, identity: { userId: 'u1' }, header: {}, hash: 'h2', now: Date.now() / 1000 })
+  const queued = s.wrap.status().queued
+  assert.equal(queued.count, 1)
+  assert.equal(queued.position, 1)
+  assert.equal(queued.phase, null)
+  assert.ok(queued.materialHash.length > 0)
+  assert.deepEqual(s.wrap.status().auto, { enabled: false, idleMinutes: 0 }, 'S1b auto 固定 false/0')
+})
+
+test('S1b 队首完成后自动推进下一条（handler finally → pump）', async (t) => {
+  const s = setup(t, { overrides: { wrap: { ...configOf('/tmp').wrap, maxQueued: 2 } }, llm: llmOf(VALID_OUTPUT) })
+  const a = await s.wrap.onTrigger({ sessionId: 'a', trigger: 'manual', material: MATERIAL, identity: { userId: 'u1' }, header: {}, hash: 'ha', now: Date.now() / 1000 })
+  const b = await s.wrap.onTrigger({ sessionId: 'b', trigger: 'manual', material: { ...MATERIAL, seqTo: 8 }, identity: { userId: 'u1' }, header: {}, hash: 'hb', now: Date.now() / 1000 })
+  assert.equal(b.queued, true)
+  const jobA = s.keeper.jobs.find((item) => item.kind === 'wrap' && item.payload.runId === a.runId)
+  await s.keeper.handlers.get('wrap')(jobA.payload, { jobId: jobA.id, log: () => {}, now: () => Date.now() / 1000 })
+  // 真 keeper 会在 handler resolve 后把 job 置 done；这里显式模拟，再等 finally 的 setImmediate。
+  s.withDb((db) => db.prepare("UPDATE jobs SET state='done' WHERE id=?").run(jobA.id))
+  await new Promise((resolve) => setImmediate(resolve))
+  const jobB = s.keeper.jobs.find((item) => item.kind === 'wrap' && item.payload.runId === b.runId)
+  assert.ok(jobB, 'A 完成后必须自动踢 B')
+})
+
+test('S1b 日志证据：入队日志含 run id 与位次，且不含正文（与 status.latest.id 对得上）', async (t) => {
+  const logLines = []
+  const s = setup(t, { logLines })
+  const out = await s.wrap.onTrigger({ sessionId: 'grep-s1', trigger: 'manual', material: MATERIAL, identity: { userId: 'u1' }, header: {}, hash: 'gh', now: Date.now() / 1000 })
+  const line = logLines.find((item) => item.includes('wrap queued run='))
+  assert.ok(line, '必须留可以 grep 的入队日志')
+  assert.match(line, new RegExp(`wrap queued run=${out.runId} `))
+  assert.match(line, /position=1/)
+  assert.equal(logLines.some((item) => item.includes('动库前先备份')), false, '日志不得含正文')
+  const latest = s.wrap.status().latest
+  assert.equal(latest.id, out.runId)
+})
+
+test('S1b 重启后 queued 清空：reconcile 标 queue_cleared，status.lastSkip 可见', async (t) => {
+  const s = setup(t, { overrides: { wrap: { ...configOf('/tmp').wrap, maxQueued: 2 } } })
+  const a = await s.wrap.onTrigger({ sessionId: 'q1', trigger: 'manual', material: MATERIAL, identity: { userId: 'u1' }, header: {}, hash: 'q-h1', now: Date.now() / 1000 })
+  // 模拟重启：job 丢失、状态仍是 queued。
+  s.withDb((db) => db.prepare("UPDATE jobs SET state='done' WHERE kind='wrap'").run())
+  const recon = s.wrap.reconcile()
+  assert.equal(recon.abandoned, 1)
+  const status = s.wrap.status()
+  assert.equal(status.queued, null, '队列必须清空')
+  assert.equal(status.lastSkip.reason, 'queue_cleared')
+  const run = s.withDb((db) => getRun(db, a.runId))
+  assert.equal(run.state, 'failed')
+  assert.equal(run.error, 'queue_cleared')
 })

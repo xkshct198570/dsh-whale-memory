@@ -20,13 +20,16 @@ export async function handleWrap({
         const reason = String(got?.reason || 'wrap_failed')
         const status = reason === 'unsupported_backend' ? 501
           : reason === 'wrap_disabled' || reason === 'no_material' || reason === 'turn_in_progress'
-            || reason === 'busy' || reason === 'busy_wrap' || reason === 'same_material'
+            || reason === 'busy' || reason === 'same_material'
+            || reason === 'session_queue_full' || reason === 'busy_queue_full'
             || reason === 'no_session' ? 409
             : reason === 'identity_required' || reason === 'invalid_session' ? 400
               : reason === 'db_error' ? 502 : 500
         return sendJson(res, status, { ok: false, error: reason })
       }
-      return sendJson(res, 200, got)
+      // S1b 矩阵：新 run 入队=202；同材料已在排队/运行/已成功=200 existing。
+      const status = got.queued === true ? 202 : 200
+      return sendJson(res, status, got)
     }
 
 
