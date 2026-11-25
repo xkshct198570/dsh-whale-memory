@@ -44,9 +44,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set +e
-          OUT=$(gh release create "$GITHUB_REF_NAME" dsh-whale-memory.tgz SHA256SUMS.txt --title "$GITHUB_REF_NAME" --generate-notes 2>&1)
-          RC=$?
-          printf '%s\n' "$OUT"
-          if [ "$RC" -ne 0 ]; then echo "::error title=ReleaseCreate::$(printf '%s' "$OUT" | tr '\n' ' ' | head -c 800)"; fi
-          exit $RC
+          gh release create "$GITHUB_REF_NAME" dsh-whale-memory.tgz SHA256SUMS.txt \
+            --title "$GITHUB_REF_NAME" --generate-notes
