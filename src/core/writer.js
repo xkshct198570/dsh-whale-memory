@@ -1,37 +1,23 @@
 /**
- * 写入决策 + 持久化队列（L2 机制层，架构书 §6.2 决策顺序 / §7.3 时间重叠）。
+ * 记忆写入编排（writer）：候选/规则判定 + 审计 + 处理 + 评审 + 写队列（纯判定 + 显式 DB 事务）。
  *
- * 为什么这样设计：
- * - 决策与落库分离：decideWrite 只读库、只产出 decision；processEvent 才动 nodes/edges/writes。
- *   一条规则能单独验，面板也能预演（拿到 decision 先给用户看，再决定是否落库）。
- * - 决策顺序即优先级：文本合法性 → 隐私 → 配额 → 同 origin 复写 → 同文去重（含来源升级）→
- *   相似合并 → 冲突 → 影子 → 新增。
- *   顺序不能换：先查冲突再脱敏，脱敏后的文本与库内文本就不可比；先去重再配额，重复消息会白吃额度。
- * - 冲突判定不调模型：否定词对 + 槽位（端口/路径/版本/日期）差异足够稳定，可离线复现、零成本。
- * - 事实时间与系统时间分开：invalid_at 用"新事实生效时间"，expired_at 用系统删除时间，回溯可解释。
- * - 队列必须落 jobs 表：DSH 进程随对话重启，内存队列会丢事件；启动时把 running 复位成 queued 是崩溃补偿。
- * - 影子模式把"会落库"的动作统一降级为 CANDIDATE：审核前 nodes 一行不写，只留 writes 审计；
- *   NOOP/REJECT 不是落库动作，照旧记审计。
- * - 本模块不做邻居注记（applyNeighborNotes 由集成层调用）：写入只负责自己的一致性，扩散注记属于关系层调度。
- * - 配置可能来自 schemastery（`.volatile()` 字段是 Ref）：core 直接 import shared/config-values.js 的
- *   `value()` 做解包。不解包时 `Ref === 'auto'` 恒 false、`Number(Ref)` 恒 NaN，
- *   auto 会静默退化成 shadow、maxChars/dailyCap 恒回默认值。
- * - 去重要比较来源可信度（架构书 §6.3：owner > self > group > web/tool > import）：
- *   同文但新来源更可信时升 source（MERGE/source_upgrade），否则才 NOOP；
- *   否则 owner 事实会被低可信版本吞掉，并失去保护面。
- * - MERGE 也必须尊重保护面（owner/core/procedural）：命中受保护目标改走 REVIEW（protected_merge），
- *   新节点 + mutex，旧正文一行不动。
- * - 影子候选的决策载荷落 writes.payload：审核 accept 按 shadowOf 还原字段并执行同构动作，
- *   不能再用硬编码 normal/semantic/self（那样 SUPERSEDE/MERGE 候选会被静默当 ADD）。
+ * privacy 底座（脱敏/命中区间/同句端口提示）已拆到 `writer/privacy.js`；
+ * 本文件保留 decide / audit / process / review / queue 五段，待 P3d2–P3d4 继续拆分。
+ *
+ * 边界：
+ * - 只依赖 node 内置与本域纯工具；不碰路由/模型编排（LLM 只经注入的 getLlm）。
+ * - 判定顺序与阈值是"能不能落库"的唯一判据，必须能脱宿主单测。
  */
 import { value } from '../shared/config-values.js'
 import { now } from './db.js'
 import { bigrams, contentHash, normalize, similarity } from './tokenize.js'
 import { linkMutex, linkSupersede, normalizeTags } from './relations.js'
 import { buildJudgePrompt, mapCandidates, parseJudgeOutput } from './judge.js'
+import { privacyCheck, spansOf, insideSpans, sentenceHasPortHint } from './writer/privacy.js'
 
-/** 脱敏占位符（隐私命中一律替换成它，长度稳定、可被检索到"这里被脱敏过"）。 */
-const MASK = '[已脱敏]'
+// privacy 的公开符号原样再导出：门面路径与导出名保持不变，调用方无需改动。
+export { privacyCheck }
+
 /** 每批任务数（写连接上保持短事务，避免长阻塞）。 */
 const BATCH = 20
 /** 写 job 自身重试上限与退避（与 keeper 的 1m→5m→30m 同口径；写队列是唯一 owner）。 */
@@ -75,21 +61,6 @@ const SOURCE_MAP = {
   self: 'self',
 }
 
-/**
- * 隐私规则：只认"明显是凭证/个人身份"的样式，宁可多脱敏也不漏。
- * 顺序有意义：先长样式（Bearer/sk）、再赋值型（密码）、最后短数字（手机号/身份证）。
- * @type {RegExp[]}
- */
-const PRIVACY_RULES = [
-  /\bsk-[A-Za-z0-9_-]{8,}/g,
-  /\bghp_[A-Za-z0-9]{10,}/g,
-  /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi,
-  /(?:password|passwd|密码)\s*[:=：]\s*\S+/gi,
-  /(?<!\d)(?:\+?86[- ]?)?1[3-9]\d{9}(?!\d)/g,
-  /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g,
-  /(?<![\dXx])\d{17}[\dXx](?![\dXx])/g,
-]
-
 /** 否定词对（正向 ↔ 反向）；判定时先认反向词，避免"不可以"里的"可以"误判。 */
 const NEGATION_PAIRS = [
   ['允许', '禁止'],
@@ -102,13 +73,6 @@ const NEGATION_PAIRS = [
 
 /** 计划/承诺词：冲突时先别取代（还没落地的事实不能覆盖已落地的事实）。 */
 const PLAN_WORDS = /下周|明天|计划|准备|等审批|待定|将要|打算/
-
-/** 句界（端口要求"同句"）。
- * @param {string} text */
-const SENTENCE_MARK = /[。！？!?；;\n]/
-
-/** 端口语境提示词。 */
-const PORT_HINT = /端口|port|回调|webhook/i
 
 const DATE_RE = /\b\d{4}-\d{2}-\d{2}\b/g
 const VERSION_RE = /(?<![\w.])v?(\d+\.\d+(?:\.\d+)?)(?![\w.])/g
@@ -162,64 +126,6 @@ function startOfDay(tsSeconds) {
   const d = new Date(tsSeconds * 1000)
   d.setHours(0, 0, 0, 0)
   return d.getTime() / 1000
-}
-
-/**
- * 隐私体检：密钥样式 / 赋值型密码 / 手机号 / 邮箱 / 身份证。
- *
- * 为什么默认脱敏而不是拒绝：长期记忆的价值在上下文，直接拒会丢掉整句；
- * 把命中片段替换成占位符，既保住语义又不把凭证写进库。redact=false 用于严格入口（导入/面板原文）。
- *
- * @param {unknown} text 原文
- * @param {{ redact?: boolean }} [opts] redact=false 时命中即判不合格（不再改写文本）
- * @returns {{ ok: boolean, text: string, reason?: string }}
- *   ok=false 仅在 redact=false 且有命中时出现（reason='privacy'）；
- *   redact=true 且有命中时 ok=true、text 为脱敏后文本、reason='privacy_redacted'。
- */
-export function privacyCheck(text, { redact = true } = {}) {
-  const source = typeof text === 'string' ? text : String(text ?? '')
-  let out = source
-  let hits = 0
-  for (const re of PRIVACY_RULES) {
-    out = out.replace(re, () => {
-      hits += 1
-      return MASK
-    })
-  }
-  if (hits === 0) return { ok: true, text: out }
-  if (!redact) return { ok: false, text: source, reason: 'privacy' }
-  return { ok: true, text: out, reason: 'privacy_redacted' }
-}
-
-/**
- * 收集正则命中区间（供端口剔除"日期/版本/路径里的数字"）。
- * @param {string} text @param {RegExp} re
- * @returns {Array<{ at: number, end: number, raw: string, match: RegExpMatchArray }>}
- */
-function spansOf(text, re) {
-  const out = []
-  for (const match of text.matchAll(re)) {
-    const at = Number(match.index ?? 0)
-    out.push({ at, end: at + match[0].length, raw: match[0], match })
-  }
-  return out
-}
-
-/** 命中是否落在保留区间内（区间半开 [at,end)）。 */
-function insideSpans(span, spans) {
-  for (const s of spans) {
-    if (span.at < s.end && span.end > s.at) return true
-  }
-  return false
-}
-
-/** 位置所在句子是否含端口语境词（"同句"的判定口径）。 */
-function sentenceHasPortHint(text, at) {
-  let start = at
-  let end = at
-  while (start > 0 && !SENTENCE_MARK.test(text[start - 1])) start -= 1
-  while (end < text.length && !SENTENCE_MARK.test(text[end])) end += 1
-  return PORT_HINT.test(text.slice(start, end))
 }
 
 /**
