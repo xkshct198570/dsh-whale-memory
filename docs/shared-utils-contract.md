@@ -37,7 +37,7 @@
 
 ## 5. 下一步
 
-**P3d（本仓）**：writer 按 privacy/decide/queue/review/audit/process 拆分，门面只 re-export；`check-deps` 白名单保持空；每步导出对拍、定向测试、`lint-size`/`check` 全绿才下一步。P3a/P3b/P3c 已收口（tag `p3a-done`/`p3b-done`/`p3c-done`）：rule-store 8、rule-reconcile 4、rule-proposal 5 模块，门面均纯 re-export。
+**P3e（本仓）**：backend 按 local-db/write-api/query-api/transfer/hybrid-bridge 拆分，门面只 re-export；`check-deps` 白名单保持空；每步导出对拍、定向测试、`lint-size`/`check` 全绿才下一步。P3a–P3d 已收口（tag `p3a-done`…`p3d-done`）：rule-store 8、rule-reconcile 4、rule-proposal 5、writer 6 模块，门面均纯 re-export。
 
 **P6（跨插件）**：
 
