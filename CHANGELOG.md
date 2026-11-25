@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.9 — 2026-11-26（收尾输出预算 32768；未推 GitHub）
+
+- 修复：蒸馏输出预算 8192 → 32768。真机证据（deepseek-account/deepseek-flash）：reasoning 12,752–17,334 字符 + 正文 4,140–4,718 字符，8192 仍被思考截断 → `bad_json`。
+- 说明：收尾低频（自动默认关），一次装下“思考+JSON”；超预算仍会截断且日志提示换非推理模型。
+- 该版本按厂长令**只留本地**，等 Session Wrap v2 完善后再推 GitHub；测试 1048（1047/1/0）。
+
 ## 0.6.8 — 2026-11-26（wrap.provider 投影修复）
 
 - 修复：`wrapCfg()` 未把 `wrap.provider` 投影给蒸馏阶段，配置了也被会话选择覆盖（真机 01:44 run4 日志 `model=gui-ji-liu-dong/deepseek-flash`、正文/思考均为 0）。

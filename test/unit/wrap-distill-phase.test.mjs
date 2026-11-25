@@ -72,7 +72,7 @@ test('蒸馏：两次都坏 → failed 且抛出 distill_bad_json（失败可见
   assert.ok(logs.some((line) => line.includes('distill bad_json attempt=1')), '首答失败要留日志')
 })
 
-test('蒸馏：思考字数单独统计，且预算用 4096 而不是 1800', async () => {
+test('蒸馏：思考字数单独统计，且预算用 32768 而不是 1800', async () => {
   const seen = []
   const llm = scriptedLlm([[
     { type: 'reasoning-delta', text: '先想一想……' },
@@ -84,7 +84,7 @@ test('蒸馏：思考字数单独统计，且预算用 4096 而不是 1800', asy
   assert.equal(got.reasoningChars, '先想一想……'.length)
   assert.equal(seen[0].provider, 'q', 'wrap.provider 覆盖必须传给 llm')
   assert.equal(seen[0].maxTokens, DISTILL_MAX_TOKENS)
-  assert.ok(DISTILL_MAX_TOKENS >= 4096)
+  assert.ok(DISTILL_MAX_TOKENS >= 32768, '推理档收尾预算需覆盖 reasoning+JSON')
 })
 
 test('蒸馏：cfg.provider 必须传到 llm（0.6.8 防回归）', async () => {

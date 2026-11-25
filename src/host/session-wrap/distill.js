@@ -12,10 +12,12 @@ import { updateRun } from '../../core/wrap-runs.js'
 export const MODEL_OUTPUT_MAX = 100_000
 
 /**
- * 蒸馏请求的输出预算。默认模型是推理档（reasoningEffort=high 时思考也计入 maxTokens），
- * 1800 会让 JSON 被思考吃掉、真机 4/4 次 distill_bad_json；4096 给思考+答案留余量。
+ * 蒸馏请求的输出预算。真机证据（2026-11-26）：
+ * - gui-ji V4.1-Flash：reasoning 8.5k–9.4k 字符，4096/8192 都会截断正文（textLen 0–2.5k）；
+ * - deepseek-account/deepseek-flash：reasoning 12.7k–17.3k 字符 + 正文 4.1k–4.7k，8192 仍被截断。
+ * 收尾是低频动作（自动默认关），32768 让“思考+JSON”一次装下；超出仍会截断并在日志给提示。
  */
-export const DISTILL_MAX_TOKENS = 8192
+export const DISTILL_MAX_TOKENS = 32768
 
 /** 首次解析失败后的重试提示：只追加约束，不改素材与判据。 */
 export function distillRetryPrompt(prompt) {
