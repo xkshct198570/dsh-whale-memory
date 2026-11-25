@@ -377,3 +377,28 @@ test('S2 自动/跳过开关：auto 勾选反映服务端，选中会话后出�
   walkTree(after, (node) => { if (node.type === 'input' && node.props.id) inputs2.set(node.props.id, node) })
   assert.equal(inputs2.get('wrap-skip-switch')?.props.checked, true, 'skipAuto=true 必须显示为勾选')
 })
+
+test('S3 阶段投影：reconcile 关闭绝不出现整合阶段；开启且 phase=reconciled 才高亮', async () => {
+  const base = {
+    id: 10, state: 'running', trigger: 'manual', phase: 'reconciled', attempts: 1,
+    createdAt: 1, updatedAt: 2, candidates: 0, ruleProposals: 0, openLoops: 0,
+    switchReady: null, error: '', reportAvailable: false,
+  }
+  const off = loadSlots({ panel: { ...DEFAULT_CONFIG.panel, tab: 'overview' } }, {
+    wrapStatus: { ok: true, supported: true, enabled: true, latest: base, recent: [], reconcile: { enabled: false } },
+    wrapSessions: { ok: true, auto: { enabled: false, idleMinutes: 10 }, items: [] },
+  })
+  const offTree = await off.mount(off.slots.main, { t: (key) => key, locale: 'zh', pollMs: 1 })
+  assert.equal(treeText(offTree).includes('overview.wrapPhaseReconcile'), false, '关闭时不得渲染整合阶段')
+
+  const on = loadSlots({ panel: { ...DEFAULT_CONFIG.panel, tab: 'overview' } }, {
+    wrapStatus: { ok: true, supported: true, enabled: true, latest: base, recent: [], reconcile: { enabled: true } },
+    wrapSessions: { ok: true, auto: { enabled: false, idleMinutes: 10 }, items: [] },
+  })
+  const onTree = await on.mount(on.slots.main, { t: (key) => key, locale: 'zh', pollMs: 1 })
+  assert.match(treeText(onTree), /overview\.wrapPhaseReconcile/)
+  let current = null
+  walkTree(onTree, (node) => { if (node.props && node.props['aria-current'] === 'step') current = node })
+  assert.ok(current)
+  assert.match(treeText(current), /overview\.wrapPhaseReconcile/)
+})

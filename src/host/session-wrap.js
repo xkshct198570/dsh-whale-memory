@@ -30,6 +30,7 @@ import {
 import { distillPhase } from './session-wrap/distill.js'
 import { countsOf, dispatchPhase } from './session-wrap/dispatch.js'
 import { buildWrapStatus } from './session-wrap/status.js'
+import { applyReconcile, reconcilePhase } from './session-wrap/reconcile.js'
 import { reportPhase, reportRead, sweepStorage as sweepStorageFiles } from './session-wrap/report.js'
 
 export { resolveDataDir } from './session-wrap/spool-run.js'
@@ -79,6 +80,11 @@ export function installSessionWrap(ctx, {
       model: String(value(w.model, '') || ''),
       maxMaterialChars: num(w.maxMaterialChars, 12000),
       timeoutMs: num(w.timeoutMs, modelTimeoutMs),
+      reconcile: {
+        enabled: bool(w.reconcile?.enabled, false),
+        topK: num(w.reconcile?.topK, 5),
+        maxNeighborChars: num(w.reconcile?.maxNeighborChars, 200),
+      },
     }
   }
   const baseDir = () => resolveDataDir(backend, config)
@@ -182,13 +188,54 @@ export function installSessionWrap(ctx, {
         ? { skipped: distilledOut.skipped }
         : { skipped: distilledOut.skipped, dropped: distilledOut.dropped }
     }
-    const distilled = distilledOut.distilled
+    let distilled = distilledOut.distilled
 
-    // 2) 分流：记忆候选 / 规则提案 / 待办不落长期记忆
-    const { items, failures } = await dispatchPhase({
-      items: distilled.items, distilled, spool, runId, config, backend,
+    // 2) 整合（S3，默认关）：先与既有记忆对齐出决策，再影子落地；关闭时完全走旧路。
+    let items = distilled.items
+    let failures = []
+    let reconcileInfo = null
+    if (cfg.reconcile.enabled) {
+      const checkpoint = distilled.reconcile && Array.isArray(distilled.reconcile.decisions)
+        ? distilled.reconcile : null
+      let decisions = checkpoint ? checkpoint.decisions : null
+      if (!decisions) {
+        const rec = await reconcilePhase({
+          runId, distilled, spool,
+          cfg: {
+            ...cfg.reconcile, provider: cfg.provider, model: cfg.model, timeoutMs: cfg.timeoutMs,
+          },
+          withDb, getLlm, getSelection, log,
+        })
+        if (!rec.ok) {
+          const error = `reconcile_${String(rec.reason || 'failed')}`.slice(0, 200)
+          finalize(runId, 'failed', { error })
+          throw new Error(error)
+        }
+        decisions = Array.isArray(rec.decisions) ? rec.decisions : []
+        reconcileInfo = { decisions, rejected: rec.rejected || [], neighbors: rec.neighbors || 0 }
+      } else {
+        reconcileInfo = { decisions, rejected: checkpoint.rejected || [], neighbors: checkpoint.neighbors || 0 }
+      }
+      // 先写断点（含 reconcile 决策），apply 内部按条落库时不会把断点覆盖掉。
+      distilled = { ...distilled, items, reconcile: reconcileInfo }
+      if (decisions.length > 0) {
+        const applied = await applyReconcile({
+          items, distilled, spool, runId, decisions,
+          rejected: reconcileInfo.rejected, config, backend,
+          autoAccept: cfg.autoAccept, withDb, log,
+        })
+        items = applied.items
+        failures.push(...applied.failures)
+        distilled = { ...distilled, items, reconcile: { ...reconcileInfo, applied: applied.applied } }
+      }
+    }
+    // 3) 分流：规则提案 / 待办 / 未整合条目（applyReconcile 只处理写记忆的 kind）
+    const dispatched = await dispatchPhase({
+      items, distilled, spool, runId, config, backend,
       autoAccept: cfg.autoAccept, withDb, createProposal, log,
     })
+    items = dispatched.items
+    failures.push(...dispatched.failures)
 
     // 3) 报告（不含原始对话）+ 可切会话结论
     const reportOut = reportPhase({
@@ -351,6 +398,7 @@ export function installSessionWrap(ctx, {
       maxRunsPerDay: wrapCfg().maxRunsPerDay,
       jobs: trigger.activeWrapJobs(),
       auto: { enabled: wrapCfg().idle, idleMinutes: wrapCfg().idleMinutes },
+      reconcileEnabled: wrapCfg().reconcile.enabled,
       job,
       latest,
       rows,

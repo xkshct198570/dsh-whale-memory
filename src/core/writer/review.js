@@ -127,6 +127,23 @@ export function acceptCandidate(db, row, text, payload, shadowOf, writeId) {
     return { ok: true, id: newId, ...(newId === targetId ? { duplicate: true } : {}) }
   }
 
+  if (shadowOf === 'ARCHIVE') {
+    // S3：整合决策 ARCHIVE 的影子候选——只改状态、不删行，双时态可追溯。
+    const ident = identOf()
+    const target = targetId ? db.prepare(`SELECT id,status,text,level,memory_type,source FROM nodes
+      WHERE id=? AND user_id=? AND role_id=? AND workspace=? AND status='active'`).get(
+      targetId, ident.userId, ident.roleId, ident.workspace) : null
+    if (!target) return { ok: false, error: 'target_not_active' }
+    if (isProtectedTarget(target, { protect: true })) return { ok: false, error: 'protected_target' }
+    db.prepare("UPDATE nodes SET status='archived', updated_at=? WHERE id=? AND status='active'").run(ts, targetId)
+    recordEvolution(db, {
+      ts, fromId: targetId, toId: targetId, field: 'status',
+      oldValue: target.status ?? 'active', newValue: 'archived', traceId: row.trace_id,
+    })
+    db.prepare("UPDATE writes SET action='ARCHIVE', node_id=? WHERE id=?").run(targetId, writeId)
+    return { ok: true, id: targetId }
+  }
+
   // ADD / REVIEW（旧候选 payload 缺失也走这里：等价 ADD）
   let newId
   let duplicate = false

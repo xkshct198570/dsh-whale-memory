@@ -978,5 +978,6 @@
   "overview.wrapSkipAuto": "跳过自动收尾",
   "overview.wrapSkipAutoDesc": "只影响空闲/关闭自动触发，手动仍可收尾",
   "overview.wrapSessionSkipped": "已跳过自动",
-  "err.invalid_session": "会话 id 不合法"
+  "err.invalid_session": "会话 id 不合法",
+  "overview.wrapPhaseReconcile": "整合"
 }

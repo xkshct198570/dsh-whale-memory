@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os'
 import { openDb, closeDb } from '../../src/core/db.js'
 import { installSessionWrap, resolveDataDir } from '../../src/host/session-wrap.js'
 import { getRun, updateRun } from '../../src/core/wrap-runs.js'
+import { bigrams, contentHash } from '../../src/core/tokenize.js'
 
 function fresh(t, suffix = '') {
   const dir = mkdtempSync(join(tmpdir(), `whale-wrap-${suffix}`))
@@ -649,4 +650,74 @@ test('S2 retrying 投影：run=failed + job 退避 queued → {attempt,max}', as
   // 耗尽（attempts=4）不再显示重试。
   s.withDb((db) => db.prepare("UPDATE jobs SET attempts=4 WHERE kind='wrap'").run())
   assert.equal(s.wrap.status().latest.retrying, false)
+})
+
+// ---------------------------------------------------------------------------
+// S3 整合（Reconcile）：默认关；开启只产影子候选/审计，ARCHIVE accept 才改状态
+// ---------------------------------------------------------------------------
+
+function reconcileLlm(reconcilePayload) {
+  return {
+    async *stream({ messages }) {
+      const prompt = String(messages?.[0]?.content?.[0]?.text || '')
+      const payload = prompt.includes('整合器') ? reconcilePayload : VALID_OUTPUT
+      yield { type: 'text-delta', text: JSON.stringify(payload) }
+    },
+  }
+}
+
+function seedNode(db, { id, text, userId = 'u1', workspace = '/w' }) {
+  const ts = Date.now() / 1000
+  db.prepare(`INSERT INTO nodes (id,text,text_hash,text_bigrams,level,memory_type,source,status,
+    role_id,user_id,workspace,tags,context_note,weight,pinned,hits,vector_state,origin,created_at,updated_at)
+    VALUES (?,?,?,?, 'normal','semantic','self','active', '',?,?,'[]','',1,0,0,'none','',?,?)`)
+    .run(id, text, contentHash(text), bigrams(text), userId, workspace, ts, ts)
+}
+
+test('S3 开启整合：邻居→决策→影子候选；ARCHIVE 候选 accept 只改状态不删行', async (t) => {
+  const s = setup(t, {
+    overrides: { wrap: { ...configOf('/tmp').wrap, reconcile: { enabled: true, topK: 5, maxNeighborChars: 200 } } },
+    llm: reconcileLlm({
+      decisions: [
+        { item: 0, op: 'ARCHIVE', targetId: 'n-old', afterText: '', reason: '旧端口已作废', evidence: '' },
+        { item: 1, op: 'ADD', targetId: '', afterText: '收尾前必须先备份', reason: '新事实', evidence: '先备份' },
+      ],
+    }),
+  })
+  // 造邻居：与候选 item0 同文本相似（真实 FTS 命中）。
+  s.withDb((db) => seedNode(db, { id: 'n-old', text: '动库前必须先备份，端口 3080 已作废' }))
+  const { out, job } = await queueRun(s, {})
+  await s.keeper.handlers.get('wrap')(job.payload, { jobId: job.id, log: () => {}, now: () => Date.now() / 1000 })
+  const run = s.withDb((db) => getRun(db, out.runId))
+  assert.equal(run.state, 'done')
+  assert.equal(run.phase, 'done')
+  assert.equal(s.wrap.status().reconcile.enabled, true, 'status 必须暴露阶段投影开关')
+  const checkpoint = JSON.parse(run.distilled_json)
+  assert.ok(checkpoint.reconcile, '必须落 reconcile 断点')
+  assert.equal(checkpoint.reconcile.decisions.length, 2)
+
+  // ARCHIVE 影子候选：writes 行 CANDIDATE + payload.shadowOf=ARCHIVE；目标节点仍 active。
+  const rows = s.withDb((db) => db.prepare("SELECT id,payload,after_text FROM writes WHERE action='CANDIDATE' ORDER BY id").all())
+  const archiveRow = rows.find((row) => JSON.parse(row.payload).shadowOf === 'ARCHIVE')
+  assert.ok(archiveRow, '必须产出 ARCHIVE 候选')
+  assert.equal(s.withDb((db) => db.prepare('SELECT status FROM nodes WHERE id=?').get('n-old').status), 'active', '影子阶段不得直接归档')
+  assert.equal(archiveRow.after_text, '')
+
+  // accept：只改状态、写 ARCHIVE 审计，不物理删行。
+  const { acceptCandidate } = await import('../../src/core/writer/review.js')
+  const got = s.withDb((db) => acceptCandidate(db, {
+    id: archiveRow.id, trace_id: 'wrap:1', user_id: 'u1', role_id: '', workspace: '/w',
+  }, '', JSON.parse(archiveRow.payload), 'ARCHIVE', archiveRow.id))
+  assert.equal(got.ok, true)
+  assert.equal(s.withDb((db) => db.prepare('SELECT status FROM nodes WHERE id=?').get('n-old').status), 'archived')
+  assert.ok(s.withDb((db) => db.prepare('SELECT 1 FROM nodes WHERE id=?').get('n-old')), '不得物理删')
+})
+
+test('S3 默认关：不开 reconcile 时行为与旧路一致（不产 decision 断点）', async (t) => {
+  const s = setup(t)
+  const { out, job } = await queueRun(s, {})
+  await s.keeper.handlers.get('wrap')(job.payload, { jobId: job.id, log: () => {}, now: () => Date.now() / 1000 })
+  const run = s.withDb((db) => getRun(db, out.runId))
+  assert.equal(run.state, 'done')
+  assert.equal(JSON.parse(run.distilled_json).reconcile, undefined)
 })

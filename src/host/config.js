@@ -80,6 +80,12 @@ export const Config = z.object({
     model: z.string().default(''),
     maxMaterialChars: z.natural().min(1000).max(50000).default(12000),
     timeoutMs: z.natural().min(5000).max(600000).default(60000),
+    // S3 整合（Reconcile）：默认关；开启也只产影子候选/审计，不直接改 active 记忆。
+    reconcile: z.object({
+      enabled: z.boolean().default(false).volatile(),
+      topK: z.natural().min(1).max(10).default(5),
+      maxNeighborChars: z.natural().min(40).max(500).default(200),
+    }).default({}),
   }).default({}),
 
   consolidate: z.object({

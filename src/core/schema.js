@@ -370,7 +370,12 @@ function migrateAdditiveColumns(db) {
  */
 export function migrateWrapRunsV6(db) {
   const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='wrap_runs'").get()
-  if (!row || !/UNIQUE\s*\(\s*session_id/i.test(String(row.sql || ''))) return { rebuilt: false }
+  const sql = String(row?.sql || '')
+  // 两个判据（任一命中即重建）：旧版 UNIQUE 约束；或 phase CHECK 还没有 reconciled（S3 断点态）。
+  const hasUnique = /UNIQUE\s*\(\s*session_id/i.test(sql)
+  const hasPhase = /phase IN/.test(sql)
+  const hasReconciled = /'reconciled'/.test(sql)
+  if (!row || !(hasUnique || (hasPhase && !hasReconciled))) return { rebuilt: false }
   db.exec('BEGIN IMMEDIATE')
   try {
     db.exec(`CREATE TABLE wrap_runs_v6 (
@@ -386,7 +391,7 @@ export function migrateWrapRunsV6(db) {
       job_id            INTEGER,
       attempts          INTEGER NOT NULL DEFAULT 0,
       phase             TEXT NOT NULL DEFAULT 'created'
-                        CHECK (phase IN ('created','distilled','written','reported','done')),
+                        CHECK (phase IN ('created','distilled','reconciled','written','reported','done')),
       summary           TEXT NOT NULL DEFAULT '',
       distilled_json    TEXT,
       candidates        INTEGER NOT NULL DEFAULT 0,

@@ -45,7 +45,7 @@ export function projectRetrying(latest, job = null) {
 export function buildWrapStatus({
   supported, enabled, maxRunsPerDay, jobs, latest, rows, spool, capture, queue,
   runsToday, lastSkip = null, lastManual = null, focusRunId = null,
-  auto = { enabled: false, idleMinutes: 0 }, job = null,
+  auto = { enabled: false, idleMinutes: 0 }, job = null, reconcileEnabled = false,
 }) {
   if (!supported) {
     return { ok: true, supported: false, enabled: false, latest: null, reason: 'unsupported_backend' }
@@ -57,6 +57,8 @@ export function buildWrapStatus({
     runsToday: Number(runsToday || 0),
     maxRunsPerDay: Number(maxRunsPerDay || 0),
     jobs: Number(jobs || 0),
+    // 阶段投影开关（§5.3）：关闭时 UI 不得出现 reconcile 阶段。
+    reconcile: { enabled: Boolean(reconcileEnabled) },
     queued: projectQueued(queue, focusRunId),
     latest: latest ? {
       id: Number(latest.id),

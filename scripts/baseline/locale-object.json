@@ -975,7 +975,8 @@
     "overview.wrapSkipAuto": "跳过自动收尾",
     "overview.wrapSkipAutoDesc": "只影响空闲/关闭自动触发，手动仍可收尾",
     "overview.wrapSessionSkipped": "已跳过自动",
-    "err.invalid_session": "会话 id 不合法"
+    "err.invalid_session": "会话 id 不合法",
+    "overview.wrapPhaseReconcile": "整合"
   },
   "en": {
     "meta.title": "Whale Memory",
@@ -1953,7 +1954,8 @@
     "overview.wrapSkipAuto": "Skip auto wrap",
     "overview.wrapSkipAutoDesc": "Only affects idle/dispose triggers; manual still works",
     "overview.wrapSessionSkipped": "auto skipped",
-    "err.invalid_session": "Invalid session id"
+    "err.invalid_session": "Invalid session id",
+    "overview.wrapPhaseReconcile": "Reconcile"
   },
   "ja": {
     "meta.title": "ホエールメモリ",
@@ -2931,6 +2933,7 @@
     "overview.wrapSkipAuto": "自動収尾をスキップ",
     "overview.wrapSkipAutoDesc": "アイドル/クローズ時のみ。手動は常に可能",
     "overview.wrapSessionSkipped": "自動スキップ中",
-    "err.invalid_session": "セッション ID が不正です"
+    "err.invalid_session": "セッション ID が不正です",
+    "overview.wrapPhaseReconcile": "整合"
   }
 }
