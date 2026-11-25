@@ -22,12 +22,15 @@
 - `src/host/session-wrap.js`：`manual({sessionId})`；`triggerRecent` 保留为缺省；新增 `sessions()` 视图。
 - `src/host/routes/wrap.js`：`GET ${PREFIX}/wrap/sessions`（远端读拒绝）；`POST /wrap` 支持 `sessionId`。
 - `lib/client-src/51-wrap-card.js`：卡片主体从 `50-overview.js` 拆出；下拉、按钮、反馈行、busy 态。
-- `lib/client-src/generated/locale.js` 与 i18n 源：新增键（会话/自动收尾/错误文案），必须走 `i18n-check --write`。
+- UI 审查 P1/P2（`Session-Wrap-v2-UI审查与排版建议-2026-11-26.md`）：`StateBadge` 状态行、错误码→中文映射、4 个 `StatTile` 替 `metaGrid+Row`、失败折叠（避免同页重复整块）、空态引导、`settingHead` 换行、页签单行横滚、间距阶梯 4/8/12/16、focus ring/aria。
+- 禁用按钮 tooltip（加载中/未启用/后端不支持），成功提示带“查看报告”入口。
+- `lib/client-src/generated/locale.js` 与 i18n 源：新增键（会话/自动收尾/错误文案/空态/折叠），必须走 `i18n-check --write`。
 
 判据：
 
 - 断言没有正文/标题字段泄露（直接断言响应 JSON 键集合）。
 - 进行中点手动：返回 409 `turn_in_progress`，卡片出现中文一句话（组件渲染冒烟）。
+- UI：1280×800 与 900×700 两档渲染冒烟断言无溢出/无 NaN；页签单行横滚；失败默认折叠。
 - 指定 sessionId：run 归属正确；不存在的 id → 409 `no_session`。
 
 回滚点：S1 单 commit，面板回旧卡片即可。
