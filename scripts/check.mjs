@@ -498,13 +498,12 @@ gate('E15', async () => {
   for (const code of [...refs].sort()) {
     if (!Object.prototype.hasOwnProperty.call(table, code)) r.push(`代码引用错误码 ${code} 未在 error-table 登记`)
   }
-  // 路由必须查表，不能又长出本地 if 链。
-  const routesSrc = read('src/host/rules-routes.js')
-  const sfStart = routesSrc.indexOf('function statusForError')
-  if (sfStart < 0) r.push('rules-routes.js 缺 statusForError')
+  // 路由必须查表，不能又长出本地 if 链：状态映射在 rules-routes 域内只准一份（门面或任一子文件）。
+  const sfFiles = ['src/host/rules-routes.js', ...walk('src/host/rules-routes').map((f) => rel(f))]
+  const sfOwners = sfFiles.filter((f) => isFile(f) && /^(?:export\s+)?function\s+statusForError\b/m.test(read(f)))
+  if (sfOwners.length !== 1) r.push(sfOwners.length ? 'statusForError 存在多份定义（状态码判据只能一处）' : 'rules-routes 域缺 statusForError')
   else {
-    const sfEnd = routesSrc.indexOf('\n}', sfStart)
-    const sf = routesSrc.slice(sfStart, sfEnd < 0 ? undefined : sfEnd)
+    const sf = read(sfOwners[0]).split(/function\s+statusForError/)[1]?.split('\n}')[0] || ''
     if (!/statusOf\(/.test(sf)) r.push('statusForError 未查 error-table（statusOf）')
     if (/code === ['"]/.test(sf)) r.push('statusForError 仍有本地 if 链（状态码未单一真源）')
   }

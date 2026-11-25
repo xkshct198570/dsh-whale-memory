@@ -187,7 +187,8 @@ test('GET /rules：每条规则带 origin，响应带 capabilities', async () =>
   const caps = await rulesCapabilities()
   assert.deepEqual(got.body.capabilities, caps, 'capabilities 必须与能力探测同源')
   assert.equal(typeof caps.plan, 'boolean')
-  assert.equal(typeof caps.restoreDefault, 'boolean')
+  // 动态 import 路径必须真解析到 rule-defaults：写错时能力静默 false、restore 走 501。
+  assert.equal(caps.restoreDefault, true, 'restoreDefault 能力必须可用（loadDefaultRestore 路径正确）')
 })
 
 test('GET /rules/proposals：status=pending,needs_manual 同时返回；单值过滤仍生效', async () => {
