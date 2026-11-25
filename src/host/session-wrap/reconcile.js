@@ -31,7 +31,7 @@ export function collectNeighbors({ withDb, identity, items, topK = DEFAULTS.topK
     let hits = []
     try {
       hits = withDb((db) => search(db, {
-        query: String(item?.text || ''), identity, limit, minRel: 0.2,
+        query: String(item?.text || ""), identity, limit, minRel: 0,
       }).hits || [])
     } catch { hits = [] }
     for (const hit of hits) {
@@ -134,15 +134,21 @@ export async function applyReconcile({ items, distilled, spool, runId, decisions
     const item = list[i]
     const kind = String(item?.kind || '')
     if (!KINDS_WRITTEN.has(kind)) continue
+    // S4：已被并进前一条的候选不再各自落库（否则 3 同主题仍会有 3 条候选）。
+    if (String(item?.status || '').startsWith('merged_into:')) continue
     const decision = byItem.get(i) || {
       item: i, op: 'ADD', targetId: '', afterText: String(item.text || '').slice(0, 200), reason: 'no_decision', evidence: '',
     }
     const text = String(decision.afterText || item.text || '')
+    // S4：模型可给 level/memoryType/tags 校正（已过 core 白名单），未给则沿用 kind 映射。
+    const tags = Array.isArray(decision.tags) && decision.tags.length > 0
+      ? ['session-wrap', 'reconcile', ...decision.tags]
+      : ['session-wrap', 'reconcile', ...(Array.isArray(item.tags) ? item.tags : [])]
     const baseEvent = {
-      level: LEVEL_OF_KIND[kind] || 'normal',
-      memory_type: TYPE_OF_KIND[kind] || 'semantic',
+      level: String(decision.level || LEVEL_OF_KIND[kind] || 'normal'),
+      memory_type: String(decision.memoryType || TYPE_OF_KIND[kind] || 'semantic'),
       source: 'owner',
-      tags: ['session-wrap', 'reconcile', ...(Array.isArray(item.tags) ? item.tags : [])].slice(0, 8),
+      tags: tags.slice(0, 8),
       origin: WRAP_ORIGIN,
       traceId,
       identity,
@@ -182,7 +188,12 @@ export async function applyReconcile({ items, distilled, spool, runId, decisions
           failures.push({ index: i, reason: `write_failed:${code}` })
         }
       }
-      applied.push({ index: i, op: decision.op, targetId: decision.targetId || '' })
+      // S4 跨候选合并：被合并的条目置 merged_into，不再各自落一条副本（断言节点数）。
+      for (const merged of Array.isArray(decision.mergeItems) ? decision.mergeItems : []) {
+        if (!Number.isInteger(merged) || merged === i || !list[merged]) continue
+        list[merged] = { ...list[merged], status: `merged_into:${i}` }
+      }
+      applied.push({ index: i, op: decision.op, targetId: decision.targetId || '', mergeItems: decision.mergeItems || [] })
     } catch (err) {
       list[i] = { ...item, status: 'write_failed:exception' }
       failures.push({ index: i, reason: `write_exception:${String(err?.message || err).slice(0, 120)}` })

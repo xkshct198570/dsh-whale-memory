@@ -979,5 +979,7 @@
   "overview.wrapSkipAutoDesc": "アイドル/クローズ時のみ。手動は常に可能",
   "overview.wrapSessionSkipped": "自動スキップ中",
   "err.invalid_session": "セッション ID が不正です",
-  "overview.wrapPhaseReconcile": "整合"
+  "overview.wrapPhaseReconcile": "整合",
+  "overview.wrapCopyReport": "レポートをコピー",
+  "overview.wrapDownloadReport": ".md をダウンロード"
 }

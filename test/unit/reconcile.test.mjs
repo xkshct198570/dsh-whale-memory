@@ -62,3 +62,23 @@ test('validateDecisions：主观前缀/相对指代/超长 afterText 拒绝；AR
   assert.equal(valid[0].op, 'ARCHIVE')
   assert.deepEqual(rejected.map((row) => row.error).sort(), ['text_hedge', 'text_relative', 'text_too_long'])
 })
+
+test('S4：跨候选 MERGE（mergeItems）合成为 1 条；校正建议白名单', () => {
+  const items = [
+    { kind: 'lesson', text: '收尾前先备份甲', evidence: '先备份' },
+    { kind: 'lesson', text: '收尾前先备份乙', evidence: '备份乙' },
+    { kind: 'lesson', text: '收尾前先备份丙', evidence: '备份丙' },
+  ]
+  const decisions = [
+    { item: 0, op: 'MERGE', targetId: '', mergeItems: [1, 2], afterText: '收尾前必须先备份', reason: '同主题', evidence: '备份乙', level: 'important', memoryType: 'procedural', tags: ['运维'] },
+    { item: 0, op: 'MERGE', targetId: '', mergeItems: [1], afterText: '端口 4090', reason: '', evidence: '', level: 'bad-level' },
+  ]
+  const { valid, rejected } = validateDecisions(decisions, { items, neighbors: [] })
+  assert.equal(valid.length, 1)
+  assert.deepEqual(valid[0].mergeItems, [1, 2])
+  assert.equal(valid[0].level, 'important')
+  assert.equal(rejected[0].error, 'bad_level')
+  // 合并没有 target 时必须有 mergeItems。
+  const noMerge = validateDecisions([{ item: 0, op: 'MERGE', targetId: '', mergeItems: [], afterText: '收尾前必须先备份', evidence: '' }], { items, neighbors: [] })
+  assert.equal(noMerge.rejected[0].error, 'target_required')
+})

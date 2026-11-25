@@ -979,5 +979,7 @@
   "overview.wrapSkipAutoDesc": "Only affects idle/dispose triggers; manual still works",
   "overview.wrapSessionSkipped": "auto skipped",
   "err.invalid_session": "Invalid session id",
-  "overview.wrapPhaseReconcile": "Reconcile"
+  "overview.wrapPhaseReconcile": "Reconcile",
+  "overview.wrapCopyReport": "Copy report",
+  "overview.wrapDownloadReport": "Download .md"
 }

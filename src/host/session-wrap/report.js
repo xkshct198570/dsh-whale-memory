@@ -34,6 +34,28 @@ export function computeSwitchReady({ reportPath, reportEnabled, currentJobId, wi
 }
 
 /**
+ * 决策摘要（S4）：按 op 计数 + 被合并条数 + 拒绝原因；不含任何正文。
+ * @param {object} reconcile run.distilled_json.reconcile
+ * @param {object} distilled
+ * @returns {{total:number, counts:Record<string,number>, rejected:string[], merged:number}}
+ */
+export function summarizeDecisions(reconcile, distilled) {
+  const counts = {}
+  const decisions = Array.isArray(reconcile?.decisions) ? reconcile.decisions : []
+  for (const decision of decisions) {
+    const op = String(decision?.op || '')
+    if (op) counts[op] = (counts[op] || 0) + 1
+  }
+  const merged = (Array.isArray(distilled?.items) ? distilled.items : [])
+    .filter((item) => String(item?.status || '').startsWith('merged_into:')).length
+  const rejected = (Array.isArray(reconcile?.rejected) ? reconcile.rejected : [])
+    .map((row) => String(row?.error || 'unknown'))
+    .filter(Boolean)
+  const applied = Array.isArray(reconcile?.applied) ? reconcile.applied.length : 0
+  return { total: decisions.length, applied, counts, rejected, merged }
+}
+
+/**
  * 报告阶段：清洁审计 → 渲染/落盘报告 → 计算可切会话结论。
  * @param {{
  *   runId:number, run:any, spool:any, distilled:any, items:any[], api:any, backend:any,
@@ -68,7 +90,10 @@ export function reportPhase({ runId, run, spool, distilled, items, api, backend,
       const switchPreview = computeSwitchReady({
         reportPath: '', reportEnabled: false, currentJobId: api?.jobId, withDb, hygiene,
       })
+      const reconcile = distilled && distilled.reconcile ? distilled.reconcile : null
+      const decisions = reconcile ? summarizeDecisions(reconcile, distilled) : null
       const markdown = renderWrapReport({
+        decisions,
         run: {
           id: runId, trigger: String(spool.trigger || run.trigger || ''),
           day: dayStamp(now()), createdAt: run.created_at,

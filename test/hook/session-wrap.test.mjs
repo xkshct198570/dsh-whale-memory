@@ -721,3 +721,47 @@ test('S3 默认关：不开 reconcile 时行为与旧路一致（不产 decision
   assert.equal(run.state, 'done')
   assert.equal(JSON.parse(run.distilled_json).reconcile, undefined)
 })
+
+test('S4 归纳：3 同主题候选 → 1 条合并候选 + 2 merged_into；报告含决策计数且无正文', async (t) => {
+  const distill3 = {
+    summary: '本轮确认备份与端口治理',
+    items: [
+      { kind: 'lesson', text: '收尾前必须先备份甲', evidence: '动库前先备份', confidence: 0.9, tags: ['运维'] },
+      { kind: 'lesson', text: '收尾前必须先备份乙', evidence: '动库前先备份', confidence: 0.9, tags: ['运维'] },
+      { kind: 'lesson', text: '收尾前必须先备份丙', evidence: '动库前先备份', confidence: 0.9, tags: ['运维'] },
+    ],
+  }
+  const s = setup(t, {
+    overrides: { wrap: { ...configOf('/tmp').wrap, reconcile: { enabled: true, topK: 5, maxNeighborChars: 200 } } },
+    llm: {
+      async *stream({ messages }) {
+        const prompt = String(messages?.[0]?.content?.[0]?.text || '')
+        const payload = prompt.includes('整合器')
+          ? { decisions: [{ item: 0, op: 'MERGE', targetId: '', mergeItems: [1, 2], afterText: '收尾前必须先备份并校验', reason: '同主题合并', evidence: '动库前先备份' }] }
+          : distill3
+        yield { type: 'text-delta', text: JSON.stringify(payload) }
+      },
+    },
+  })
+  s.withDb((db) => seedNode(db, { id: 'n-old', text: '动库前先备份是铁律，收尾前也必须备份' }))
+  const writes = []
+  const orig = s.backend.write
+  s.backend.write = async (q) => { writes.push(q); return orig(q) }
+  const { out, job } = await queueRun(s, {})
+  await s.keeper.handlers.get('wrap')(job.payload, { jobId: job.id, log: () => {}, now: () => Date.now() / 1000 })
+  const run = s.withDb((db) => getRun(db, out.runId))
+  assert.equal(run.state, 'done')
+  const items = JSON.parse(run.distilled_json).items
+  assert.equal(items.filter((item) => item.status === 'written').length, 1, '只落 1 条候选')
+  assert.equal(items.filter((item) => String(item.status).startsWith('merged_into:')).length, 2)
+  assert.equal(writes.length, 1, '合并后只调一次写')
+  assert.equal(run.candidates, 1, '计数按落库条目算')
+  // 报告：决策计数可读，且不含候选正文。
+  const report = s.withDb((db) => db.prepare('SELECT report_path FROM wrap_runs WHERE id=?').get(out.runId))
+  const text = readFileSync(String(report.report_path), 'utf8')
+  assert.match(text, /## 整合决策/)
+  assert.match(text, /MERGE 1/)
+  // 报告只含改写后的候选短语义与计数；不得含素材原文/证据逐字片段。
+  assert.equal(text.includes('以后都必须在动库前备份，这是铁律'), false, '报告不得含素材原文')
+  assert.equal(text.includes(MATERIAL.turns[0].text), false)
+})

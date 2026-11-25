@@ -77,9 +77,14 @@ export function parseReconcileOutput(raw) {
     item: Number(row?.item),
     op: String(row?.op || '').toUpperCase(),
     targetId: row?.targetId === null || row?.targetId === undefined ? '' : String(row.targetId),
+    mergeItems: Array.isArray(row?.mergeItems) ? row.mergeItems.map((n) => Number(n)) : [],
     afterText: normalizeText(row?.afterText),
     reason: normalizeText(row?.reason).slice(0, MAX_REASON),
     evidence: normalizeText(row?.evidence).slice(0, MAX_EVIDENCE),
+    // S4 校正建议（可选）：不合法整项拒绝，避免“半套校正”写坏等级/类型。
+    level: row?.level === undefined ? '' : String(row.level),
+    memoryType: row?.memoryType === undefined ? '' : String(row.memoryType),
+    tags: Array.isArray(row?.tags) ? row.tags.map((t) => String(t).trim()).filter(Boolean).slice(0, 5) : [],
   }))
   return { ok: true, decisions }
 }
@@ -120,19 +125,39 @@ export function validateDecisions(decisions, { items = [], neighbors = [] } = {}
     if (!Number.isInteger(itemIndex) || itemIndex < 0 || itemIndex >= list.length) {
       rejected.push({ decision, error: 'bad_item' }); continue
     }
-    if (seen.has(key)) { rejected.push({ decision, error: 'duplicate' }); continue }
     const needsTarget = op === 'UPDATE' || op === 'MERGE' || op === 'ARCHIVE'
     const targetId = String(decision?.targetId || '')
-    if (needsTarget) {
+    const mergeItems = Array.isArray(decision?.mergeItems) ? decision.mergeItems : []
+    // S4：MERGE 允许“跨候选合并”——无 target 时必须有 mergeItems（同主题多条合成一条）。
+    if (op === 'MERGE' && !targetId) {
+      if (mergeItems.length === 0) { rejected.push({ decision, error: 'target_required' }); continue }
+      if (mergeItems.some((n) => !Number.isInteger(n) || n < 0 || n >= list.length || n === itemIndex)) {
+        rejected.push({ decision, error: 'bad_item' }); continue
+      }
+    } else if (needsTarget) {
       if (!targetId) { rejected.push({ decision, error: 'target_required' }); continue }
       if (!allowed.has(targetId)) { rejected.push({ decision, error: 'target_not_neighbor' }); continue }
     }
+    const LEVELS = new Set(['core', 'important', 'normal'])
+    const TYPES = new Set(['procedural', 'semantic', 'episodic', 'mixed'])
+    if (decision?.level && !LEVELS.has(decision.level)) { rejected.push({ decision, error: 'bad_level' }); continue }
+    if (decision?.memoryType && !TYPES.has(decision.memoryType)) { rejected.push({ decision, error: 'bad_memory_type' }); continue }
+    if (Array.isArray(decision?.tags) && decision.tags.some((tag) => Array.from(String(tag)).length > 24)) {
+      rejected.push({ decision, error: 'bad_tags' }); continue
+    }
+    // 去重放在形状/校正判据之后：先保证错误原因准确，再谈重复。
+    if (seen.has(key)) { rejected.push({ decision, error: 'duplicate' }); continue }
     if (targetId && !allowed.has(targetId)) { rejected.push({ decision, error: 'target_not_neighbor' }); continue }
     if (op !== 'NOOP' && op !== 'ARCHIVE') {
       const problem = textProblem(decision?.afterText)
       if (problem) { rejected.push({ decision, error: `text_${problem}` }); continue }
       const evidence = normalizeText(decision?.evidence)
       const haystacks = [normalizeText(list[itemIndex]?.text), normalizeText(list[itemIndex]?.evidence)]
+      for (const index of mergeItems) {
+        if (Number.isInteger(index) && list[index]) {
+          haystacks.push(normalizeText(list[index]?.text), normalizeText(list[index]?.evidence))
+        }
+      }
       if (targetId) haystacks.push(normalizeText(allowed.get(targetId)?.text))
       if (evidence && !haystacks.some((hay) => hay.includes(evidence))) {
         rejected.push({ decision, error: 'evidence_mismatch' }); continue
@@ -144,6 +169,10 @@ export function validateDecisions(decisions, { items = [], neighbors = [] } = {}
       item: itemIndex,
       targetId,
       afterText: op === 'ARCHIVE' || op === 'NOOP' ? '' : decision.afterText,
+      mergeItems: op === 'MERGE' && !targetId ? mergeItems : [],
+      level: decision.level || '',
+      memoryType: decision.memoryType || '',
+      tags: Array.isArray(decision.tags) ? decision.tags : [],
     })
   }
   return { valid, rejected }

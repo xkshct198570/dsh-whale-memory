@@ -979,5 +979,7 @@
   "overview.wrapSkipAutoDesc": "只影响空闲/关闭自动触发，手动仍可收尾",
   "overview.wrapSessionSkipped": "已跳过自动",
   "err.invalid_session": "会话 id 不合法",
-  "overview.wrapPhaseReconcile": "整合"
+  "overview.wrapPhaseReconcile": "整合",
+  "overview.wrapCopyReport": "复制报告",
+  "overview.wrapDownloadReport": "下载 .md"
 }

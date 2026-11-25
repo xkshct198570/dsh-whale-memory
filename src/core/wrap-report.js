@@ -1,4 +1,25 @@
 /**
+ * 整合决策摘要：只渲染计数与拒绝原因（无正文、无候选原文）。
+ * @param {{total?:number, counts?:Record<string,number>, rejected?:Array<string>, merged?:number}} decisions
+ * @returns {string}
+ */
+export function renderDecisions(decisions) {
+  const input = decisions && typeof decisions === 'object' ? decisions : {}
+  const counts = input.counts && typeof input.counts === 'object' ? input.counts : {}
+  const order = ['ADD', 'UPDATE', 'MERGE', 'ARCHIVE', 'NOOP', 'REVIEW']
+  const parts = order.filter((op) => Number(counts[op] || 0) > 0).map((op) => `${op} ${Number(counts[op])}`)
+  const lines = [`共 ${Number(input.total || 0)} 条决策：${parts.length ? parts.join(' · ') : EMPTY}`]
+  if (Number(input.merged || 0) > 0) lines.push(`跨候选合并：${Number(input.merged)} 条并入`)
+  const reasons = Array.isArray(input.rejected) ? input.rejected : []
+  if (reasons.length > 0) {
+    const tally = new Map()
+    for (const reason of reasons) tally.set(String(reason), (tally.get(String(reason)) || 0) + 1)
+    lines.push(`校验拒绝：${[...tally].map(([reason, n]) => `${reason}×${n}`).join(' · ')}`)
+  }
+  return lines.join('\n')
+}
+
+/**
  * 收尾报告渲染：结构化入参 → Markdown 文件。
  *
  * 为什么入参是结构化的、绝不接受 material/turns：
@@ -202,7 +223,7 @@ function renderSwitchReady(switchReady) {
  * @returns {string} Markdown 报告
  */
 export function renderWrapReport({
-  run, summary, candidates, ruleProposals, openLoops, hygiene, switchReady, generatedAt, dropped,
+  run, summary, candidates, ruleProposals, openLoops, hygiene, switchReady, generatedAt, dropped, decisions = null,
 } = {}) {
   const runMeta = run && typeof run === 'object' ? run : {}
   const runId = pickId(runMeta, ['runId', 'id']) || '-'
@@ -235,6 +256,7 @@ export function renderWrapReport({
     '',
     candidatesSection,
     '',
+    ...(decisions ? ['## 整合决策', '', renderDecisions(decisions), ''] : []),
     '## 规则提案',
     '',
     renderProposals(ruleProposals),
