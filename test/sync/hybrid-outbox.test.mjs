@@ -353,3 +353,22 @@ test('createBackend：mode=hybrid 返回 Hybrid（本地+HTTP），mode=local �
   local.dispose()
   rmSync(localDir, { recursive: true, force: true })
 })
+
+test('hybrid：首轮画像读本地真源（local.profileLayers 透传）；fail-closed 原因透传 openError', async (t) => {
+  const dir = tempDir()
+  const local = new LocalBackend({ dataDir: dir, useWorker: false, log: () => {} })
+  const hybrid = new HybridBackend({ local, log: () => {} })
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  t.after(() => hybrid.dispose())
+  const seeded = await local.write({ text: '偏好：画像必须走本地真源', identity, layer: 'user' })
+  assert.equal(seeded.ok, true)
+  const groups = await hybrid.profileLayers({ user: 5, lesson: 5, fact: 3 }, { identity })
+  assert.equal(groups.user.length, 1)
+  assert.match(groups.user[0].text, /画像必须走本地真源/)
+  assert.equal(hybrid.openError, '')
+
+  // 阻断原因：hybrid 必须把本地的 fail-closed 原因透出，否则面板只说"不可用"而说不出为什么。
+  const blocked = new HybridBackend({ local: { withDb() {}, ready: false, openError: 'disk_full' }, log: () => {} })
+  assert.equal(blocked.ready, false)
+  assert.equal(blocked.openError, 'disk_full')
+})

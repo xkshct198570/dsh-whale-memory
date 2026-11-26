@@ -8,6 +8,28 @@ import { sendJson } from '../http-kit.js'
 import { value } from '../../shared/config-values.js'
 import { WHALE_PROTOCOL } from '../../core/backend.js'
 
+/**
+ * backend 异常 → 502 统一出口。
+ *
+ * 为什么需要单独出口：各路由的 catch 各自映射 `backend_error`/`backend_unreachable`，
+ * 迁移 fail-closed 被折叠后就只剩"加载失败"——面板说不出"缺回滚点/磁盘不可写"。
+ *
+ * @param {any} res
+ * @param {(res:any, status:number, payload:object)=>any} sendJson
+ * @param {unknown} err
+ * @param {string} [fallback] 非迁移阻断时的既有错误码（保持各路由原口径）
+ */
+export function sendBackendFailure(res, sendJson, err, fallback = 'backend_error') {
+  if (err?.code === 'migration_backup_failed') {
+    return sendJson(res, 502, {
+      ok: false, offline: true,
+      error: String(err.message || 'migration_backup_failed').slice(0, 200),
+      reason: String(err.reason || ''),
+    })
+  }
+  return sendJson(res, 502, { ok: false, error: fallback })
+}
+
 /** 405 统一出口：带 allow 头。 */
 export function sendMethodNotAllowed(res, allow) {
   res.setHeader('allow', allow)
@@ -39,8 +61,6 @@ export function makeBackendView({ backend, config }) {
       protocol: status ? (status.protocol ?? null) : WHALE_PROTOCOL,
       expected: String(status?.expected || WHALE_PROTOCOL),
       match: status ? Boolean(status.ok) : true,
-      // 迁移 fail-closed 原因（未阻断时省略该键）：面板离线卡要能说出"为什么打不开"，而不是只说不可用。
-      ...(backend?.openError ? { reason: String(backend.openError) } : {}),
     }
   }
 }

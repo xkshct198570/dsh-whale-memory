@@ -6,7 +6,7 @@ import { bigrams, contentHash, normalize } from '../tokenize.js'
 import { linkMutex, linkSupersede, normalizeTags } from '../relations.js'
 import {
   TEXT_LIMIT, decideWrite, finite, mapSource, normalizeIdentity, validExpiredAt,
-  validLevel, validMemoryType,
+  validLayer, validLevel, validMemoryType,
 } from './decide.js'
 import { privacyCheck } from './privacy.js'
 import { isActiveHashConflict, recordEvolution, recordWrite, withTx } from './audit.js'
@@ -47,14 +47,15 @@ export function insertNodeRow(db, event, text, { ts, validAt, source, origin, le
     at += 1
     id = `n${at}_${hash.slice(0, 10)}`
   }
-  // v7：layer 由写入口（backend.write / 导入）收敛成三值或 NULL，这里只落列不重判。
+  // v7：写入口（backend.write / 导入）已收敛，这里再做一次 validLayer——门面直接导出
+  // processEvent，外部调用方可能绕过写入口传脏值；落列点必须是最后一道白名单。
   db.prepare(`INSERT INTO nodes
     (id,text,text_hash,text_bigrams,level,memory_type,source,status,role_id,user_id,workspace,tags,
      context_note,weight,pinned,layer,hits,vector_state,origin,trace_id,valid_at,expired_at,created_at,updated_at)
     VALUES (?,?,?,?,?,?,?,'active',?,?,?,?,?,1,?,?,0,'none',?,?,?,?,?,?)`).run(
     id, text, hash, bigrams(text), level, memoryType, source,
     ident.roleId, ident.userId, ident.workspace,
-    JSON.stringify(normalizeTags(event?.tags)), '', pinned, layer ?? null,
+    JSON.stringify(normalizeTags(event?.tags)), '', pinned, validLayer(layer),
     origin, String(event?.traceId ?? ''),
     validAt, expiredAt, ts, ts,
   )

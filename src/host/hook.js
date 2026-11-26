@@ -19,7 +19,7 @@
  */
 import { readdirSync, realpathSync, statSync } from 'node:fs'
 import { join } from 'node:path'
-import { deriveWorkspace, resolveIdentity } from './identity.js'
+import { deriveWorkspace, isDelegatedHeader, resolveIdentity } from './identity.js'
 import { bool, num, value } from '../shared/config-values.js'
 import { judgeReply } from '../core/adoption.js'
 import { listRules } from '../core/rule-store.js'
@@ -619,7 +619,7 @@ export function installHook(ctx, {
       const agent = payload?.agent
       const sessionId = agent?.session?.id
       if (!sessionId) return decision
-      if (agent?.session?.header?.origin === 'subagent') return decision
+      if (isDelegatedHeader(agent?.session?.header)) return decision
       if (payload?.signal?.aborted) return decision
 
       const sid = String(sessionId)

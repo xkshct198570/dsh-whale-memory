@@ -79,6 +79,12 @@ export class HybridBackend {
   get ready() { return !this.closed && Boolean(this.local?.ready) }
 
   /**
+   * 迁移 fail-closed 原因透传：hybrid 的读真源是本地区，否则面板只看到 ready=false 而说不出原因。
+   * @returns {string} 空串=未阻断
+   */
+  get openError() { return String(this.local?.openError || '') }
+
+  /**
    * 运行中补 token：转发到 HTTP 客户端（凭证服务异步解析，构造时拿不到）。
    * @param {string} token
    * @returns {{ ok: boolean }}
@@ -448,6 +454,8 @@ export class HybridBackend {
 
   // 以下是本地专属能力：所有落库/审计/导入导出都走本地真源，不代理远端。
   withDb(fn) { return this.local.withDb(fn) }
+  // 首轮画像读本地分层（layer 是本地写入的结果，远端副本可能落后/不支持）；缺能力时抛给调用方显式处理。
+  profileLayers(limits, opts) { return this.local.profileLayers(limits, opts) }
   drainWrites() { return this.local.drainWrites() }
   reviewWrite(id, decision, reason) { return this.local.reviewWrite(id, decision, reason) }
   listEpisodic(limit) { return this.local.listEpisodic(limit) }

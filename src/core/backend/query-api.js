@@ -11,6 +11,7 @@ import { computeMetrics } from '../metrics.js'
 import { memoryPressure } from '../../shared/memory-guard.js'
 import { bool } from '../../shared/config-values.js'
 import { NODE_EXPORT_FIELDS, identityFilter, whereOf } from './base.js'
+import { LAYERS } from '../../shared/layers.js'
 
 /**
  * hit_ids 解析成命中条数。
@@ -119,7 +120,7 @@ export const queryApi = {
     const db = this._db()
     const out = { user: [], lesson: [], fact: [] }
     const filter = identityFilter(opts?.identity)
-    for (const layer of ['user', 'lesson', 'fact']) {
+    for (const layer of LAYERS) {
       const cap = Math.max(0, Math.min(20, Math.trunc(Number(limits?.[layer]) || 0)))
       if (!cap) continue
       out[layer] = db.prepare(`SELECT id,text,layer FROM nodes

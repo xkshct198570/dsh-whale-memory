@@ -7,7 +7,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import http from 'node:http'
 import { installIdentitySource } from '../../src/host/identity-source.js'
-import { resolveIdentity } from '../../src/host/identity.js'
+import { isDelegatedHeader, resolveIdentity, sessionIdentityOf } from '../../src/host/identity.js'
 import { Config } from '../../src/host/config.js'
 import { createRoutes } from '../../src/host/routes.js'
 
@@ -154,4 +154,33 @@ test('/stats：identity 带 source/workspaceSource 与 migration 只读字段，
   } finally {
     await close()
   }
+})
+
+
+test('会话身份唯一判据：header 矩阵与 identity_required（工具/画像共用）', () => {
+  const deps = {
+    getIdentityCfg: () => ({ mode: 'auto' }),
+    getIdentityHint: () => null,
+    getHostUserId: () => 'u-host',
+  }
+  // 子代理判据矩阵：origin / delegationDepth / 两者 / 都不是。
+  assert.equal(isDelegatedHeader({ origin: 'subagent' }), true)
+  assert.equal(isDelegatedHeader({ delegationDepth: 1 }), true)
+  assert.equal(isDelegatedHeader({ origin: 'subagent', delegationDepth: 2 }), true)
+  assert.equal(isDelegatedHeader({ cwd: '/tmp/x' }), false)
+  assert.equal(isDelegatedHeader(null), false)
+
+  // 会话身份：缺 header / 缺 cwd / fixed 缺 userId → identity_required；正常 → host+session 来源。
+  assert.deepEqual(sessionIdentityOf({ header: null, ...deps }), { ok: false, error: 'identity_required' })
+  assert.deepEqual(sessionIdentityOf({ header: {}, ...deps }), { ok: false, error: 'identity_required' })
+  assert.deepEqual(
+    sessionIdentityOf({ header: { cwd: '/tmp/ws' }, ...deps, getIdentityCfg: () => ({ mode: 'fixed' }) }),
+    { ok: false, error: 'identity_required' },
+  )
+  const got = sessionIdentityOf({ header: { cwd: '/tmp/ws' }, ...deps })
+  assert.equal(got.ok, true)
+  assert.equal(got.identity.userId, 'u-host')
+  assert.equal(got.identity.workspace, '/tmp/ws')
+  assert.equal(got.sources.userId, 'host')
+  assert.equal(got.sources.workspace, 'session')
 })

@@ -3,7 +3,7 @@ import { now } from '../db.js'
 import { bigrams, contentHash, normalize } from '../tokenize.js'
 import { linkMutex, linkSupersede, normalizeTags } from '../relations.js'
 import {
-  isProtectedTarget, mapSource, sourceRank, validExpiredAt, validLevel, validMemoryType,
+  isProtectedTarget, mapSource, sourceRank, validExpiredAt, validLayer, validLevel, validMemoryType,
 } from './decide.js'
 import { isActiveHashConflict, recordEvolution, recordWrite } from './audit.js'
 import { insertNodeRow, validAtOf } from './process.js'
@@ -41,6 +41,8 @@ export function acceptCandidate(db, row, text, payload, shadowOf, writeId) {
     origin: landedOrigin,
     level: validLevel(payload?.level),
     memoryType: validMemoryType(payload?.memory_type),
+    // v7：候选转正必须保留分层（payload 缺失=旧候选→NULL）；MERGE 分支不动目标 layer。
+    layer: validLayer(payload?.layer),
     expiredAt: validExpiredAt(payload?.expired_at),
   })
 

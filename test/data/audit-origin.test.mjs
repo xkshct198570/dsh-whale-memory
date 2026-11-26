@@ -13,7 +13,8 @@ import { tmpdir } from 'node:os'
 import { createBackend } from '../../src/core/backend.js'
 
 const IDENT = { userId: 'u1', roleId: '', workspace: 'web' }
-const PAYLOAD_KEYS = ['expired_at', 'level', 'memory_type', 'origin', 'shadowOf', 'source', 'tags', 'targetId']
+// v7 契约变更：payload 增加 `layer`（候选转正还原分层）；键集从 8 → 9，断言随契约同步而非放宽。
+const PAYLOAD_KEYS = ['expired_at', 'layer', 'level', 'memory_type', 'origin', 'shadowOf', 'source', 'tags', 'targetId']
 
 async function freshNode(t, text) {
   const home = mkdtempSync(join(tmpdir(), 'whale-audit-origin-'))

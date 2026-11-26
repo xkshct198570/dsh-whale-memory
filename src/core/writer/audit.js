@@ -2,7 +2,7 @@
 import { now } from '../db.js'
 import { normalizeTags } from '../relations.js'
 import {
-  finite, mapSource, normalizeIdentity, validExpiredAt, validLevel, validMemoryType,
+  finite, mapSource, normalizeIdentity, validExpiredAt, validLayer, validLevel, validMemoryType,
 } from './decide.js'
 
 /**
@@ -26,9 +26,9 @@ import {
  * （漏 origin/shadowOf 会让 `json_extract(payload,'$.origin')` 的查询静默漏行）。
  *
  * @param {{ level?: unknown, memory_type?: unknown, tags?: unknown, source?: unknown, origin?: unknown,
- *   expired_at?: unknown, shadowOf?: unknown, targetId?: unknown }} [fields]
+ *   expired_at?: unknown, shadowOf?: unknown, targetId?: unknown, layer?: unknown }} [fields]
  * @returns {{ level: string, memory_type: string, tags: string[], source: string, origin: string,
- *   expired_at: number|null, shadowOf: string|null, targetId: string|null }}
+ *   expired_at: number|null, shadowOf: string|null, targetId: string|null, layer: string|null }}
  */
 export function writePayload(fields = {}) {
   return {
@@ -40,6 +40,8 @@ export function writePayload(fields = {}) {
     expired_at: validExpiredAt(fields?.expired_at),
     shadowOf: fields?.shadowOf ? String(fields.shadowOf) : null,
     targetId: fields?.targetId ? String(fields.targetId) : null,
+    // v7：影子候选 accept 要还原分层；不存这里，候选转正就会静默丢 layer。
+    layer: validLayer(fields?.layer),
   }
 }
 
@@ -54,6 +56,7 @@ export function recordWrite(db, event, decision) {
     expired_at: event?.expired_at,
     shadowOf: decision?.shadowOf,
     targetId: decision?.targetId,
+    layer: decision?.layer ?? event?.layer,
   })
   const info = db.prepare(`INSERT INTO writes
     (ts,trace_id,action,node_id,reason,before_text,after_text,mode,payload,user_id,role_id,workspace)

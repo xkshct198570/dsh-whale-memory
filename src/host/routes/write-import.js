@@ -7,6 +7,7 @@ import { Buffer } from 'node:buffer'
 import { readJson } from '../http-kit.js'
 import { statusOf } from '../../shared/error-table.mjs'
 import { PREFIX } from './prefix.js'
+import { sendBackendFailure } from './common.js'
 
 /** 写入文本上限（与 Config.write.maxChars 默认值一致，路由侧再做硬顶）。 */
 const MAX_WRITE_CHARS = 500
@@ -59,7 +60,7 @@ export async function handleWriteImport({
         })
       } catch (err) {
         log(`[whale-memory] write fail: ${err?.message || 'error'}`)
-        return sendJson(res, 502, { ok: false, error: 'backend_error' })
+        return sendBackendFailure(res, sendJson, err, 'backend_error')
       }
       if (!result) return sendJson(res, 502, { ok: false, error: 'backend_unreachable' })
       if (result.ok === false) {

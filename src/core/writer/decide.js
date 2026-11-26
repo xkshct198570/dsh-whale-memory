@@ -26,10 +26,11 @@ const SOURCE_RANK = { owner: 5, self: 4, group: 3, web: 2, tool: 2, import: 1 }
 /** 单条写入文本硬顶（与 nodes.text CHECK 同值）。 */
 export const TEXT_LIMIT = 500
 
+// 分层标签词汇/白名单的唯一实现在 shared/layers.js；本域再导出以保持 decide 的公开面不变。
+export { validLayer } from '../../shared/layers.js'
+
 const LEVELS = new Set(['core', 'important', 'normal'])
 const MEMORY_TYPES = new Set(['semantic', 'procedural', 'episodic', 'mixed'])
-/** 分层标签（v7）合法值：DB 无 CHECK，写入层白名单是唯一保证。 */
-const LAYERS = new Set(['fact', 'lesson', 'user'])
 /** 事件来源 → nodes.source（schema CHECK 只认这几种，'chat'/'search' 不是合法列值）。 */
 const SOURCE_MAP = {
   chat: 'self',
@@ -668,20 +669,6 @@ export function validLevel(level) {
 export function validMemoryType(type) {
   const v = String(type ?? '')
   return MEMORY_TYPES.has(v) ? v : 'semantic'
-}
-
-/**
- * 分层标签（v7）：只允许 fact/lesson/user，其余（含缺省/旧调用方/脏导入）一律 NULL。
- *
- * 为什么不在 DB 加 CHECK：老库走 ALTER TABLE 加不了 CHECK；且未知值的语义是"未分层"
- * （读路径按 NULL 处理），用写入层白名单 + 读路径 IN 三值同样安全，且迁移不需要重建表。
- *
- * @param {unknown} layer
- * @returns {'fact'|'lesson'|'user'|null}
- */
-export function validLayer(layer) {
-  const v = String(layer ?? '')
-  return LAYERS.has(v) ? v : null
 }
 
 /** expired_at：只在显式传入有限正数时落库。 */

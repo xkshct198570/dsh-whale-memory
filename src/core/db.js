@@ -143,7 +143,7 @@ export function quickCheck(db) {
   }
 }
 
-/** 只读探测库内 schema 版本；meta 表不存在/读失败按 0（=新库或不可读，不做快照）。 */
+/** 只读探测库内 schema 版本；meta 表不存在/读失败/值非法返回 0（0 只表示"版本未知"，不等于新库）。 */
 function readSchemaVersion(db) {
   try {
     const row = db.prepare("SELECT value FROM meta WHERE key='schema_version'").get()
@@ -155,9 +155,43 @@ function readSchemaVersion(db) {
 }
 
 /**
+ * 迁移与快照需求判定（v7 fail-closed 的判据来源）。
+ *
+ * 为什么不能只看 `meta.schema_version`：版本行缺失/被手工改错会读成 0，旧逻辑把它当"新库"
+ * 从而跳过快照——带数据的库就会在没有回滚点的情况下执行 ALTER；版本号已是 7 但列形态不符
+ * （半迁移/手工删列）同样必须先进快照再兜底。
+ *
+ * 判据：
+ * - `existing`：`sqlite_master` 已有 nodes 表（= 已初始化的记忆库，哪怕版本行缺失）；
+ * - `missingLayer`：nodes 存在但没有 v7 的 layer 列（形态未到位）；
+ * - `migrate`：`current < SCHEMA_VERSION` 或 `existing && missingLayer`。
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @returns {{ current: number, existing: boolean, missingLayer: boolean, migrate: boolean }}
+ */
+export function schemaStateOf(db) {
+  const current = readSchemaVersion(db)
+  let existing = false
+  let missingLayer = false
+  try {
+    existing = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes'").get())
+    if (existing) {
+      missingLayer = !db.prepare('PRAGMA table_info(nodes)').all()
+        .some((column) => String(column.name) === 'layer')
+    }
+  } catch {
+    // 读不到形态时保守按"无 nodes 表"处理；真正的坏库由 quick_check/ensureSchema 报错。
+    existing = false
+    missingLayer = false
+  }
+  return { current, existing, missingLayer, migrate: current < SCHEMA_VERSION || (existing && missingLayer) }
+}
+
+/**
  * @param {string} dataDir 数据目录（不存在则创建）
  * @param {{ readOnly?: boolean, backupOnMigrate?: boolean }} [opts]
- *   backupOnMigrate=false：跳过快照与 v7 fail-closed 闸（单测/临时库专用；生产默认开）。
+ *   backupOnMigrate=false：跳过快照与 v7 fail-closed 闸（**仅**单测/一次性脚本可用；
+ *   生产唯一入口 LocalBackend 不得传 false——否则带数据的库可能在无回滚点时被迁移）。
  * @returns {import('node:sqlite').DatabaseSync}
  * @throws {Error & { code?: string }} 迁移快照失败时 `code='migration_backup_failed'`，且**不执行迁移**
  */
@@ -194,8 +228,11 @@ export function openDb(dataDir, { readOnly = false, backupOnMigrate: doBackup = 
       }
       db.exec('PRAGMA journal_mode = WAL')
       db.exec('PRAGMA synchronous = NORMAL')
-      const current = readSchemaVersion(db)
-      if (doBackup && current > 0 && current < SCHEMA_VERSION) {
+      const state = schemaStateOf(db)
+      // 快照条件（v7 起）：库已初始化（有 nodes 表或版本号>0）且需要迁移/补形态。
+      // 全新空库（无 nodes、版本 0）不需要快照——没有任何可回滚的数据。
+      const mustSnapshot = doBackup && state.migrate && (state.current > 0 || state.existing)
+      if (mustSnapshot) {
         // 快照结果挂在连接上供诊断（db.js 无 logger；不阻断、不静默：调用方可读）。
         db.migrationBackup = backupOnMigrate(db, dir)
         // v7 起 fail-closed：没有回滚点就不迁移。任何 current<7 的升级都包含 v7 的 ALTER，

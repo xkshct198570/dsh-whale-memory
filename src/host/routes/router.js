@@ -237,6 +237,15 @@ export function createRoutes({
         try { if (!res.writableEnded) res.end() } catch { /* 收尾失败没有可上报的通道 */ }
         return undefined
       }
+      // 迁移 fail-closed 必须带原因：折叠成 backend_error 时记忆库页只显示"加载失败"，
+      // 看不到"缺回滚点/磁盘不可写"这类可行动信息。
+      if (err?.code === 'migration_backup_failed') {
+        return sendJson(res, 502, {
+          ok: false, offline: true,
+          error: String(err.message || 'migration_backup_failed').slice(0, 200),
+          reason: String(err.reason || ''),
+        })
+      }
       return sendJson(res, 502, { ok: false, error: 'backend_error' })
     }
   }

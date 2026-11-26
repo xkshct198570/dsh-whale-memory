@@ -17,7 +17,7 @@
  * - 显式：pre-step 只做确定性意图判定并记 pendingIntent；turn-stopping 时入队（不阻塞回复）。
  * - 空闲：60s tick；无进行中的 turn、有材料、超过 idleMinutes 才触发；同材料 hash 不重复触发。
  * - disposed：会话被移除时 flush；失败只记日志，不阻塞宿主 dispose。
- * - 子代理会话（header.origin==='subagent'）根本不进缓冲：它没有可裁定的 owner。
+ * - 子代理会话（`identity.isDelegatedHeader`：origin 或 delegationDepth）根本不进缓冲：它没有可裁定的 owner。
  */
 
 import { privacyCheck } from '../core/writer.js'
@@ -25,6 +25,7 @@ import { detectWrapIntent } from '../core/wrap-intent.js'
 import { materialHash, normalizeMaterial } from '../core/wrap-material.js'
 import { bool, num } from '../shared/config-values.js'
 import { projectSessions } from './session-capture/sessions.js'
+import { isDelegatedHeader } from './identity.js'
 
 /** 单条消息缓冲上限（码点）：一次长粘贴不应挤掉整轮对话。 */
 const MAX_MESSAGE_CHARS = 2000
@@ -131,7 +132,7 @@ export function installSessionCapture(ctx, {
     const sid = idOf(session)
     if (!sid) return null
     const header = session?.header || {}
-    if (header.origin === 'subagent') return null
+    if (isDelegatedHeader(header)) return null
     let rec = sessions.get(sid)
     if (!rec) {
       rec = {
@@ -249,7 +250,7 @@ export function installSessionCapture(ctx, {
     try {
       if (disposed || decision?.kind !== 'enter') return decision
       const session = payload?.agent?.session
-      if (!session || session?.header?.origin === 'subagent') return decision
+      if (!session || isDelegatedHeader(session?.header)) return decision
       const rec = ensure(session)
       if (!rec) return decision
       rec.lastActivity = now()

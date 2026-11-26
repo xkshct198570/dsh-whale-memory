@@ -6,6 +6,7 @@
 import { clamp, readJson } from '../http-kit.js'
 import { statusOf } from '../../shared/error-table.mjs'
 import { PREFIX } from './prefix.js'
+import { sendBackendFailure } from './common.js'
 
 export async function handleNodesReview({
   req, res, path, backend, traceId, log, sendJson, sendMethodNotAllowed,
@@ -26,7 +27,7 @@ export async function handleNodesReview({
         data = await backend.nodes({ identity: idn.identity, limit, offset })
       } catch (err) {
         log(`[whale-memory] nodes fail: ${err?.message || 'error'}`)
-        return sendJson(res, 502, { ok: false, error: 'backend_error' })
+        return sendBackendFailure(res, sendJson, err, 'backend_error')
       }
       if (!data) return sendJson(res, 502, { ok: false, error: 'backend_unreachable' })
       const items = Array.isArray(data.items) ? data.items : []

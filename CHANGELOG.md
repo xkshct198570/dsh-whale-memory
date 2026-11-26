@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.8.0-beta1 — 2026-11-27（普通记忆自动入库 S1 + 模型记忆工具面 S2）
+## 0.8.0-beta1 — 2026-11-27（普通记忆自动入库 S1 + 模型记忆工具面 S2 + 分层与首轮画像 S3）
 
 - **自动入库**：收尾普通记忆默认走 `process.js` 唯一闸——durable→active；task/stale→REJECT（before/after 均为 NULL，不存正文）；歧义/主观/低置信→审核候选。来源固定 `source=self`（owner 只留给用户手工/导入，避免保护面锁死后续 MERGE）。
 - **价值闸/歧义闸**：新增 `src/shared/ingest-policy.js`（纯判据，零 import）与 `classifyDurability`/`detectAmbiguity`；顺序 stale→task 句首/计划句→歧义→durable→uncertain，歧义只返回原因、不改写正文。
@@ -11,7 +11,12 @@
 - **模型记忆工具面（S2）**：新增 `memory_remember / memory_search / memory_read / memory_update / memory_forget`（`src/host/tools.js` + `tool-output.js` / `tool-errors.js` / `tool-rate-limit.js`）。身份固定当前会话，缺会话 cwd 一律 `IDENTITY_REQUIRED`；跨分区 id 按不存在（`NODE_NOT_FOUND`）；remember 走与收尾同一 `ingestPolicy`（含 `wrap.ingest.mode=review` 回退），任务/一次性句抛 `NOT_MEMORY`，歧义/保护面转 CANDIDATE；update 有 CAS（`NODE_CHANGED`）、保护面/重复正文分别拒；forget 只归档不物理删。
 - **限次与开关（S2）**：每回合 `remember/update/forget` 写尝试上限 `tools.maxWritesPerTurn`（默认 5，第 6 次 `RATE_LIMITED`，turn 变化清零）；`tools.enabled=false` 或子代理会话时调用被拒（`TOOLS_DISABLED`/`SUBAGENT_FORBIDDEN`，live rc.5 准入不调用 `when`，执行期闸为真关闭）；设置页新增「模型工具」组（三语）。
 - **审计与重构（S2）**：`updateNode` 审计行补 `writes.payload.origin`（面板/同步/工具三口径）并复用 `isProtectedTarget`（删除抄写）；`writePayload` 抽成唯一构造；tags 归一/解析移到 `src/shared/tags.js`（关系层再导出）；`write()` 透传 reason。
-- 测试：全量 **1154（1153 pass / 1 skip / 0 fail）**；新增写入闸 §7.1 十二条 + §7.2 判重、dispatch/reconcile 集成、迁移幂等、配置清理用例、工具面 18 例、真注册表 1 例、审计来源 3 例。
+- **分层与首轮画像（S3）**：schema v7 `nodes.layer`（`fact|lesson|user`，加法列、旧行 NULL、不加 CHECK）；收尾 kind→layer 单一映射（`lesson→lesson`、`decision/fact→fact`、`preference→user`、rule 无）；`validLayer` 唯一白名单（写入/导入共用），落列只在 `writer.process.insertNodeRow`；MERGE 保留目标 layer、SUPERSEDE 用本次事件 layer；导出末尾补 `layer`、导入补列/绑定（旧 JSONL 按 NULL 保真）。
+- **迁移 fail-closed（S3）**：迁移前快照失败 → `migration_backup_failed:<reason>` 且**不执行迁移**（`backend.ready=false`，原因进程内记忆、修好磁盘不自动重试，重启才重试）；`/stats` 返回 502 带完整原因（`backend.ready=false`），`/version` 阻断期间仍 200。
+- **首轮画像（S3）**：新增 `src/host/profile-context.js`——会话首轮把同身份 `user` top5 / `lesson` top5 / `fact` top3（`pinned DESC, weight DESC, updated_at DESC`）渲染成 ≤800 码点的「长期画像」，`systemPrompt.context` name=`whale-memory:profile`、order=129、零 IO 装配；每会话一次、第二轮不再出现，子代理/身份不可判定/中止跳过，失败只记日志，缓存上限 200 并随 `agent/disposed` 清理。
+- **身份判据收敛（S3）**：`sessionIdentityOf`（会话 cwd 派生 + `resolveIdentity`）与 `isDelegatedHeader` 收敛到 `identity.js` 唯一实现，工具与画像共用。
+- **S3 复核修复批**：候选转正保分层（`writes.payload.layer` + `acceptCandidate` 还原）；迁移 fail-closed 判据改 `schemaStateOf`（版本行缺失/版本与列形态不符也必须先快照，空库不空快照）；落列点 `insertNodeRow` 再过 `validLayer`（门面直出 `processEvent` 也不能写脏值）；hybrid 透传 `profileLayers`/`openError`，http 无能力时安装即跳过；子代理判据收敛（hook/session-capture 改用 `isDelegatedHeader`）；画像在 `turn/end` 就摘 `active`（rc.5 assemble 先于 pre-step，防第二轮装配期带旧画像）、查询 await 后被中止不写缓存；迁移阻断原因在 `/stats` 与 `/nodes`/`/write` 等数据路由统一 `migration_backup_failed:<reason>`；分层词汇收敛 `src/shared/layers.js`。
+- 测试：全量 **1195（1194 pass / 1 skip / 0 fail）**；新增写入闸 §7.1 十二条 + §7.2 判重、dispatch/reconcile 集成、迁移幂等、配置清理用例、工具面 19 例、真注册表 1 例、审计来源 3 例、schema v7 7 例、layer 数据面 5 例（含候选转正/门面兜底）、收尾映射 2 例、画像 17 例 + 真库端到端 + 真 SystemPrompt 机制、分层词汇 3 例、身份矩阵 1 例、hybrid 画像 1 例。
 
 ## 0.7.3 — 2026-11-26（面板页签不可见修复）
 

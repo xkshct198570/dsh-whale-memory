@@ -7,6 +7,8 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { Context } from '@deepseek-ai/cordis'
+import SystemPromptService, { renderContextSections } from '@deepseek-ai/dsh-system-prompt'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -97,6 +99,12 @@ function fakeHost({ backend = stubBackend({}), header = HEADER, hostUserId = 'u1
     },
     disposeAgent(agent) {
       for (const handler of [...(listeners.get('agent/disposed') || [])]) handler({ agent })
+    },
+    /** 真宿主在 turn/end 时派发 session/event（profile 靠它在本轮结束后摘 active）。 */
+    endTurn(agent, turn = 1) {
+      for (const handler of [...(listeners.get('session/event') || [])]) {
+        handler(agent?.session, { type: 'turn/end', seq: 1, time: 1, data: { turn } })
+      }
     },
     /** 装配阶段求值：当前注册的 profile context 文本。 */
     assemble(sessionId) {
@@ -278,6 +286,7 @@ test('dispose：反注册 context 与监听器，之后不再注入', async () =
   assert.equal(host.contexts.length, 0)
   assert.equal(host.listeners.get('agent/pre-step')?.length ?? 0, 0)
   assert.equal(host.listeners.get('agent/disposed')?.length ?? 0, 0)
+  assert.equal(host.listeners.get('session/event')?.length ?? 0, 0)
   assert.equal(host.assemble('s-dispose'), '')
 })
 
@@ -347,4 +356,78 @@ test('宿主无 systemPrompt 面：不装监听器、不查库，只留一条不
   await host.preStep(agentOf('s-nosp'), { turn: 1 })
   assert.equal(backend.calls.length, 0)
   assert.equal(profile.textOf({ scope: { session: { id: 's-nosp' } } }), '')
+})
+
+
+test('turn/end 即摘 active：下一轮装配期（assemble 先于 pre-step）就不带画像', async () => {
+  const backend = stubBackend(GROUPS)
+  const host = fakeHost({ backend })
+  host.install()
+  const agent = agentOf('s-turnend')
+  await host.preStep(agent, { turn: 1 })
+  assert.match(host.assemble('s-turnend'), /【长期画像】/)
+  host.endTurn(agent, 1)
+  assert.equal(host.assemble('s-turnend'), '', 'turn/end 后装配期必须已为空（第二轮不出现）')
+  await host.preStep(agent, { turn: 2 })
+  assert.equal(host.assemble('s-turnend'), '')
+  assert.equal(backend.calls.length, 1)
+})
+
+test('真 SystemPrompt 机制：装配期解析为空 → refreshContext 带画像；turn/end 后下一轮装配即无画像', async () => {
+  const ctx = new Context()
+  ctx.plugin(SystemPromptService)
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  const backend = stubBackend(GROUPS)
+  const logs = []
+  installProfileContext({
+    ctx, backend,
+    getIdentityCfg: () => ({ mode: 'auto' }),
+    getIdentityHint: () => null,
+    getHostUserId: () => 'u1',
+    log: (line) => logs.push(line),
+  })
+  const agent = { session: { id: 'mech-1', header: HEADER } }
+  const scope = agent
+  const firstAssembly = await ctx.systemPrompt.assemble({ scope })
+  // rc.5 的顺序是 assemble 先于 pre-step：装配阶段 provider 求值必须是空（不查库、不提前注入）。
+  assert.deepEqual(renderContextSections(firstAssembly).filter((s) => s.text), [])
+  await ctx.waterfall('agent/pre-step', {
+    agent, turn: 1, step: 1, messages: [], signal: new AbortController().signal,
+  }, async () => ({ kind: 'enter' }))
+  const firstRequest = renderContextSections(ctx.systemPrompt.refreshContext(firstAssembly, { scope }))
+  assert.match(firstRequest.map((s) => s.text).join('\n'), /【长期画像】/, '首轮请求必须带画像')
+  // turn/end 在下一轮 assemble 前落盘：第二轮从装配期就不带画像。
+  ctx.emit('session/event', agent.session, { type: 'turn/end', seq: 42, time: 42, data: { turn: 1 } })
+  const secondAssembly = await ctx.systemPrompt.assemble({ scope })
+  const secondRequest = renderContextSections(ctx.systemPrompt.refreshContext(secondAssembly, { scope }))
+  assert.equal(secondRequest.some((s) => s.text.includes('【长期画像】')), false, '第二轮不得带画像')
+  assert.equal(backend.calls.length, 1, '每会话只查一次')
+  assert.ok(logs.some((line) => line.includes('profile injected chars=')))
+})
+
+test('查询期间被中止：不写缓存、不标注入（该会话下一轮仍可重试）', async () => {
+  let aborted = false
+  const backend = {
+    calls: 0,
+    async profileLayers() { this.calls += 1; aborted = true; return GROUPS },
+  }
+  const host = fakeHost({ backend })
+  const profile = host.install()
+  const agent = agentOf('s-late-abort')
+  const handler = host.listeners.get('agent/pre-step')[0]
+  await handler(
+    { agent, turn: 1, step: 1, signal: { get aborted() { return aborted } } },
+    async () => ({ kind: 'enter' }),
+  )
+  assert.equal(profile.size(), 0, '中止的查询结果不得进缓存')
+  assert.equal(host.assemble('s-late-abort'), '')
+  assert.equal(backend.calls, 1)
+})
+
+test('后端无 profileLayers（http/远端）：不装监听器、不查库，只留一条不可用日志', async () => {
+  const host = fakeHost({ backend: { calls: 0 } })
+  const profile = host.install()
+  assert.equal(profile.size(), 0)
+  assert.equal(host.listeners.get('agent/pre-step')?.length ?? 0, 0)
+  assert.match(host.logs.join('\n'), /profile unavailable: backend has no profileLayers/)
 })

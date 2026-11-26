@@ -140,8 +140,64 @@ test('/stats 在迁移阻断时返回可行动原因（health 区显示 [migrati
   assert.match(String(body.error), /^migration_backup_failed:/, '错误必须带原因，不能折叠成 backend_error')
   assert.ok(String(body.reason).length > 0)
   assert.equal(body.backend.ready, false)
-  assert.ok(String(body.backend.reason).length > 0, 'backend 视图也要带原因')
-  // /version 不碰库：阻断期间仍可用（页头/协议信息不该跟着记忆库一起黑）。
+  // 数据路由同样要能说出原因（记忆库页只看到 backend_error 等于没说）：/nodes 走统一错误出口。
+  const nodesRes = await fetch(`${root}/nodes?limit=1`)
+  const nodesBody = JSON.parse(await nodesRes.text())
+  assert.equal(nodesRes.status, 502)
+  assert.match(String(nodesBody.error), /^migration_backup_failed:/)
+  assert.ok(String(nodesBody.reason).length > 0)
+  // /version 在阻断期间仍 200（ready 快速失败；页头/协议信息不该跟着记忆库一起黑）。
   const version = await fetch(`${root}/version`)
   assert.equal(version.status, 200)
+})
+
+
+test('版本行缺失 + 有数据 + 无 layer：仍必须先快照再迁移（不得当成新库）', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'whale-v7-nover-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  makeV6Db(dir)
+  const raw = new DatabaseSync(join(dir, 'memory.db'))
+  raw.prepare("DELETE FROM meta WHERE key='schema_version'").run()
+  raw.close()
+
+  const db = openDb(dir)
+  try {
+    assert.equal(Number(db.prepare('SELECT count(*) AS n FROM nodes').get().n), 2)
+    assert.ok(nodeColumns(dir).includes('layer'))
+    assert.equal(String(db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value), '7')
+    assert.equal(db.migrationBackup?.performed, true, '带数据的库必须先留快照')
+    assert.equal(readdirSync(join(dir, 'backup')).filter((name) => BACKUP_RE.test(name)).length, 1)
+  } finally { closeDb(db) }
+})
+
+test('版本号已 7 但缺 layer 列（形态不符）：先快照再补列', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'whale-v7-shape-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const seed = openDb(dir)
+  seed.prepare(`INSERT INTO nodes
+    (id,text,text_hash,text_bigrams,level,memory_type,source,status,role_id,user_id,workspace,tags,
+     context_note,weight,pinned,hits,vector_state,origin,trace_id,created_at,updated_at)
+    VALUES ('s1','半迁移样本','hs','', 'normal','semantic','self','active','','','','[]','',1,0,0,'none','','',1,1)`).run()
+  closeDb(seed)
+  const raw = new DatabaseSync(join(dir, 'memory.db'))
+  raw.exec('ALTER TABLE nodes DROP COLUMN layer')
+  raw.close()
+
+  const db = openDb(dir)
+  try {
+    assert.ok(nodeColumns(dir).includes('layer'), '缺列必须被补上')
+    assert.equal(Number(db.prepare('SELECT count(*) AS n FROM nodes').get().n), 1)
+    assert.equal(db.prepare('SELECT layer FROM nodes WHERE id=?').get('s1').layer, null)
+    assert.equal(db.migrationBackup?.performed, true, '形态不符也必须先留快照')
+  } finally { closeDb(db) }
+})
+
+test('全新空目录：没有可回滚数据，不产生迁移快照', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'whale-v7-fresh-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const db = openDb(dir)
+  try {
+    assert.equal(String(db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value), '7')
+    assert.equal(readdirSync(dir).includes('backup'), false, '空库首建不该留空快照')
+  } finally { closeDb(db) }
 })

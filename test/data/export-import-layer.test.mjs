@@ -12,6 +12,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { LocalBackend } from '../../src/core/backend.js'
+import { processEvent } from '../../src/core/writer.js'
 
 const IDENT = { userId: 'u-layer', roleId: '', workspace: 'ws-layer' }
 
@@ -110,4 +111,33 @@ test('MERGE 保留目标既有 layer（不升级/清空），SUPERSEDE 新行用
   assert.notEqual(superseded.id, oldRow.id)
   assert.equal(layerOf(backend, superseded.id), 'lesson', 'SUPERSEDE 新行必须用本次事件 layer')
   assert.equal(layerOf(backend, oldRow.id), 'fact', '旧行 layer 留档不得被改')
+})
+
+test('影子候选转正保留 layer（payload 存 layer，accept 落同值）', async (t) => {
+  const backend = fresh(t, 'whale-layer-candidate-')
+  const subjective = '我觉得以后发布前应该多测一轮。'
+  const written = await backend.write({
+    text: subjective, identity: IDENT, layer: 'lesson', origin: 'session-wrap', source: 'self',
+    ingestPolicy: { mode: 'auto', minConfidence: 0.55, confidence: 0.9, dropTaskInstructions: true },
+  })
+  assert.equal(written.action, 'CANDIDATE', '主观句必须进审核队列（否则用例没覆盖候选路径）')
+  const candidate = backend.withDb((db) => db.prepare(
+    "SELECT id,payload FROM writes WHERE action='CANDIDATE' ORDER BY id DESC LIMIT 1",
+  ).get())
+  assert.ok(candidate?.payload, '候选必须留 payload')
+  assert.equal(JSON.parse(candidate.payload).layer, 'lesson', '候选 payload 必须存 layer，否则转正无处还原')
+  const accepted = backend.reviewWrite(candidate.id, 'accept', undefined, { identity: IDENT })
+  assert.equal(accepted.ok, true, JSON.stringify(accepted))
+  assert.equal(layerOf(backend, accepted.id), 'lesson', '候选转正后的节点必须保留候选 layer')
+})
+
+
+test('落列点兜底：processEvent 直传脏 layer 也只落 NULL（门面不能写脏值）', async (t) => {
+  const backend = fresh(t, 'whale-layer-facade-')
+  const res = backend.withDb((db) => processEvent(db, {
+    text: '门禁全绿后才能发布，且必须留证据', source: 'self', origin: 'plugin-x',
+    identity: IDENT, layer: 'topic',
+  }, { write: { reviewMode: 'auto' } }))
+  assert.equal(res.action, 'ADD')
+  assert.equal(layerOf(backend, res.id), null, '落列点是最后一道白名单：未知 layer 一律 NULL')
 })

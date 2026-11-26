@@ -77,6 +77,13 @@ test('hook：subagent 不召回', async () => {
     messages: [{ source: { kind: 'user' }, content: [{ type: 'text', text: '问' }] }],
   }, async () => ({ kind: 'enter' }))
   assert.equal(called, 0)
+
+  // delegationDepth 变体同样算子代理：判据只认 identity.isDelegatedHeader，一处实现。
+  await state.pre({
+    agent: { session: { id: 's2b', header: { cwd: '/home/hy/hy', delegationDepth: 2 } } },
+    messages: [{ source: { kind: 'user' }, content: [{ type: 'text', text: '问' }] }],
+  }, async () => ({ kind: 'enter' }))
+  assert.equal(called, 0, 'delegationDepth 变体不得召回')
 })
 
 test('hook：recall 传入非空 traceId 且含 session id', async () => {
