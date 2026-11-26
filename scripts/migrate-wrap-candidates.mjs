@@ -111,9 +111,12 @@ export function run(opts) {
   const db = new DatabaseSync(opts.db, opts.apply ? { timeout: 5000 } : { readOnly: true })
   const out = { db: opts.db, apply: opts.apply, candidates: 0, planned: {}, migrated: 0, rejected: 0, review: 0, skipped: 0, normalized: 0, failed: 0, backup: '' }
   try {
-    if (opts.apply) out.backup = backup(db, opts.db)
     const rows = candidateRows(db)
     out.candidates = rows.length
+    // 只有真要写入时才备份：no-op 的 --apply 不应每次多产一份 4.6M 快照。
+    const staleRejects = Number(db.prepare("SELECT count(*) AS n FROM writes WHERE action='REJECT' AND reason LIKE 'auto_ingested:%'").get()?.n || 0)
+    const actionable = rows.filter((row) => planOf(row).action !== 'SKIP').length
+    if (opts.apply && (actionable > 0 || staleRejects > 0)) out.backup = backup(db, opts.db)
     // 可见性：库里还有别的来源候选（tool/reflect/无身份），本脚本不处理，必须报数而不是装作全清。
     out.otherCandidates = Number(db.prepare(`SELECT count(*) AS n FROM writes
       WHERE action='CANDIDATE' AND COALESCE(json_extract(payload,'$.origin'),'')<>'session-wrap'`).get()?.n || 0)

@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-11-26T14:08:57.396Z",
+  "generatedAt": "2026-11-26T14:51:06.250Z",
   "thresholds": {
     "plan": 800,
     "freeze": 1200,
@@ -163,7 +163,7 @@
     "test/data/metrics.test.mjs": 269,
     "test/data/migrate-audit.test.mjs": 284,
     "test/data/migrate-script.test.mjs": 68,
-    "test/data/migrate-wrap-candidates.test.mjs": 82,
+    "test/data/migrate-wrap-candidates.test.mjs": 83,
     "test/data/rule-mirror.test.mjs": 303,
     "test/data/schema-v3.test.mjs": 171,
     "test/data/schema-v6.test.mjs": 66,
@@ -241,7 +241,7 @@
     "scripts/manual-build.mjs": 61,
     "scripts/migrate-audit.mjs": 1073,
     "scripts/migrate-from-gateway.mjs": 213,
-    "scripts/migrate-wrap-candidates.mjs": 140,
+    "scripts/migrate-wrap-candidates.mjs": 142,
     "scripts/run-tests.mjs": 61,
     "scripts/split-client.mjs": 258,
     "scripts/stress.mjs": 76

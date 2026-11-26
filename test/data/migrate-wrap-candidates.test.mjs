@@ -97,6 +97,7 @@ test('dry-run：只读、零副作用；apply：备份+重放+MIGRATED；第二�
   assert.equal(second.skipped, 2)
   assert.equal(second.migrated, 0)
   assert.equal(second.normalized, 0)
+  assert.equal(second.backup, '', '无工作的 apply 不得再产备份')
   assert.deepEqual(rowsOf(path), after, '第二遍计数不变、行不变')
   void dir
 })
