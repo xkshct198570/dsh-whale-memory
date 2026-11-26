@@ -11,7 +11,7 @@
 // 用法：node scripts/lint-size.mjs [--write|--check]（缺省 --check）。
 import fs from 'node:fs'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import * as acorn from 'acorn'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
@@ -250,32 +250,38 @@ function check(groups) {
   return fails
 }
 
-const args = process.argv.slice(2)
-const known = new Set(['--write', '--check'])
-for (const arg of args) {
-  if (!known.has(arg)) {
-    console.error(`[lint-size] 未知参数 ${arg}；用法：node scripts/lint-size.mjs [--write|--check]`)
-    process.exit(2)
+/** CLI 入口：只在被直接执行时跑；被测试 import 时只导出 effectiveLines。 */
+function main() {
+  const args = process.argv.slice(2)
+  const known = new Set(['--write', '--check'])
+  for (const arg of args) {
+    if (!known.has(arg)) {
+      console.error(`[lint-size] 未知参数 ${arg}；用法：node scripts/lint-size.mjs [--write|--check]`)
+      process.exit(2)
+    }
   }
-}
-const mode = args.includes('--write') ? 'write' : 'check'
+  const mode = args.includes('--write') ? 'write' : 'check'
 
-const groups = collect()
-report('source', groups.source)
-report('clientSrc', groups.clientSrc)
-report('tests', groups.tests)
-report('scripts', groups.scripts)
+  const groups = collect()
+  report('source', groups.source)
+  report('clientSrc', groups.clientSrc)
+  report('tests', groups.tests)
+  report('scripts', groups.scripts)
 
-if (mode === 'write') {
-  writeBaseline(groups)
-  process.exit(0)
+  if (mode === 'write') {
+    writeBaseline(groups)
+    process.exit(0)
+  }
+
+  const fails = check(groups)
+  if (fails.length > 0) {
+    for (const line of fails) console.error(`[lint-size] FAIL: ${line}`)
+    process.exit(1)
+  }
+  console.log(
+    `[lint-size] ok：source ${groups.source.size} / clientSrc ${groups.clientSrc.size} / tests ${groups.tests.size} / scripts ${groups.scripts.size} 个文件，0 违规`,
+  )
 }
 
-const fails = check(groups)
-if (fails.length > 0) {
-  for (const line of fails) console.error(`[lint-size] FAIL: ${line}`)
-  process.exit(1)
-}
-console.log(
-  `[lint-size] ok：source ${groups.source.size} / clientSrc ${groups.clientSrc.size} / tests ${groups.tests.size} / scripts ${groups.scripts.size} 个文件，0 违规`,
-)
+const isMain = Boolean(process.argv[1]) && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href
+if (isMain) main()

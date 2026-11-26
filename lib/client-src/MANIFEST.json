@@ -28,8 +28,20 @@
     "responsibility": "概览页：KPI、趋势、失败作业、收尾卡"
   },
   {
+    "file": "51-wrap-card-actions.js",
+    "responsibility": "会话收尾卡片 · 文案与数据动作：错误/状态/触发/跳过文案映射、阶段投影、useWrapCard 取数与动作 hook"
+  },
+  {
+    "file": "51-wrap-card-report.js",
+    "responsibility": "会话收尾卡片 · 报告视图：展开按钮/正文/复制下载（无 document 时隐藏动作）"
+  },
+  {
+    "file": "51-wrap-card-settings.js",
+    "responsibility": "会话收尾卡片 · 设置与动作区：会话下拉、立即收尾、自动收尾/跳过开关"
+  },
+  {
     "file": "51-wrap-card.js",
-    "responsibility": "会话收尾卡片：会话选择、状态徽标、指标块、失败折叠、报告与错误文案映射（S1）"
+    "responsibility": "会话收尾卡片主体：卡壳（状态/指标/警告/失败折叠）与小件（阶段进度/状态徽标/指标块），只装配子片"
   },
   {
     "file": "60-memory.js",

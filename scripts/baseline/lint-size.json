@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-11-26T22:08:29.634Z",
+  "generatedAt": "2026-11-26T22:42:55.358Z",
   "thresholds": {
     "plan": 800,
     "freeze": 1200,
@@ -145,6 +145,7 @@
     "test/client/rules-r8.test.mjs": 208,
     "test/client/rules-tab.test.mjs": 311,
     "test/client/scroll-contract.test.mjs": 149,
+    "test/client/wrap-card-split.test.mjs": 66,
     "test/contract/backend-install-methods.test.mjs": 47,
     "test/contract/backend-status.test.mjs": 186,
     "test/contract/config-contract.test.mjs": 250,
@@ -259,7 +260,7 @@
     "scripts/eval.mjs": 219,
     "scripts/gate-facade-exports.mjs": 82,
     "scripts/i18n-check.mjs": 170,
-    "scripts/lint-size.mjs": 204,
+    "scripts/lint-size.mjs": 208,
     "scripts/manual-build.mjs": 61,
     "scripts/migrate-audit.mjs": 1073,
     "scripts/migrate-from-gateway.mjs": 213,
