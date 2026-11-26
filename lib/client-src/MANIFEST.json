@@ -81,7 +81,7 @@
   },
   {
     "file": "95-settings-02.js",
-    "responsibility": "设置页第 2 段：问题提示、分组卡、设置页主体"
+    "responsibility": "设置页第 2 段：问题提示、分组卡、设置页主体；含反思峰时窗口卡（maintenance.suppressWindows）"
   },
   {
     "file": "99-css.js",

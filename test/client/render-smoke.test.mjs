@@ -6,174 +6,11 @@
  * R11 实测踩坑——危险区分组卡只传 title 没传 titleKey，`alwaysOpen` 判定失败后走折叠
  * 分支调用未注入的 `t`，设置页整页空白且页签失效。本用例直接跑组件函数，白屏类错误会红。
  *
- * 边界：只覆盖纯 React 渲染（fetch/timer 都打桩）；不替代真实浏览器像素验收。
+ * 双件（最小 React/hooks + fetch/localStorage 桩）见 render-harness.mjs；本文件只放概览/收尾卡用例。
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import fs from 'node:fs'
-import path from 'node:path'
-import vm from 'node:vm'
-import { fileURLToPath } from 'node:url'
-
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
-const CLIENT = path.join(ROOT, 'lib/client.js')
-const DEFAULT_CONFIG = {
-  dataDir: '',
-  backend: { id: '', mode: 'local', url: '', timeoutMs: 3000 },
-  identity: { mode: 'auto', userId: '', roleId: '', workspace: '' },
-  recall: {
-    enabled: true, maxHits: 5, charBudget: 1500, intentBudget: true, minRel: 0.34,
-    timeoutMs: 2000, injectLevels: ['core', 'important'], showSources: true,
-  },
-  write: {
-    enabled: true, reviewMode: 'shadow', maxChars: 500, dailyCap: 200, judge: 'rules',
-    searchFeed: false, searchTtlHours: 24, model: '', ignorePatterns: [],
-  },
-  tools: { enabled: true, maxWritesPerTurn: 5 },
-  rules: {
-    enabled: true, dir: '', requireGit: false, askMode: 'panel+chat', llm: false,
-    maxProposals: 20, guardStrict: true, mirrorAuto: true, askCooldownDays: 30,
-  },
-  reflect: { enabled: false, model: '', idleMinutes: 30, maxItems: 8, maxRunsPerDay: 24 },
-  wrap: {
-    enabled: true, explicit: true, idle: false, disposed: false, idleMinutes: 10,
-    maxItems: 8, spoolTtlHours: 24, retentionDays: 180, maxRunsPerDay: 6,
-    ingest: { mode: 'auto', minConfidence: 0.55, dropTaskInstructions: true },
-    report: true, model: '', maxMaterialChars: 12000, timeoutMs: 60000,
-  },
-  consolidate: { enabled: true, intervalHours: 6 },
-  embed: { enabled: false, endpoint: '', model: '', batch: 16 },
-  privacy: { redact: true, retentionDays: 0 },
-  edges: { diffusion: true, minConf: 0.6 },
-  sync: {
-    enabled: false, mode: 'off', intervalMin: 15, httpTimeoutMs: 800, batch: 100,
-    bridgeUrl: '', dryRun: true,
-  },
-  panel: { allowRemote: false, pollMs: 60000, tab: 'overview' },
-  advanced: { traceId: '', logLevel: 'warn', worker: true },
-}
-
-/** 载入 client bundle，返回 apply() 后注册的两个 slot 组件。 */
-function loadSlots(configOverride = null, extra = {}) {
-  const config = configOverride ? { ...DEFAULT_CONFIG, ...configOverride } : DEFAULT_CONFIG
-  let factory = null
-  const sandbox = {
-    console,
-    setTimeout,
-    clearTimeout,
-    setInterval: () => ({ unref() {} }),
-    clearInterval() {},
-    queueMicrotask,
-    URL,
-    fetch: async (url, opts) => {
-      const path = String(url)
-      const isPost = Boolean(opts && String(opts.method || '').toUpperCase() === 'POST')
-      // 写接口用 extra.wrapPost 提供状态码/体；读接口按路径分发，未知路径回空壳（与旧行为一致）。
-      if (isPost && path.endsWith('/wrap')) {
-        const spec = extra.wrapPost || { status: 200, body: { ok: true, runId: 9, state: 'queued' } }
-        return { ok: spec.status >= 200 && spec.status < 300, status: spec.status, json: async () => spec.body }
-      }
-      const body = path.endsWith('/config')
-        ? { ok: true, config }
-        : path.endsWith('/wrap/status') && extra.wrapStatus
-          ? extra.wrapStatus
-          : path.includes('/wrap/sessions')
-            ? (extra.wrapSessions || { ok: true, items: [], auto: { enabled: false, idleMinutes: 10 } })
-            : path.includes('/wrap/report') && extra.wrapReport
-              ? extra.wrapReport
-              : { ok: true, items: [], series: [], stats: {} }
-      return { ok: true, status: 200, json: async () => body }
-    },
-    document: undefined,
-    window: {},
-    localStorage: {
-      store: new Map(
-        Object.entries(extra.openGroups || {}).map(([key, value]) => ['wm.settings.open.v1', JSON.stringify({ [key]: value })]),
-      ),
-      getItem(key) { return this.store.has(key) ? this.store.get(key) : null },
-      setItem(key, value) { this.store.set(key, String(value)) },
-    },
-  }
-  sandbox.window.__ModuleLoader__ = { load({ factory: fn }) { factory = fn } }
-  sandbox.window.confirm = () => true
-  vm.createContext(sandbox)
-  vm.runInContext(fs.readFileSync(CLIENT, 'utf8'), sandbox, { filename: 'client.js' })
-  assert.ok(factory, 'client bundle 未注册 factory')
-
-  // 最小 React：函数组件 + hooks；只执行组件函数，不产生 DOM。
-  const states = []
-  const refs = []
-  let cursor = 0
-  let dirty = false
-  let effects = []
-  const React = {
-    createElement: (type, props, ...children) => ({ type, props: props || {}, children: children.flat(Infinity) }),
-    Fragment: 'Fragment',
-    useState(init) {
-      const i = cursor++
-      if (!(i in states)) states[i] = typeof init === 'function' ? init() : init
-      return [states[i], (next) => {
-        states[i] = typeof next === 'function' ? next(states[i]) : next
-        dirty = true
-      }]
-    },
-    useEffect(fn) { const i = cursor++; effects.push({ i, fn }) },
-    useMemo(fn) { cursor++; return fn() },
-    useRef(init) {
-      const i = cursor++
-      if (!(i in refs)) refs[i] = { current: init }
-      return refs[i]
-    },
-    useCallback(fn) { cursor++; return fn },
-    createContext(value) { return { _default: value } },
-    useContext(ctx) { cursor++; return ctx && ctx._default },
-  }
-  const renderNode = (node) => {
-    if (node === null || node === undefined || node === false) return null
-    if (typeof node === 'string' || typeof node === 'number') return { text: String(node) }
-    if (Array.isArray(node)) return node.map(renderNode)
-    if (typeof node.type === 'function') return renderNode(node.type({ ...node.props, children: node.children }))
-    // 保留 props：S1 起断言 select/option/button 的可访问性与事件要读真实属性（不只是文本）。
-    return { type: String(node.type), props: node.props || {}, children: node.children.map(renderNode) }
-  }
-  const mount = async (Component, props, rounds = 8) => {
-    // 固定跑几轮让 effect 里的异步加载/轮询落地；返回最后一轮渲染树，
-    // 供测试断言"页签真的渲染出内容"而不是只断言源码字符串。
-    let tree = null
-    for (let round = 0; round < rounds; round += 1) {
-      cursor = 0
-      dirty = false
-      effects = []
-      tree = renderNode(React.createElement(Component, props))
-      for (const { fn } of effects) fn()
-      await new Promise((resolve) => setTimeout(resolve, 0))
-      if (!dirty) return tree
-    }
-    return tree
-  }
-
-  const slots = {}
-  const ctx = {
-    locale: { register() {}, bind() { return (key) => key }, current() { return 'zh' } },
-    slots: {
-      inject(name, fn) { fn() },
-      register(meta, component) { slots[meta.name] = component },
-    },
-    effect(fn) { try { fn() } catch { /* <style> 注入与渲染无关 */ } },
-  }
-  factory((name) => (name === 'react' ? React : {}))
-    .apply(ctx)
-  return { slots, mount }
-}
-
-/** 渲染树 → 纯文本（只用于断言关键文案是否真的出现）。 */
-function treeText(node) {
-  if (node === null || node === undefined || node === false) return ''
-  if (typeof node === 'string' || typeof node === 'number') return String(node)
-  if (Array.isArray(node)) return node.map(treeText).join('')
-  if (node.text !== undefined) return String(node.text)
-  return (node.children || []).map(treeText).join('')
-}
+import { DEFAULT_CONFIG, loadSlots, walkTree, treeText } from './render-harness.mjs'
 
 test('面板渲染冒烟：settings.section 与 main 都能无异常渲染（防白屏）', async () => {
   const { slots, mount } = loadSlots()
@@ -237,15 +74,6 @@ test('Session Wrap 设置组与候选过滤：分组/开关真实渲染，收尾
   assert.match(settingsText, /settings\.wrapEnabled/, '必须有启用开关')
   assert.match(settingsText, /settings\.wrapCostNote/, '必须明确会花模型 token')
 })
-
-/** 渲染树遍历：找满足条件的节点（用于点按钮、断言 select/option 真实存在）。 */
-function walkTree(node, visit) {
-  if (!node) return
-  if (Array.isArray(node)) { for (const child of node) walkTree(child, visit); return }
-  if (typeof node !== 'object') return
-  visit(node)
-  for (const child of node.children || []) walkTree(child, visit)
-}
 
 test('S1 空态：没有收尾记录也有引导，且 409 点击失败可见（不再“什么都没发生”）', async () => {
   const { slots, mount } = loadSlots(
@@ -422,3 +250,5 @@ test('页签不可被压缩：nav flexShrink=0/minHeight、tab 显式 28px 盒�
     assert.equal(tab.props.style.boxSizing, 'border-box')
   }
 })
+
+// ---------------------------------------------------------------------------
