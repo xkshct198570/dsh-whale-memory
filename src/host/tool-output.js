@@ -134,7 +134,8 @@ export const TOOL_OUTPUT = Object.freeze({
       const edges = out.edges.length
         ? `\n邻居边：${out.edges.map((edge) => `${edge.from}→${edge.to} (${edge.etype})`).join('；')}`
         : ''
-      return textResult(`id=${node.id} status=${node.status} level=${node.level} type=${node.memory_type}\n${node.text}\n标签：${tags}${edges}`)
+      // updatedAt 必须给模型：memory_update 的 CAS 基线来自这里，render 是模型可见内容的唯一出口。
+      return textResult(`id=${node.id} status=${node.status} level=${node.level} type=${node.memory_type} updatedAt=${node.updated_at}\n${node.text}\n标签：${tags}${edges}`)
     },
   },
   update: {

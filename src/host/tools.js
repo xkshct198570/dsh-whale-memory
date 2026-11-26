@@ -15,6 +15,11 @@ import {
   LEVELS, MEMORY_TYPES, TAGS_LIMIT, TOOL_OUTPUT, num, projectNode, round4,
 } from './tool-output.js'
 
+/** 子代理会话判据（origin 或持久化的 delegationDepth；两条都认，避免 header 变体漏判）。 */
+function isDelegatedHeader(header) {
+  return header?.origin === 'subagent' || Number(header?.delegationDepth) > 0
+}
+
 /** 写类工具（受每回合限次）；读工具不限次。 */
 export const WRITE_TOOL_NAMES = Object.freeze(['memory_remember', 'memory_update', 'memory_forget'])
 
@@ -43,6 +48,9 @@ function makeContext(deps) {
    */
   const identityOf = (exec) => {
     const header = exec?.agent?.session?.header
+    // 执行期兜底（2026-11-27 live 实测：子代理的工具集仍含 memory_* 且可执行，
+    // 说明 step 准入的 when 在真实宿主里不够；这里对同一判据再拦一次，绝不静默放行）。
+    if (isDelegatedHeader(header)) throw toolError(TOOL_ERROR.SUBAGENT_FORBIDDEN)
     const sessionWorkspace = header ? deriveWorkspace(header) : ''
     if (!header || !sessionWorkspace) throw toolError(TOOL_ERROR.IDENTITY_REQUIRED)
     const resolved = resolveIdentity(getIdentityCfg(), getIdentityHint(), getHostUserId(), sessionWorkspace)
@@ -316,9 +324,16 @@ export function installMemoryTools({ ctx, backend, config, getIdentityCfg, getId
   const definitions = createMemoryToolDefinitions({
     backend, config, getIdentityCfg, getIdentityHint, getHostUserId, limiter, log,
   })
+  const traced = new Set()
   const when = (context) => {
+    const header = context?.agent?.session?.header
+    const sessionId = String(context?.agent?.session?.id || '')
+    if (sessionId && !traced.has(sessionId)) {
+      traced.add(sessionId)
+      log(`[whale-memory] tools.when session=${sessionId} origin=${header?.origin ?? '-'} depth=${header?.delegationDepth ?? '-'} parent=${header?.parentSession ? 'y' : 'n'} enabled=${String(value(config?.tools?.enabled))}`)
+    }
     if (value(config?.tools?.enabled) === false) return false
-    return context?.agent?.session?.header?.origin !== 'subagent'
+    return !isDelegatedHeader(header)
   }
   const offs = []
   try {

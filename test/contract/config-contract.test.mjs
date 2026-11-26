@@ -269,3 +269,27 @@ test('POST /config：非对象/无白名单键 -> 400 invalid_config', async () 
     }
   } finally { await close() }
 })
+
+test('tools 组：GET 回显默认值、POST 可保存且不丢其它组（白名单必须含 tools）', async () => {
+  const runtime = baseConfig({ write: { enabled: true, dailyCap: 120 }, tools: { enabled: true, maxWritesPerTurn: 5 } })
+  const { ctx, state } = fakeEditor({ write: { enabled: true, dailyCap: 120 }, tools: { enabled: true, maxWritesPerTurn: 5 } })
+  const { base, close } = await startServer(runtime, ctx)
+  try {
+    const body = await getConfig(base)
+    assert.deepEqual(body.config.tools, { enabled: true, maxWritesPerTurn: 5 })
+
+    const saved = await postConfig(base, { tools: { enabled: false, maxWritesPerTurn: 3 } })
+    assert.equal(saved.status, 200, `tools 组保存被拒：${JSON.stringify(saved.body)}`)
+    assert.equal(saved.body.ok, true)
+    const after = await getConfig(base)
+    assert.deepEqual(after.config.tools, { enabled: false, maxWritesPerTurn: 3 })
+    assert.equal(after.config.write.dailyCap, 120, 'tools 组保存不得把别的组回落默认')
+    assert.equal(state.edits, 1)
+  } finally { await close() }
+})
+
+test('Config 的每个可选组都必须登记在 CONFIG_GROUPS（防新组漏白名单=设置页存不了）', () => {
+  const groups = Object.keys(Config({})).filter((key) => key !== 'dataDir')
+  const missing = groups.filter((key) => !CONFIG_GROUPS.includes(key))
+  assert.deepEqual(missing, [], `CONFIG_GROUPS 缺少 Config 组：${missing.join(',')}`)
+})

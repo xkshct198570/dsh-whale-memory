@@ -10,7 +10,7 @@ import { mergePreservingVolatile } from '../../shared/config-values.js'
 import { resolveRefsDeep } from '../../shared/resolve-refs.js'
 
 export const CONFIG_GROUPS = [
-  'backend', 'identity', 'recall', 'write', 'reflect', 'wrap', 'consolidate',
+  'backend', 'identity', 'recall', 'write', 'tools', 'reflect', 'wrap', 'consolidate',
   'embed', 'privacy', 'edges', 'sync', 'rules', 'panel', 'advanced',
 ]
 export const CONFIG_KEYS = ['dataDir', ...CONFIG_GROUPS]

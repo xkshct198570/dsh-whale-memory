@@ -177,6 +177,7 @@ test('激活条件：tools.enabled=false 或子代理会话 → when=false；普
   const whenOn = host.registered[0].options.when
   assert.equal(whenOn({ agent: agentOf() }), true)
   assert.equal(whenOn({ agent: agentOf('s2', { cwd: WORK_DIR, origin: 'subagent' }) }), false, '子代理不可见')
+  assert.equal(whenOn({ agent: agentOf('s3', { cwd: WORK_DIR, delegationDepth: 1 }) }), false, '只看 delegationDepth 的子代理也不可见')
 })
 
 test('缺 tools 服务：不抛、零注册、留日志证据（fail-open 但可见）', () => {
@@ -297,6 +298,9 @@ test('search/read：同会话命中、输出 schema 合法、跨分区 id 按不
   const detail = await run(definitions, 'memory_read', { id: remembered.id })
   assertOutput(definitions, 'memory_read', detail)
   assert.match(detail.node.text, /全量门禁/, 'read 必须回真实正文（写入入口会归一标点）')
+  // CAS 基线必须进模型可见渲染：render 是唯一出口，canonical value 模型看不到。
+  assert.match(definitionOf(definitions, 'memory_read').output.render({}, detail)[0].text,
+    new RegExp(`updatedAt=${detail.node.updated_at}`), 'read 渲染必须给出 updatedAt')
   assert.deepEqual(detail.node.tags, [])
 
   await rejectsWith(run(definitions, 'memory_read', { id: other.id }), TOOL_ERROR.NODE_NOT_FOUND)
@@ -510,4 +514,32 @@ test('跨分区同文对照：同正文写进别的 workspace，search/read 均�
   assert.ok(found.hits.some((hit) => hit.id === mine.id))
   assert.ok(found.hits.every((hit) => hit.id !== other.id), '同文跨分区节点不得命中')
   await rejectsWith(run(definitions, 'memory_read', { id: other.id }), TOOL_ERROR.NODE_NOT_FOUND)
+})
+
+test('执行闸兜底：子代理 exec（origin 或 delegationDepth）调任何记忆工具 → SUBAGENT_FORBIDDEN', async (t) => {
+  const backend = freshBackend(t)
+  const host = fakeHost()
+  const { definitions } = host.install({ backend })
+  await host.preStep(agentOf(), 1)
+  const byOrigin = execOf(agentOf('sub-a', { cwd: WORK_DIR, origin: 'subagent' }))
+  const byDepth = execOf(agentOf('sub-b', { cwd: WORK_DIR, delegationDepth: 1 }))
+  for (const exec of [byOrigin, byDepth]) {
+    await rejectsWith(run(definitions, 'memory_search', { query: '门禁' }, exec), TOOL_ERROR.SUBAGENT_FORBIDDEN)
+    await rejectsWith(run(definitions, 'memory_remember', { text: '子代理不得写入长期记忆' }, exec), TOOL_ERROR.SUBAGENT_FORBIDDEN)
+  }
+  // 与身份闸同序：执行闸先于后端调用（后端不被摸到）。
+  const calls = []
+  const defs = createMemoryToolDefinitions({
+    backend: {
+      mode: 'local',
+      write: async () => { calls.push('write'); return { ok: true, action: 'ADD', id: 'x' } },
+      search: async () => { calls.push('search'); return { hits: [] } },
+      getNode: async () => { calls.push('getNode'); return { ok: false, error: 'node_not_found' } },
+      updateNode: async () => { calls.push('updateNode'); return { ok: true } },
+    },
+    config: {}, getIdentityCfg: () => ({ mode: 'auto' }), getIdentityHint: () => null, getHostUserId: () => 'u1',
+    limiter: createWriteRateLimiter({ ctx: { on: () => () => {} } }),
+  })
+  await rejectsWith(run(defs, 'memory_search', { query: '门禁' }, byOrigin), TOOL_ERROR.SUBAGENT_FORBIDDEN)
+  assert.deepEqual(calls, [], '执行闸必须前置，后端零调用')
 })
