@@ -43,14 +43,15 @@ export function installReflectTrigger({
   })
 
   /**
-   * 评估一个 turn（每 turn 只评估一次）：distinct step 数 ≥7 且身份可判定才交给单一自动闸。
-   * 不足 7 也标记已评估——下一 turn 的 pre-step 不再重算这个 turn。
+   * 评估一个 turn（触发后锁存）：distinct step 数 ≥7 且身份可判定才交给单一自动闸。
+   * 不足 7 **不锁存**：turn-stopping 可被 steer 后续同一 turn 继续（rc.5 serial 语义），
+   * 若过早锁存，6 步时停止一次后同 turn 再走 4 步也会被吞掉。锁存只发生在"达到阈值并尝试派发"后。
    */
   const evaluate = (sid, state, turn, header) => {
     if (!state || !Number.isFinite(turn) || state.lastEvaluated === turn) return
-    state.lastEvaluated = turn
     const steps = state.steps.size
     if (steps < MIN_TOOL_STEPS) return
+    state.lastEvaluated = turn
     const ident = identityOf(header)
     if (!ident.ok) {
       log(`[whale-memory] reflect trigger turn=${turn} steps=${steps} skip=identity_required`)

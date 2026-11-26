@@ -1,7 +1,7 @@
 /**
  * 反思（S4）：把最近 episodic 提炼成 semantic/procedural 长期记忆。
  *
- * - 纯函数：buildReflectPrompt / parseReflectOutput（可脱库测试）。
+ * - 提示词/解析在 `reflect-prompt.js`（纯函数，可脱库测试）。
  * - runReflect：读近期 episodic → DSH 默认模型（ctx.llm.stream）→ 解析 JSON → 落库（source=self）。
  * - 调度：单一自动闸 scheduleAuto（enabled/队列/日限/峰时）供空闲 tick 与 turn 触发共用；
  *   手动 trigger 绕过峰时/日限但仍要求身份。身份由调用方显式传入（架构书 §5.5.1）：
@@ -12,37 +12,7 @@ import { ingestPolicyOf } from '../shared/ingest-policy.js'
 import { layerOfMemoryType } from '../shared/layers.js'
 import { compileSuppressWindows, inSuppressWindow, localDayKey } from '../shared/maintenance-window.js'
 import { memoryPressure } from '../shared/memory-guard.js'
-
-const MAX_MATERIAL = 6000
-const MAX_ITEM_CHARS = 500
-
-export function buildReflectPrompt(items, { maxItems = 8 } = {}) {
-  const body = (items || []).map((it, i) => `${i + 1}. ${String(it.text || '').slice(0, 500)}`).join('\n')
-  return [
-    '你是记忆整理器。把下面的经历片段提炼成可长期复用的规则/事实。',
-    `最多 ${maxItems} 条；只输出 JSON 数组，每项 {"text":"...","type":"semantic|procedural"}。`,
-    '要求：只复述素材里出现的事实；不要编造、不要写解释、不要超过 500 字；没有可提炼的就输出 []。',
-    '',
-    body,
-  ].join('\n').slice(0, MAX_MATERIAL)
-}
-
-export function parseReflectOutput(raw) {
-  let text = String(raw || '').trim()
-  text = text.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim()
-  const start = text.indexOf('[')
-  const end = text.lastIndexOf(']')
-  if (start === -1 || end <= start) return []
-  let arr
-  try { arr = JSON.parse(text.slice(start, end + 1)) } catch { return [] }
-  if (!Array.isArray(arr)) return []
-  return arr
-    .filter((x) => x && typeof x.text === 'string' && x.text.trim())
-    .map((x) => ({
-      text: x.text.trim().slice(0, MAX_ITEM_CHARS),
-      type: x.type === 'procedural' ? 'procedural' : 'semantic',
-    }))
-}
+import { buildReflectPrompt, parseReflectOutput } from './reflect-prompt.js'
 
 /**
  * 反思输出预算：默认模型是推理档，会把思考计入 maxTokens；1200 会被思考吃光 → 正文空 →
@@ -85,13 +55,29 @@ function identityOf(raw) {
 }
 
 /**
- * 反思写入计数：added=落库/合并，review=候选，rejected=价值闸/身份闸拒绝。
- * @param {{ ok?: boolean, action?: string, candidate?: boolean }} res backend.write 结果
+ * 条目级拒绝码：价值闸/身份闸/内容校验等"这条不该入库"的终态；其余 ok:false 属基础设施失败，
+ * 必须让 run 失败（keeper 退避重试），不能计成 rejected 混进"价值闸拒绝"。
+ */
+const ITEM_REJECT_RE = /^(gate:|identity_required|invalid_text|text_too_long|ignored|privacy|daily_cap|write_disabled|write_rejected)/
+
+/**
+ * 反思写入计数：added=新增/合并/取代，review=候选，rejected=条目级拒绝，duplicate=判重命中，
+ * failed=基础设施失败（队列超时/落库失败/无返回）。
+ * @param {{ ok?: boolean, action?: string, candidate?: boolean, duplicate?: boolean, error?: string, reason?: string } | null | undefined} res
+ * @param {{ added:number, review:number, rejected:number, duplicate:number, failed:number }} counts
  */
 function tally(res, counts) {
-  if (res?.ok === false) counts.rejected += 1
-  else if (res?.candidate === true || res?.action === 'CANDIDATE') counts.review += 1
-  else if (res?.ok === true) counts.added += 1
+  if (!res || typeof res !== 'object') { counts.failed += 1; return 'no_result' }
+  if (res.ok === false) {
+    const code = String(res.error || res.reason || 'write_failed')
+    if (ITEM_REJECT_RE.test(code)) { counts.rejected += 1; return code }
+    counts.failed += 1
+    return code
+  }
+  if (res.candidate === true || res.action === 'CANDIDATE') { counts.review += 1; return 'review' }
+  if (res.duplicate === true || res.action === 'NOOP') { counts.duplicate += 1; return 'duplicate' }
+  counts.added += 1
+  return 'added'
 }
 
 /**
@@ -109,11 +95,20 @@ export async function runReflect({ backend, llm, selection, config, identity = n
       log('[whale-memory] reflect skip identity_required (no session partition)')
       return { ok: false, reason: 'identity_required' }
     }
-    if (!llm || typeof llm.stream !== 'function') return { ok: false, reason: 'llm_unavailable' }
-    if (!selection?.provider || (!selection?.model && !config?.reflect?.model)) return { ok: false, reason: 'no_model' }
-    if (memoryPressure().stress) return { ok: false, reason: 'memory_pressure' }
+    if (!llm || typeof llm.stream !== 'function') {
+      log('[whale-memory] reflect skip reason=llm_unavailable')
+      return { ok: false, reason: 'llm_unavailable' }
+    }
+    if (!selection?.provider || (!selection?.model && !config?.reflect?.model)) {
+      log('[whale-memory] reflect skip reason=no_model')
+      return { ok: false, reason: 'no_model' }
+    }
+    if (memoryPressure().stress) {
+      log('[whale-memory] reflect skip reason=memory_pressure')
+      return { ok: false, reason: 'memory_pressure' }
+    }
     const items = await backend.listEpisodic(20, { identity: ident })
-    if (!items || items.length === 0) return { ok: true, added: 0, review: 0, rejected: 0, material: 0, items: 0, reason: 'no_material' }
+    if (!items || items.length === 0) return { ok: true, added: 0, review: 0, rejected: 0, duplicate: 0, failed: 0, material: 0, items: 0, reason: 'no_material' }
     const maxItems = num(config?.reflect?.maxItems, 8)
     const prompt = buildReflectPrompt(items, { maxItems })
     const out = await collectLlmText(llm, selection, prompt, config?.reflect?.model || '')
@@ -131,17 +126,29 @@ export async function runReflect({ backend, llm, selection, config, identity = n
     // 同一 ingestPolicy 真源（shared/ingest-policy.js）：confidence 固定 1，任务句直接拒；
     // wrap.ingest.mode=review 时反思也回退候选，不绕过用户显式选择的保守档。
     const ingestPolicy = ingestPolicyOf(config?.wrap?.ingest, { confidence: 1 })
-    const counts = { added: 0, review: 0, rejected: 0 }
-    for (const item of parsed) {
-      const r = await backend.write({
-        text: item.text, level: 'important', memory_type: item.type, source: 'self',
-        tags: ['reflect'], origin: 'reflect', identity: ident,
-        layer: layerOfMemoryType(item.type), ingestPolicy,
-      })
-      tally(r, counts)
+    const counts = { added: 0, review: 0, rejected: 0, duplicate: 0, failed: 0 }
+    let lastFailure = ''
+    try {
+      for (const item of parsed) {
+        const r = await backend.write({
+          text: item.text, level: 'important', memory_type: item.type, source: 'self',
+          tags: ['reflect'], origin: 'reflect', identity: ident,
+          layer: layerOfMemoryType(item.type), ingestPolicy,
+        })
+        const outcome = tally(r, counts)
+        if (counts.failed > 0 && outcome !== 'added' && outcome !== 'review' && outcome !== 'duplicate') lastFailure = outcome
+      }
+    } catch (err) {
+      // 第 N 条抛错时前 N-1 条可能已落库：先把已有计数打出来，再按 write_failed 失败（keeper 可退避）。
+      counts.failed += 1
+      lastFailure = String(err?.message || err)
     }
     // 日志只计数，不打印任何记忆正文（架构书 §6）。
-    log(`[whale-memory] reflect done material=${items.length} items=${parsed.length} added=${counts.added} review=${counts.review} rejected=${counts.rejected}`)
+    log(`[whale-memory] reflect done material=${items.length} items=${parsed.length} added=${counts.added} review=${counts.review} rejected=${counts.rejected} duplicate=${counts.duplicate} failed=${counts.failed}`)
+    // 基础设施失败不得冒充成功（铁律 22）：返回 ok:false，keeper 记 failed/退避，路由可见 error。
+    if (counts.failed > 0) {
+      return { ok: false, reason: 'write_failed', error: lastFailure, material: items.length, items: parsed.length, ...counts }
+    }
     return { ok: true, material: items.length, items: parsed.length, ...counts }
   } catch (err) {
     log(`[whale-memory] reflect fail-open: ${err?.message || err}`)
@@ -178,28 +185,57 @@ export function installReflectScheduler(ctx, {
   let autoRuns = 0
   /** 坏窗口值只记一次（按原文签名去重；配置改了再记新值）。 */
   const warnedWindows = new Set()
+  /** 空闲无会话身份只记一次：tick 每 60s 一次，逐次打印会刷屏；身份恢复后重新武装。 */
+  let idleSkipLogged = false
 
-  /** 当前执行身份只在 payload 里，不再现取 Config（S4 四点之一）。 */
-  const run = (payload = {}) => {
+  /** 当前执行身份只在 payload 里，不再现取 Config（S4 四点之一）。失败一律收敛为可见结果，不抛出。 */
+  const run = async (payload = {}) => {
     const ident = identityOf(payload?.identity)
     if (!ident) {
       log('[whale-memory] reflect skip identity_required (job payload lacks identity)')
-      return Promise.resolve({ ok: false, reason: 'identity_required' })
+      return { ok: false, reason: 'identity_required' }
     }
-    return runReflect({
-      backend, llm: getLlm?.(), selection: getSelection?.(), config,
-      identity: ident, sessionId: String(payload?.sessionId || ''), log,
-    })
+    try {
+      return await runReflect({
+        backend, llm: getLlm?.(), selection: getSelection?.(), config,
+        identity: ident, sessionId: String(payload?.sessionId || ''), log,
+      })
+    } catch (err) {
+      log(`[whale-memory] reflect run fail-open: ${err?.message || err}`)
+      return { ok: false, reason: 'reflect_error' }
+    }
   }
 
   if (keeper && typeof keeper.register === 'function') {
-    try { keeper.register('reflect', (payload) => run(payload)) } catch (err) {
+    try {
+      // 写库/队列等基础设施失败要让 keeper 走退避重试（铁律 22）：handler 抛出，job 记 failed；
+      // 价值闸拒绝/无素材/无模型等终态仍按 done（重试无意义，日志已可见）。
+      keeper.register('reflect', async (payload) => {
+        const out = await run(payload)
+        if (out?.ok === false && out.reason === 'write_failed') {
+          throw new Error(`reflect_write_failed:${String(out.error || '').slice(0, 160)}`)
+        }
+        return out
+      })
+    } catch (err) {
       log(`[whale-memory] reflect handler not registered: ${err?.message || err}`)
     }
   }
 
-  /** 队列里已有 reflect（queued/running）时不再叠加，防压力期堆一堆重复 job。 */
+  /**
+   * 队列里已有 reflect（queued/running）时不再叠加。
+   * 优先用 keeper.countActive（精确 SQL），不用 status() 的最近 200 行快照——写队列每条写入一行 job，
+   * 反射 job 可能被挤出快照窗口而误判为空 → 重复入队（重复烧模型）。
+   */
   const queueBusy = () => {
+    if (keeper && typeof keeper.countActive === 'function') {
+      try {
+        return keeper.countActive('reflect') > 0
+      } catch (err) {
+        log(`[whale-memory] reflect queue count fail-open: ${err?.message || err}`)
+        return true
+      }
+    }
     if (keeper && typeof keeper.status === 'function') {
       try {
         return keeper.status().jobs.some((job) => job.kind === 'reflect' && (job.state === 'queued' || job.state === 'running'))
@@ -250,7 +286,10 @@ export function installReflectScheduler(ctx, {
     running = true
     autoRuns += 1
     lastActivity = clock()
-    void run(payload).finally(() => { running = false })
+    // run 自身已收敛异常；这里再兜一层并保证 running 一定释放（否则直跑路径会永久 queued）。
+    Promise.resolve(run(payload))
+      .catch((err) => log(`[whale-memory] reflect direct run fail-open: ${err?.message || err}`))
+      .finally(() => { running = false })
     return { ok: true, ran: true }
   }
 
@@ -269,9 +308,13 @@ export function installReflectScheduler(ctx, {
       const ident = identityOf(got?.identity)
       if (!ident) {
         // 空闲反思没有会话分区可落：跳过并留一次可见证据，绝不写 '' 共享分区。
-        log('[whale-memory] reflect idle skipped: no recent session identity')
+        if (!idleSkipLogged) {
+          idleSkipLogged = true
+          log('[whale-memory] reflect idle skipped: no recent session identity')
+        }
         return { skipped: 'identity_required' }
       }
+      idleSkipLogged = false
       return scheduleAuto({ identity: ident, sessionId: got?.sessionId || '', reason: 'idle' })
     } catch (err) {
       log(`[whale-memory] reflect scheduler fail-open: ${err?.message || err}`)

@@ -113,6 +113,76 @@ test('resolveIdentity auto 四态（S4 §5.5.1）：absent 才回落；pending/e
   )
 })
 
+test('identity source：absent 后服务出现 → pending（拒绝期）而不是直接 ready/回落；留可见日志', async () => {
+  const logs = []
+  let service
+  const ctx = {
+    get(name) { return name === 'deepseekAccount' ? service : undefined },
+    effect(fn) { return fn() },
+  }
+  const source = installIdentitySource(ctx, { log: (line) => logs.push(line) })
+  assert.equal(source.getState(), 'absent')
+  service = { async getDeviceIdentity() { return { userId: 'late-host' } } }
+  assert.equal(source.getState(), 'pending', '服务出现必须先 pending，不能直接 ready')
+  assert.ok(logs.some((line) => line.includes('identity source appeared')))
+  assert.equal(await source.refresh(), 'late-host')
+  assert.equal(source.getState(), 'ready')
+  source.dispose()
+})
+
+test('identity source：ready 后服务消失 → 保留 ready（不回落第二分区）；再出现不丢 id', async () => {
+  const logs = []
+  let service = { async getDeviceIdentity() { return { userId: 'host-u' } } }
+  const ctx = {
+    get(name) { return name === 'deepseekAccount' ? service : undefined },
+    effect(fn) { return fn() },
+  }
+  const source = installIdentitySource(ctx, { log: (line) => logs.push(line) })
+  assert.equal(await source.refresh(), 'host-u')
+  assert.equal(source.getState(), 'ready')
+  service = undefined
+  assert.equal(source.getUserId(), 'host-u', '服务消失不得丢掉已知宿主 id')
+  assert.equal(source.getState(), 'ready', '曾就绪后消失必须保留 ready，不能回落 Config')
+  assert.ok(logs.some((line) => line.includes('identity source disappeared')))
+  // 服务再出现：仍 ready，缓存 id 不变（同一分区）。
+  service = { async getDeviceIdentity() { return { userId: 'host-u' } } }
+  assert.equal(source.getState(), 'ready')
+  assert.equal(source.getUserId(), 'host-u')
+  source.dispose()
+})
+
+test('identity source：读取超时按异常处理（pending 可重试），不永久挂起', async () => {
+  const logs = []
+  const ctx = {
+    get(name) { return name === 'deepseekAccount' ? { getDeviceIdentity: () => new Promise(() => {}) } : undefined },
+    effect(fn) { return fn() },
+  }
+  const source = installIdentitySource(ctx, { log: (line) => logs.push(line), probeTimeoutMs: 20 })
+  assert.equal(await source.refresh(), '')
+  assert.equal(source.getState(), 'pending')
+  assert.ok(logs.some((line) => line.includes('identity_probe_timeout')))
+  source.dispose()
+})
+
+test('identity source：登出/登录状态迁移留无正文日志（ready↔empty）', async () => {
+  const logs = []
+  let mode = 'ready'
+  const service = {
+    async getDeviceIdentity() { return mode === 'ready' ? { userId: 'host-u' } : { osVersion: 'linux' } },
+  }
+  const ctx = { get(name) { return name === 'deepseekAccount' ? service : undefined }, effect(fn) { return fn() } }
+  const source = installIdentitySource(ctx, { log: (line) => logs.push(line) })
+  assert.equal(await source.refresh(), 'host-u')
+  mode = 'empty'
+  assert.equal(await source.refresh(), '')
+  assert.equal(source.getState(), 'empty')
+  assert.ok(logs.some((line) => line.includes('identity source state=ready->empty')))
+  mode = 'ready'
+  assert.equal(await source.refresh(), 'host-u')
+  assert.ok(logs.some((line) => line.includes('identity source state=empty->ready')))
+  source.dispose()
+})
+
 test('identity source getState 四态：ready/empty/absent；读取异常保持 pending', async () => {
   const ready = installIdentitySource(fakeCtx({ async getDeviceIdentity() { return { userId: 'u1' } } }).ctx, { log: () => {} })
   assert.equal(ready.getState(), 'pending')

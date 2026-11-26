@@ -372,3 +372,21 @@ test('hybrid：首轮画像读本地真源（local.profileLayers 透传）；fai
   assert.equal(blocked.ready, false)
   assert.equal(blocked.openError, 'disk_full')
 })
+
+test('P1-3 修复：hybrid 的本地专属能力必须透传身份 opts（listEpisodic/reviewWrite）', async () => {
+  const seen = []
+  const local = {
+    ready: false,
+    withDb() { throw new Error('no_db') },
+    async listEpisodic(limit, opts) { seen.push({ kind: 'listEpisodic', limit, opts }); return [] },
+    reviewWrite(id, decision, reason, opts) { seen.push({ kind: 'reviewWrite', id, decision, reason, opts }); return { ok: true } },
+  }
+  const hybrid = new HybridBackend({ local, log: () => {} })
+  try {
+    await hybrid.listEpisodic(20, { identity })
+    hybrid.reviewWrite(7, 'accept', 'ok', { identity })
+    assert.deepEqual(seen[0], { kind: 'listEpisodic', limit: 20, opts: { identity } })
+    assert.deepEqual(seen[1].opts, { identity })
+    assert.equal(seen[1].id, 7)
+  } finally { hybrid.dispose() }
+})

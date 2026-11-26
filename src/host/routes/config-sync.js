@@ -42,10 +42,11 @@ export async function handleConfigSync({
       if (!reflect || typeof reflect.trigger !== 'function') {
         return sendJson(res, 501, { ok: false, error: 'reflect_unavailable' })
       }
-      // 手动反思是显式动作：用最近会话身份（有 workspace），其次当前控制面身份；
-      // 都没有 workspace 就拒——绝不写 workspace='' 的共享分区（架构书 §5.5.1）。
+      // 手动反思是显式动作：只接受"可判定会话身份"（lastRecall），或显式 fixed 配置的固定身份。
+      // auto 下控制面身份可能在宿主 pending 时落到本地兜底，不能拿来触发写（§5.5.1/§5.8）。
       const runtime = runtimeIdentity && typeof runtimeIdentity === 'object' ? runtimeIdentity : null
-      const chosen = runtime?.workspace ? runtime : identity
+      const mode = String(value(config?.identity?.mode, 'auto'))
+      const chosen = runtime?.workspace ? runtime : (mode === 'fixed' ? identity : null)
       if (!chosen?.userId || !chosen?.workspace) {
         return sendJson(res, 400, { ok: false, error: 'identity_required' })
       }

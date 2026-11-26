@@ -89,6 +89,31 @@ test('POST /reflect：手动传最近会话身份 → 200 started；缺服务 �
     assert.equal(got.status, 400)
     assert.equal(got.body.error, 'identity_required')
   } finally { await noWs.close() }
+
+  // auto 模式即使控制面有 workspace，也不能在无会话身份时触发（可能是 local 兜底分区）。
+  const autoCalls = []
+  const auto = await startRoutes({
+    config: { ...config, identity: { mode: 'auto', userId: '', roleId: '', workspace: '/work/ws' } },
+    reflect: { trigger: async (opts) => { autoCalls.push(opts); return { ok: true } } },
+  })
+  try {
+    const got = await post(auto.base, '/whale-memory/api/reflect', {})
+    assert.equal(got.status, 400)
+    assert.equal(got.body.error, 'identity_required')
+    assert.equal(autoCalls.length, 0)
+  } finally { await auto.close() }
+
+  // fixed 模式的显式固定身份是稳定分区：无会话也可手动反思，且身份原样下传。
+  const fixedCalls = []
+  const fixed = await startRoutes({
+    config: { ...config, identity: { mode: 'fixed', userId: 'u1', roleId: 'r1', workspace: 'web' } },
+    reflect: { trigger: async (opts) => { fixedCalls.push(opts); return { ok: true } } },
+  })
+  try {
+    const got = await post(fixed.base, '/whale-memory/api/reflect', {})
+    assert.equal(got.status, 200)
+    assert.deepEqual(fixedCalls[0].identity, { userId: 'u1', roleId: 'r1', workspace: 'web' })
+  } finally { await fixed.close() }
 })
 
 test('POST /sync：dryRun pull 可达且 trace_id 回显；非 dryRun 缺 confirm 拒绝', async () => {

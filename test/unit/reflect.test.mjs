@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildReflectPrompt, parseReflectOutput, runReflect, installReflectScheduler } from '../../src/core/reflect.js'
+import { buildReflectPrompt, parseReflectOutput } from '../../src/core/reflect-prompt.js'
+import { runReflect, installReflectScheduler } from '../../src/core/reflect.js'
 
 const identity = { userId: 'u1', roleId: '', workspace: '/work/ws' }
 
@@ -83,7 +84,7 @@ test('runReflect：计数 added/review/rejected 按真实 write 结果（durable
     async listEpisodic() { return [{ text: '素材' }] },
     async write(q) {
       if (q.text.includes('规则')) return { ok: true, action: 'MERGE' }
-      if (q.text.includes('候选')) return { ok: true, action: 'CANDIDATE', candidate: true }
+      if (q.text.includes('候选')) return { ok: true, action: 'CANDIDATE' }
       return { ok: false, action: 'REJECT', error: 'gate:task' }
     },
   }
@@ -96,7 +97,39 @@ test('runReflect：计数 added/review/rejected 按真实 write 结果（durable
   assert.equal(r.added, 1)
   assert.equal(r.review, 1)
   assert.equal(r.rejected, 1)
-  assert.match(logs.find((line) => line.includes('reflect done')), /added=1 review=1 rejected=1/)
+  assert.match(logs.find((line) => line.includes('reflect done')), /added=1 review=1 rejected=1 duplicate=0 failed=0/)
+})
+
+test('runReflect：判重命中（NOOP）不计 added；基础设施失败必须 ok:false（不冒充成功）', async () => {
+  const body = '[{"text":"重复条目","type":"semantic"},{"text":"超时条目","type":"semantic"}]'
+  const llm = { async *stream() { yield { type: 'text-delta', text: body } } }
+  const backend = {
+    async listEpisodic() { return [{ text: '素材' }] },
+    async write(q) {
+      if (q.text.includes('重复')) return { ok: true, action: 'NOOP', duplicate: true }
+      return { ok: false, action: 'TIMEOUT', reason: 'queue_wait_timeout' }
+    },
+  }
+  const logs = []
+  const r = await runReflect({
+    backend, llm, selection: { provider: 'p', model: 'm' }, identity, config: {}, log: (line) => logs.push(line),
+  })
+  assert.equal(r.ok, false, '队列超时是基础设施失败，不能当成功')
+  assert.equal(r.reason, 'write_failed')
+  assert.equal(r.added, 0)
+  assert.equal(r.duplicate, 1)
+  assert.equal(r.failed, 1)
+  const done = logs.find((line) => line.includes('reflect done'))
+  assert.match(done, /added=0 review=0 rejected=0 duplicate=1 failed=1/)
+  assert.equal(/重复条目|超时条目/.test(String(done)), false, '日志不得含正文')
+})
+
+test('runReflect：早退 reason 有可见日志（llm_unavailable/no_model/memory_pressure 不静默）', async () => {
+  const logs = []
+  await runReflect({ backend: {}, llm: null, selection: {}, config: {}, identity, log: (l) => logs.push(l) })
+  await runReflect({ backend: {}, llm: { async *stream() {} }, selection: {}, config: {}, identity, log: (l) => logs.push(l) })
+  assert.ok(logs.some((line) => line.includes('reflect skip reason=llm_unavailable')))
+  assert.ok(logs.some((line) => line.includes('reflect skip reason=no_model')))
 })
 
 test('runReflect：delta+block-end 同发不得把 JSON 拼两遍（真机 items=0 根因）', async () => {
@@ -128,7 +161,7 @@ test('runReflect：无素材/无 llm 不写；有身份才继续', async () => {
   const none = await runReflect({
     backend, llm: { async *stream() {} }, selection: { provider: 'p', model: 'm' }, config: {}, identity,
   })
-  assert.deepEqual(none, { ok: true, added: 0, review: 0, rejected: 0, material: 0, items: 0, reason: 'no_material' })
+  assert.deepEqual(none, { ok: true, added: 0, review: 0, rejected: 0, duplicate: 0, failed: 0, material: 0, items: 0, reason: 'no_material' })
   assert.equal((await runReflect({ backend, llm: { async *stream() {} }, selection: {}, config: {}, identity })).reason, 'no_model')
 })
 
@@ -177,9 +210,11 @@ test('scheduleAuto：单一自动闸（enabled/队列/日限/峰时），payload
     assert.deepEqual(keeper.enqueued[0], { kind: 'reflect', payload: { identity, sessionId: 's1', reason: 'turn_steps' } })
     assert.ok(logs.some((line) => /reflect scheduled source=turn_steps/.test(line)))
 
-    // 队列已有 → queued。
-    keeper.status = () => ({ running: 0, queued: 1, failed: 0, jobs: [{ kind: 'reflect', state: 'queued' }] })
+    // 队列已有 → queued（精确 countActive，不依赖 200 行快照）。
+    keeper.countActive = () => 1
+    keeper.status = () => ({ running: 0, queued: 0, failed: 0, jobs: [] })
     assert.deepEqual(sched.scheduleAuto({ identity }), { ok: false, reason: 'queued' })
+    keeper.countActive = () => 0
 
     // 日限（本地自然日）：maxRuns=1，第一次已计入。
     keeper.status = () => ({ running: 0, queued: 0, failed: 0, jobs: [] })
@@ -271,7 +306,42 @@ test('空闲 tick：只用最近会话身份；没有会话身份就跳过（绝
     const skipped = await sched.tick()
     assert.equal(skipped.skipped, 'identity_required')
     assert.equal(keeper.enqueued.length, before)
-    assert.ok(logs.some((line) => line.includes('no recent session identity')))
+    assert.equal(logs.filter((line) => line.includes('no recent session identity')).length, 1, '空闲跳过日志只打一次（不刷屏）')
+    // 第二次 tick 仍无身份：不得重复打印同一跳过日志。
+    assert.deepEqual(await sched.tick(), { skipped: 'identity_required' })
+    assert.equal(logs.filter((line) => line.includes('no recent session identity')).length, 1)
+  } finally { sched.dispose() }
+})
+
+test('无 keeper 直跑：getLlm 同步抛错不会让 running 永久卡死', async () => {
+  const { ctx } = fakeCtx()
+  const logs = []
+  const sched = installReflectScheduler(ctx, {
+    backend: {}, config: baseConfig(), getLlm: () => { throw new Error('llm service unavailable') },
+    getSelection: () => undefined, log: (line) => logs.push(line),
+  })
+  try {
+    assert.equal(sched.scheduleAuto({ identity }).ok, true)
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.ok(logs.some((line) => line.includes('reflect run fail-open')))
+    assert.equal(sched.scheduleAuto({ identity }).ok, true, 'running 必须释放，不能永久 queued')
+  } finally { sched.dispose() }
+})
+
+test('keeper handler：基础设施写失败抛出（job 可退避重试），价值闸拒绝仍 done', async () => {
+  const { ctx } = fakeCtx()
+  const keeper = fakeKeeper()
+  const llm = { async *stream() { yield { type: 'text-delta', text: '[{"text":"条目","type":"semantic"}]' } } }
+  const sched = installReflectScheduler(ctx, {
+    backend: {
+      async listEpisodic() { return [{ text: '素材' }] },
+      async write() { return { ok: false, action: 'TIMEOUT', reason: 'queue_wait_timeout' } },
+    },
+    config: {}, getLlm: () => llm, getSelection: () => ({ provider: 'p', model: 'm' }), keeper, log: () => {},
+  })
+  try {
+    const handler = keeper.registered.get('reflect')
+    await assert.rejects(() => handler({ identity }), /reflect_write_failed:queue_wait_timeout/)
   } finally { sched.dispose() }
 })
 

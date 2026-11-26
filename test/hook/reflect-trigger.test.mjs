@@ -85,6 +85,40 @@ test('同一步并行调用 / PTC 子派发 / memory_* / run_code 都不增加 d
   } finally { trig.dispose() }
 })
 
+test('同一步多个并行工具只算一个 distinct step（不虚增）', async () => {
+  const { ctx } = fakeCtx()
+  const { calls, reflect } = fakeReflect()
+  const trig = installReflectTrigger({ ctx, ...identityDeps, reflect, log: () => {} })
+  try {
+    await turnWithTools(ctx, { turn: 1, steps: 6 })
+    await preStep(ctx, 's1', 1, 7)
+    // 同一 step 三个并行调用：distinct step 仍为 7（不是 9）。
+    toolResult(ctx, { name: 'bash' })
+    toolResult(ctx, { name: 'grep' })
+    toolResult(ctx, { name: 'read' })
+    ctx.handlers.get('agent/turn-stopping')({ agent: { session: sessionOf('s1') }, turn: 1 })
+    assert.equal(calls.length, 1)
+  } finally { trig.dispose() }
+})
+
+test('steer 续跑：同一 turn 先 6 步 stopping，再 4 步 → 最终触发一次（不过早锁存）', async () => {
+  const { ctx } = fakeCtx()
+  const { calls, reflect } = fakeReflect()
+  const trig = installReflectTrigger({ ctx, ...identityDeps, reflect, log: () => {} })
+  try {
+    await turnWithTools(ctx, { turn: 1, steps: 6 })
+    ctx.handlers.get('agent/turn-stopping')({ agent: { session: sessionOf('s1') }, turn: 1 })
+    assert.equal(calls.length, 0, '6 步不触发')
+    // turn-stopping 后宿主 steer 继续同一 turn：第 7..10 步。
+    for (let i = 7; i <= 10; i += 1) {
+      await preStep(ctx, 's1', 1, i)
+      toolResult(ctx, { sid: 's1' })
+    }
+    ctx.handlers.get('agent/turn-stopping')({ agent: { session: sessionOf('s1') }, turn: 1 })
+    assert.equal(calls.length, 1, '续跑后达到 10 步必须触发且只一次')
+  } finally { trig.dispose() }
+})
+
 test('abort/error（无 turn-stopping）：下一次 pre-step turn 变化补评估上一 turn', async () => {
   const { ctx } = fakeCtx()
   const { calls, reflect } = fakeReflect()

@@ -62,7 +62,7 @@ export const Config = z.object({
     maxRunsPerDay: z.natural().min(1).max(96).default(24),
   }).default({}),
 
-  // 维护窗口（S4）：只抑制**自动**反思/维护类动作；手动触发是显式动作，绕过窗口与日限。
+  // 峰时窗口（S4）：只抑制**自动反思**（当前唯一消费者）；手动触发是显式动作，绕过窗口与日限。
   // 格式 "HH:MM-HH:MM"（本地时区；start>end 表示跨午夜）；坏值运行期 fail-open 跳过并记一次日志。
   maintenance: z.object({
     suppressWindows: z.array(z.string()).default([]).volatile(),

@@ -284,6 +284,18 @@ export function createKeeper({
       }
     },
 
+    /**
+     * 某 kind 的在队数（queued/running）：供自动闸判断"队列已有"，不受 status() 200 行快照限制。
+     * @param {string} kind
+     * @returns {number}
+     */
+    countActive(kind) {
+      const key = String(kind || '')
+      return Number(store.withDb((db) => db.prepare(
+        "SELECT count(*) AS n FROM jobs WHERE kind = ? AND state IN ('queued','running')",
+      ).get(key)?.n || 0))
+    },
+
     /** 队列快照（面板用）：running/queued/failed 为**计数**，不是布尔。 */
     status() {
       const rows = store.withDb((db) => db.prepare(`SELECT id, kind, state, attempts, next_at, last_error

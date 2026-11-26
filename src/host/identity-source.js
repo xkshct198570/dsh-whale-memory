@@ -20,6 +20,8 @@ import { resolve, sep } from 'node:path'
 
 /** 宿主 userId 缓存 TTL：5 分钟（重新探测账号态；分区稳定性由 `pending/empty` 拒绝保证）。 */
 export const DEFAULT_IDENTITY_TTL_MS = 300_000
+/** 单次宿主身份读取超时（ms）：无超时会让 pending 永久（TTL 重试无法结算）。 */
+export const DEFAULT_PROBE_TIMEOUT_MS = 4000
 /** workspace 长度上限（与 Config.identity.workspace 的 max(64) 同值）。 */
 export const WORKSPACE_MAX = 64
 const USER_ID_MAX = 128
@@ -77,9 +79,15 @@ export function deriveWorkspace(header, { maxLen = WORKSPACE_MAX } = {}) {
  *   refresh: () => Promise<string>, dispose: () => void }}
  *   `getUserId` 同步返回当前值（未就绪为空），过期时在后台刷新，**绝不阻塞调用方**。
  */
-export function installIdentitySource(ctx, { log = () => {}, ttlMs = DEFAULT_IDENTITY_TTL_MS, now = () => Date.now() } = {}) {
+export function installIdentitySource(ctx, {
+  log = () => {}, ttlMs = DEFAULT_IDENTITY_TTL_MS, now = () => Date.now(), probeTimeoutMs = DEFAULT_PROBE_TIMEOUT_MS,
+} = {}) {
   const ttl = Number(ttlMs) > 0 ? Number(ttlMs) : DEFAULT_IDENTITY_TTL_MS
+  const probeTimeout = Number(probeTimeoutMs) >= 0 ? Number(probeTimeoutMs) : DEFAULT_PROBE_TIMEOUT_MS
   const clock = typeof now === 'function' ? now : () => Date.now()
+  /** 是否见过账号服务：区分"从未有服务（absent，可稳定回落）"与"曾有服务后消失（不得回落出第二分区）"。 */
+  let everHadService = false
+  let serviceLostLogged = false
   /** @type {{ phase: 'absent'|'pending'|'empty'|'ready', userId: string, at: number }} */
   let state = { phase: 'absent', userId: '', at: -Infinity }
   /** @type {Promise<string> | null} */
@@ -98,20 +106,50 @@ export function installIdentitySource(ctx, { log = () => {}, ttlMs = DEFAULT_IDE
   }
 
   /**
-   * 读一次宿主 userId。返回三态：service 缺失 / 读取异常 / 成功（userId 可空）。
+   * 带超时的读取：账号服务可能挂在 credentials/平台会话 IO 上；无超时会让 `inflight`
+   * 永不 settle、`pending` 永久，TTL 重试形同虚设（全插件记忆面 fail-closed）。
+   * @param {Promise<any>} promise
+   * @param {number} ms 0/负数 = 不设超时
+   * @returns {Promise<any>}
+   */
+  const withTimeout = async (promise, ms) => {
+    if (!(ms > 0)) return promise
+    /** @type {ReturnType<typeof setTimeout>} */
+    let timer
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(Object.assign(new Error('identity_probe_timeout'), { name: 'TimeoutError' })), ms)
+      if (typeof timer.unref === 'function') timer.unref()
+    })
+    try {
+      return await Promise.race([promise, timeout])
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  /**
+   * 读一次宿主 userId。返回三态：service 缺失 / 读取异常（含超时）/ 成功（userId 可空）。
    * 异常必须与"未登录"分开：前者留 `pending` 待重试，后者是已落定的 `empty`。
    */
   const readOnce = async () => {
     const service = account()
     if (!service) return { kind: 'absent' }
+    everHadService = true
     try {
-      const info = await service.getDeviceIdentity()
+      const info = await withTimeout(Promise.resolve(service.getDeviceIdentity()), probeTimeout)
       const userId = info && typeof info.userId === 'string' ? info.userId.trim() : ''
       return { kind: 'ok', userId: userId.slice(0, USER_ID_MAX) }
     } catch (err) {
       log(`[whale-memory] identity source fail-open: ${err?.message || err?.name || 'error'}`)
       return { kind: 'error' }
     }
+  }
+
+  /** 服务在"曾就绪"后消失：这是来源变化，留在原已落定态（ready 用缓存 id / empty 继续拒），不回落 Config。 */
+  const markServiceLost = () => {
+    if (!everHadService || serviceLostLogged) return
+    serviceLostLogged = true
+    log(`[whale-memory] identity source disappeared: keep phase=${state.phase} (no Config fallback for this process)`)
   }
 
   /** 单飞刷新：并发调用共享同一个 in-flight promise，不叠读。 */
@@ -122,15 +160,22 @@ export function installIdentitySource(ctx, { log = () => {}, ttlMs = DEFAULT_IDE
       .then((got) => {
         if (disposed) return state.userId
         if (got.kind === 'absent') {
-          state = { phase: 'absent', userId: '', at: clock() }
+          // 服务从未出现过 → absent（Config 是稳定身份）；曾就绪后消失 → 保留已落定态，绝不产出第二分区。
+          if (!everHadService) state = { phase: 'absent', userId: '', at: clock() }
+          else markServiceLost()
         } else if (got.kind === 'error') {
           // 读取异常：已有可用值继续用；从未落定时保持 pending（下一 TTL 重试），不得冒充 empty。
           state = state.phase === 'ready'
             ? { ...state, at: clock() }
             : { phase: 'pending', userId: '', at: clock() }
         } else {
+          const prevPhase = state.phase
           const prev = state.phase === 'ready' ? state.userId : ''
           state = { phase: got.userId ? 'ready' : 'empty', userId: got.userId, at: clock() }
+          // 来源状态迁移（含登出 ready→empty、登录 empty→ready）必须可见：它改变"能不能写记忆"。
+          if (prevPhase !== state.phase && (prevPhase === 'ready' || prevPhase === 'empty' || state.phase === 'empty')) {
+            log(`[whale-memory] identity source state=${prevPhase}->${state.phase}`)
+          }
           // 账号切换是显式事件：分区会随之变化，必须留可见证据（无正文）。
           if (prev && state.userId && prev !== state.userId) {
             log('[whale-memory] identity source changed: host userId switched (new partition for subsequent writes)')
@@ -161,10 +206,19 @@ export function installIdentitySource(ctx, { log = () => {}, ttlMs = DEFAULT_IDE
   /** 四态同步读取：identity.js 据此决定 auto 是否允许回落。 */
   const getState = () => {
     if (disposed) return /** @type {'absent'} */ ('absent')
-    if (!account()) return /** @type {'absent'} */ ('absent')
-    // 服务在启动后出现（插件热装）：从 absent 升为 pending 并触发一次读取，绝不直接当 ready。
+    if (!account()) {
+      // 从未有过服务 → absent（可稳定回落）；曾有服务后消失 → 保留已落定态（ready 缓存 id / empty 继续拒）。
+      if (!everHadService) return /** @type {'absent'} */ ('absent')
+      markServiceLost()
+      return state.phase
+    }
+    everHadService = true
+    serviceLostLogged = false
+    // 服务在启动后出现（插件热装/加载顺序）：从 absent 升为 pending 并触发一次读取，绝不直接当 ready。
+    // 留一条无正文日志：这是"分区来源变化"这类必须可见的事件。
     if (state.phase === 'absent') {
       state = { phase: 'pending', userId: '', at: -Infinity }
+      log('[whale-memory] identity source appeared: host identity pending (no provisional partition)')
       void refresh().catch(() => {})
     }
     return state.phase
@@ -177,6 +231,7 @@ export function installIdentitySource(ctx, { log = () => {}, ttlMs = DEFAULT_IDE
 
   const initial = account()
   if (initial) {
+    everHadService = true
     state = { phase: 'pending', userId: '', at: -Infinity }
     if (ctx && typeof ctx.effect === 'function') {
       try {

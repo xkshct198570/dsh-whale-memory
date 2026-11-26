@@ -457,8 +457,8 @@ export class HybridBackend {
   // 首轮画像读本地分层（layer 是本地写入的结果，远端副本可能落后/不支持）；缺能力时抛给调用方显式处理。
   profileLayers(limits, opts) { return this.local.profileLayers(limits, opts) }
   drainWrites() { return this.local.drainWrites() }
-  reviewWrite(id, decision, reason) { return this.local.reviewWrite(id, decision, reason) }
-  listEpisodic(limit) { return this.local.listEpisodic(limit) }
+  reviewWrite(id, decision, reason, opts) { return this.local.reviewWrite(id, decision, reason, opts) }
+  listEpisodic(limit, opts) { return this.local.listEpisodic(limit, opts) }
   nodes(q) { return this.local.nodes(q) }
   getNode(id, opts) { return this.local.getNode(id, opts) }
   updateNode(id, patch, opts) { return this.local.updateNode(id, patch, opts) }
