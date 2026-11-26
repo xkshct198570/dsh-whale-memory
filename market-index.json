@@ -39,6 +39,18 @@
       },
       "versions": [
         {
+          "version": "0.7.1",
+          "publishTimestamp": 1795671149,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/xkshct198570/dsh-whale-memory.git",
+            "commit": "8135365fa8924f8ebc34957eacb33e4bd10080be"
+          },
+          "engines": {
+            "dsh": ">=0.2.2-rc.5 <0.3.0-0"
+          }
+        },
+        {
           "version": "0.7.0",
           "publishTimestamp": 1795634743,
           "source": {
