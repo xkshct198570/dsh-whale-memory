@@ -39,19 +39,29 @@ export function parseReflectOutput(raw) {
     }))
 }
 
+/**
+ * 反思输出预算：默认模型是推理档，会把思考计入 maxTokens；1200 会被思考吃光 → 正文空 →
+ * 解析出 []（真机 47/47 次 `items=0`，2026-11-26 实核）。给足“思考+JSON”，并只收一种文本通道。
+ */
+const REFLECT_MAX_TOKENS = 8192
+
 async function collectLlmText(llm, selection, prompt, modelOverride) {
   const provider = selection?.provider
   const model = modelOverride || selection?.model
   if (!provider || !model) return { ok: false, reason: 'no_model' }
-  let text = ''
+  // 适配器会同时发 text-delta 与 block-end.text；两者相加会把 JSON 拼两遍（与收尾蒸馏同一根因）。
+  let streamed = ''
+  let blocked = ''
+  let reasoningChars = 0
   for await (const chunk of llm.stream({
-    provider, model, temperature: 0.2, maxTokens: 1200,
+    provider, model, temperature: 0.2, maxTokens: REFLECT_MAX_TOKENS,
     messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
   })) {
-    if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') text += chunk.text
-    if (chunk?.type === 'block-end' && chunk.block?.type === 'text') text += String(chunk.block.text || '')
+    if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') streamed += chunk.text
+    else if (chunk?.type === 'block-end' && chunk.block?.type === 'text') blocked += String(chunk.block.text || '')
+    else if (chunk?.type === 'reasoning-delta' && typeof chunk.text === 'string') reasoningChars += chunk.text.length
   }
-  return { ok: true, text }
+  return { ok: true, text: streamed || blocked, reasoningChars }
 }
 
 /**
@@ -74,7 +84,16 @@ export async function runReflect({ backend, llm, selection, config, identity = n
     const prompt = buildReflectPrompt(items, { maxItems })
     const out = await collectLlmText(llm, selection, prompt, config?.reflect?.model || '')
     if (!out.ok) return { ok: false, reason: out.reason }
-    const parsed = parseReflectOutput(out.text).slice(0, maxItems)
+    let parsed = parseReflectOutput(out.text)
+    if (parsed.length === 0 && String(out.text || '').trim()) {
+      // 解析空但正文非空：按收尾蒸馏同口径重试一次，只追加约束不改素材。
+      log(`[whale-memory] reflect parse empty textLen=${out.text.length} reasoning=${out.reasoningChars || 0} retry=1`)
+      const retry = await collectLlmText(llm, selection, `${prompt}\n\n只输出一个 JSON 数组，不要解释、不要代码围栏。`, config?.reflect?.model || '')
+      if (retry.ok) parsed = parseReflectOutput(retry.text)
+    } else if (String(out.text || '').trim() === '') {
+      log(`[whale-memory] reflect empty text reasoning=${out.reasoningChars || 0} (reasoning may dominate; check reflect.model/budget)`)
+    }
+    parsed = parsed.slice(0, maxItems)
     let added = 0
     for (const item of parsed) {
       const r = await backend.write({
@@ -83,7 +102,7 @@ export async function runReflect({ backend, llm, selection, config, identity = n
       })
       if (r?.ok && !r.duplicate) added += 1
     }
-    log(`[whale-memory] reflect done material=${items.length} items=${parsed.length} added=${added}`)
+    log(`[whale-memory] reflect done material=${items.length} items=${parsed.length} added=${added} textLen=${out.text.length} reasoning=${out.reasoningChars || 0}`)
     return { ok: true, added, material: items.length, items: parsed.length }
   } catch (err) {
     log(`[whale-memory] reflect fail-open: ${err?.message || err}`)

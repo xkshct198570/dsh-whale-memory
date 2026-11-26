@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-11-26T05:31:54.102Z",
+  "generatedAt": "2026-11-26T06:39:09.150Z",
   "thresholds": {
     "plan": 800,
     "freeze": 1200,
@@ -28,7 +28,7 @@
     "src/core/node-rank.js": 19,
     "src/core/queryplan.js": 93,
     "src/core/reconcile.js": 141,
-    "src/core/reflect.js": 147,
+    "src/core/reflect.js": 159,
     "src/core/relations.js": 192,
     "src/core/rule-defaults.js": 443,
     "src/core/rule-lock.js": 194,
@@ -191,7 +191,7 @@
     "test/unit/memory-hygiene.test.mjs": 188,
     "test/unit/queryplan.test.mjs": 129,
     "test/unit/reconcile.test.mjs": 73,
-    "test/unit/reflect.test.mjs": 64,
+    "test/unit/reflect.test.mjs": 83,
     "test/unit/relations.test.mjs": 157,
     "test/unit/rule-defaults-content.test.mjs": 152,
     "test/unit/rule-defaults.test.mjs": 475,
