@@ -3,10 +3,10 @@
 
 /** @typedef {import('./base.js').Identity} Identity */
 
-import { createWriteQueue, isActiveHashConflict, recordEvolution, withTx } from '../writer.js'
+import { createWriteQueue, isActiveHashConflict, isProtectedTarget, recordEvolution, withTx, writePayload } from '../writer.js'
 import { bigrams, contentHash, normalize } from '../tokenize.js'
 import { now } from '../db.js'
-import { applyNeighborNotes } from '../relations.js'
+import { applyNeighborNotes, parseTags } from '../relations.js'
 import { value } from '../../shared/config-values.js'
 import { whereOf } from './base.js'
 
@@ -93,6 +93,7 @@ export const writeApi = {
       ok: true,
       id: res.id,
       action: res.action,
+      reason: String(res.reason ?? ''),
       duplicate: Boolean(res.duplicate),
       candidate: res.action === 'CANDIDATE',
     }
@@ -111,8 +112,9 @@ export const writeApi = {
    *
    * @param {string} id
    * @param {{ text?:string, status?:string, level?:string, tags?:string[], superseded_by?:string }} patch
-   * @param {{ identity?:Identity, traceId?:string, mode?:'manual'|'sync' }} [opts]
-   *   mode 只影响 writes.mode（面板人工 vs 同步冲突标记），便于审计区分改动来源。
+   * @param {{ identity?:Identity, traceId?:string, mode?:'manual'|'sync', origin?:string, reason?:string }} [opts]
+   *   mode 只影响 writes.mode（面板人工 vs 同步冲突标记）；origin 落 writes.payload.origin（工具改写传 'tool'）；
+   *   reason 覆盖归档审计原因（缺省 `<origin>_archive`）。
    * @returns {{ ok: boolean, id?: string, error?: string }}
    */
   async updateNode(id, patch = {}, opts = {}) {
@@ -143,19 +145,37 @@ export const writeApi = {
 
     const textChanged = text !== row.text
     const levelChanged = level !== row.level
-    const protectedTarget = String(row.source || '') === 'owner'
-      || String(row.level || '') === 'core'
-      || String(row.memory_type || '') === 'procedural'
-    if (protectedTarget && (textChanged || levelChanged)) return { ok: false, error: 'protected_target' }
+    // 保护面判据只认 decide.js 的 isProtectedTarget（同一判据一处；此前这里抄了一份）。
+    if (isProtectedTarget(row, { protect: true }) && (textChanged || levelChanged)) {
+      return { ok: false, error: 'protected_target' }
+    }
 
     const statusChanged = status !== row.status
     const tagsChanged = tags !== row.tags
     const pointerChanged = String(nextPointer ?? '') !== String(row.superseded_by ?? '')
+    // 无变化时不发 UPDATE 也不产审计：返回“实际生效的 updated_at”，否则调用方拿到一个
+    // 从未落库的新时间戳，下一次 CAS 必然误判 node_changed（幻影版本号）。
+    const changed = textChanged || statusChanged || levelChanged || tagsChanged || pointerChanged
     // CAS 基线必须严格递增：同一毫秒内两次保存若返回相同 updated_at，客户端下一次提交仍带旧值
     // 会被误判 node_changed（A3 偶发红）。至少比旧值大 1 微秒。
     const ts = Math.max(now(), Number(row.updated_at || 0) + 0.000001)
     const traceId = String(opts?.traceId || '').slice(0, 64)
     const mode = opts?.mode === 'sync' ? 'sync' : 'manual'
+    // 来源标记落 writes.payload.origin（v2 列）：工具改写必须可查（json_extract），
+    // 面板/同步沿用各自默认值；payload 与影子候选同形（writePayload 唯一构造）。
+    const origin = String(opts?.origin || (opts?.mode === 'sync' ? 'sync' : 'panel')).slice(0, 32)
+    const verb = origin === 'tool' ? 'tool' : origin === 'sync' ? 'sync' : 'manual'
+    const payloadJson = JSON.stringify(writePayload({
+      level,
+      memory_type: row.memory_type,
+      tags: parseTags(tags),
+      source: row.source,
+      origin,
+      expired_at: row.expired_at,
+      shadowOf: null,
+      targetId: null,
+    }))
+    const reasonOf = (fallback) => String(opts?.reason || fallback).slice(0, 200)
 
     try {
       return withTx(db, () => {
@@ -165,7 +185,7 @@ export const writeApi = {
       if (current && String(current.updated_at) !== String(row.updated_at)) {
         return { ok: false, error: 'node_changed' }
       }
-      if (textChanged || statusChanged || levelChanged || tagsChanged || pointerChanged) {
+      if (changed) {
         db.prepare(`UPDATE nodes SET text=?,text_hash=?,text_bigrams=?,status=?,level=?,tags=?,superseded_by=?,updated_at=?
           WHERE id=?`).run(
           text, contentHash(text), bigrams(text), status, level, tags, nextPointer, ts, target,
@@ -174,20 +194,20 @@ export const writeApi = {
       /** 一个字段的改动 = 一条 writes + 一条 evolution（面板「写入」页与「演化」页同源）。 */
       const audit = (action, field, oldValue, newValue, reason) => {
         db.prepare(`INSERT INTO writes
-          (ts,trace_id,action,node_id,reason,before_text,after_text,mode,user_id,role_id,workspace)
-          VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(
+          (ts,trace_id,action,node_id,reason,before_text,after_text,mode,payload,user_id,role_id,workspace)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(
           ts, traceId, action, target, reason,
           String(row.text ?? ''), field === 'text' ? String(newValue ?? '') : String(row.text ?? ''),
-          mode, String(row.user_id ?? ''), String(row.role_id ?? ''), String(row.workspace ?? ''),
+          mode, payloadJson, String(row.user_id ?? ''), String(row.role_id ?? ''), String(row.workspace ?? ''),
         )
         recordEvolution(db, { ts, fromId: target, toId: target, field, oldValue, newValue, traceId })
       }
-      if (textChanged) audit('EDIT', 'text', row.text, text, 'manual_edit')
-      if (statusChanged) audit('ARCHIVE', 'status', row.status, status, 'manual_archive')
-      if (levelChanged) audit('EDIT', 'level', row.level, level, 'manual_level')
-      if (tagsChanged) audit('EDIT', 'tags', row.tags, tags, 'manual_tags')
-      if (pointerChanged) audit('EDIT', 'superseded_by', row.superseded_by ?? '', nextPointer ?? '', 'manual_supersede')
-        return { ok: true, id: target, updated_at: ts }
+      if (textChanged) audit('EDIT', 'text', row.text, text, `${verb}_edit`)
+      if (statusChanged) audit('ARCHIVE', 'status', row.status, status, reasonOf(`${verb}_archive`))
+      if (levelChanged) audit('EDIT', 'level', row.level, level, `${verb}_level`)
+      if (tagsChanged) audit('EDIT', 'tags', row.tags, tags, `${verb}_tags`)
+      if (pointerChanged) audit('EDIT', 'superseded_by', row.superseded_by ?? '', nextPointer ?? '', `${verb}_supersede`)
+        return { ok: true, id: target, updated_at: changed ? ts : Number(row.updated_at || 0) }
       })
     } catch (err) {
       // 编辑后的正文与另一活跃行撞车：回明确错误码，不把 SQLite 约束文案透给面板。

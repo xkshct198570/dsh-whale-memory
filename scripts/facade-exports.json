@@ -167,13 +167,15 @@
         "decideWrite",
         "findCandidates",
         "isActiveHashConflict",
+        "isProtectedTarget",
         "privacyCheck",
         "processEvent",
         "recordEvolution",
         "recordWrite",
         "slotsOf",
         "timeOverlap",
-        "withTx"
+        "withTx",
+        "writePayload"
       ]
     },
     {

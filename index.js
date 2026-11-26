@@ -10,6 +10,7 @@ import { installHook } from './src/host/hook.js'
 import { createBackend } from './src/core/backend.js'
 import { Config } from './src/host/config.js'
 import { installSearchFeed } from './src/host/search-feed.js'
+import { installMemoryTools } from './src/host/tools.js'
 import { installIdentitySource } from './src/host/identity-source.js'
 import { deriveWorkspace, resolveIdentity } from './src/host/identity.js'
 import { installConfigMigration } from './src/host/config-migration.js'
@@ -28,7 +29,7 @@ import { agentsPathOf, renderAgentsDigest } from './src/core/rule-render.js'
 import { bool, num } from './src/shared/config-values.js'
 
 export { Config }
-export const inject = ['webServer', 'systemPrompt']
+export const inject = ['webServer', 'systemPrompt', 'tools']
 
 const log = (line) => { try { console.log(line) } catch { /* log 永远不是故障点 */ } }
 
@@ -355,6 +356,16 @@ export function apply(ctx, config) {
     backend: backendProxy, config, log,
     getIdentityCfg, getIdentityHint, getHostUserId,
   })
+
+  // 模型侧记忆工具面（S2）：五工具注册 + 每回合写限次；身份与收尾/召回同一套 getter。
+  // 注册在 ctx.effect 里：插件卸载时逐个反注册并清 pre-step 监听。
+  ctx.effect(() => {
+    const tools = installMemoryTools({
+      ctx, backend: backendProxy, config, log,
+      getIdentityCfg, getIdentityHint, getHostUserId,
+    })
+    return () => tools.dispose()
+  }, 'whale-memory: memory tools')
 
   // 会话收尾（Session Wrap）：采集器 → 服务编排（keeper `wrap` job）。
   // captureRef 是回指：服务成功后要推进采集缓冲；采集器触发时调用服务 onTrigger。

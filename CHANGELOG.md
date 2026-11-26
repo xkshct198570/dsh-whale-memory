@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.8.0-beta1 — 2026-11-27（普通记忆自动入库 · S1）
+## 0.8.0-beta1 — 2026-11-27（普通记忆自动入库 S1 + 模型记忆工具面 S2）
 
 - **自动入库**：收尾普通记忆默认走 `process.js` 唯一闸——durable→active；task/stale→REJECT（before/after 均为 NULL，不存正文）；歧义/主观/低置信→审核候选。来源固定 `source=self`（owner 只留给用户手工/导入，避免保护面锁死后续 MERGE）。
 - **价值闸/歧义闸**：新增 `src/shared/ingest-policy.js`（纯判据，零 import）与 `classifyDurability`/`detectAmbiguity`；顺序 stale→task 句首/计划句→歧义→durable→uncertain，歧义只返回原因、不改写正文。
@@ -8,7 +8,10 @@
 - **判重**：字符袋相同/语序反转→审核（不 NOOP、不 MERGE）；矛盾先行；新文包含旧文且旧文≥8 字→MERGE（不受 0.85 相似度限制）；近文/疑似改写无增益→审核候选。语义同义判重仍留 0.8.1。
 - **计数与报告**：run 落 `distilled_json.counts={ingested,reviewed,skipped}`，`/wrap/status.latest.counts` 同源；面板收尾卡显示入库/待审/跳过三计数；报告只打印待审正文，已入库只列 node id，跳过只列分类码。
 - **迁移**：`scripts/migrate-wrap-candidates.mjs`（随包发布）默认 dry-run；`--apply` 自动备份后重放旧候选，原行改 `MIGRATED`，历史 `auto_ingested:%` REJECT 归一；靠 `trace_id=migrate:*` 排除自身产物，两遍幂等。
-- 测试：全量 1127（1126 pass / 1 skip / 0 fail）；新增写入闸 §7.1 十二条 + §7.2 判重、dispatch/reconcile 集成、迁移幂等、配置清理用例。
+- **模型记忆工具面（S2）**：新增 `memory_remember / memory_search / memory_read / memory_update / memory_forget`（`src/host/tools.js` + `tool-output.js` / `tool-errors.js` / `tool-rate-limit.js`）。身份固定当前会话，缺会话 cwd 一律 `IDENTITY_REQUIRED`；跨分区 id 按不存在（`NODE_NOT_FOUND`）；remember 走与收尾同一 `ingestPolicy`（含 `wrap.ingest.mode=review` 回退），任务/一次性句抛 `NOT_MEMORY`，歧义/保护面转 CANDIDATE；update 有 CAS（`NODE_CHANGED`）、保护面/重复正文分别拒；forget 只归档不物理删。
+- **限次与开关（S2）**：每回合 `remember/update/forget` 写尝试上限 `tools.maxWritesPerTurn`（默认 5，第 6 次 `RATE_LIMITED`，turn 变化清零）；`tools.enabled=false` 或子代理会话时五工具不进 step 工具集；设置页新增「模型工具」组（三语）。
+- **审计与重构（S2）**：`updateNode` 审计行补 `writes.payload.origin`（面板/同步/工具三口径）并复用 `isProtectedTarget`（删除抄写）；`writePayload` 抽成唯一构造；tags 归一/解析移到 `src/shared/tags.js`（关系层再导出）；`write()` 透传 reason。
+- 测试：全量 **1151（1150 pass / 1 skip / 0 fail）**；新增写入闸 §7.1 十二条 + §7.2 判重、dispatch/reconcile 集成、迁移幂等、配置清理用例、工具面 17 例、真注册表 1 例、审计来源 3 例。
 
 ## 0.7.3 — 2026-11-26（面板页签不可见修复）
 

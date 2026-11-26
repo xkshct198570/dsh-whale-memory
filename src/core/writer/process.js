@@ -1,6 +1,6 @@
 // 职责：事件落库（节点插入/配置归一/processEvent 编排/__ingest 唯一闸）；依赖：../../shared/config-values.js + ../../shared/ingest-policy.js + ../db.js + ../tokenize.js + ../relations.js + ./decide.js + ./privacy.js + ./audit.js；不 import 门面。
 import { value } from '../../shared/config-values.js'
-import { DURABILITY, classifyDurability, detectAmbiguity } from '../../shared/ingest-policy.js'
+import { DURABILITY, INGEST_DEFAULTS, classifyDurability, detectAmbiguity } from '../../shared/ingest-policy.js'
 import { now } from '../db.js'
 import { bigrams, contentHash, normalize } from '../tokenize.js'
 import { linkMutex, linkSupersede, normalizeTags } from '../relations.js'
@@ -12,7 +12,7 @@ import { privacyCheck } from './privacy.js'
 import { isActiveHashConflict, recordEvolution, recordWrite, withTx } from './audit.js'
 
 /** minConfidence 缺省（架构书 §5.1）：distill 缺 confidence 时按 0.5 走，低于它转审核。 */
-const DEFAULT_MIN_CONFIDENCE = 0.55
+const DEFAULT_MIN_CONFIDENCE = INGEST_DEFAULTS.minConfidence
 
 /**
  * 插一个 active 节点（内部用）：字段全填，双时态 valid_at 置为本次决策时间。

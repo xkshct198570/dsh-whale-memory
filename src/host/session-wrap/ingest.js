@@ -7,12 +7,9 @@
  * 依赖方向：host → shared + core/wrap-runs；不 import 门面。
  */
 
-/** 与 Config 缺省一致；host 必须显式传入实时配置，不在本文件读全局。 */
-export const INGEST_DEFAULTS = Object.freeze({
-  mode: 'auto',
-  minConfidence: 0.55,
-  dropTaskInstructions: true,
-})
+// 缺省与映射的唯一真源在 shared/ingest-policy.js；这里只保留公开名（收尾/工具/reflect 共用）。
+import { INGEST_DEFAULTS, ingestPolicyOf } from '../../shared/ingest-policy.js'
+export { INGEST_DEFAULTS }
 
 /** 写入前就失败、重试也不会变的错误码：直接终态跳过（与 0.7.x dispatch 口径一致）。 */
 const PERMANENT_ERRORS = new Set([
@@ -117,7 +114,6 @@ export async function ingestItem({
   backend, item, identity, runId, ingest, origin, level, memoryType,
   source = 'self', tags = [],
 }) {
-  const cfg = { ...INGEST_DEFAULTS, ...(ingest && typeof ingest === 'object' ? ingest : {}) }
   try {
     const res = await backend.write({
       text: String(item?.text || ''),
@@ -128,12 +124,7 @@ export async function ingestItem({
       origin,
       traceId: `wrap:${runId}`,
       identity,
-      ingestPolicy: {
-        mode: cfg.mode,
-        minConfidence: cfg.minConfidence,
-        dropTaskInstructions: cfg.dropTaskInstructions,
-        confidence: item?.confidence,
-      },
+      ingestPolicy: ingestPolicyOf(ingest, { confidence: item?.confidence }),
     })
     return statusOf(res)
   } catch (err) {

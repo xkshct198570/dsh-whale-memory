@@ -19,18 +19,42 @@ import {
  *   source?: string, shadowOf?: string, targetId?: string|null }} decision
  * @returns {number} 新 writes 行 id
  */
+/**
+ * writes.payload 的唯一构造（v2 列）：来源/字段快照；影子候选审核时还承载 shadowOf/targetId。
+ *
+ * 为什么抽成导出函数：影子候选与工具改写的审计行必须同形；两处各拼一次 JSON 迟早字段漂移
+ * （漏 origin/shadowOf 会让 `json_extract(payload,'$.origin')` 的查询静默漏行）。
+ *
+ * @param {{ level?: unknown, memory_type?: unknown, tags?: unknown, source?: unknown, origin?: unknown,
+ *   expired_at?: unknown, shadowOf?: unknown, targetId?: unknown }} [fields]
+ * @returns {{ level: string, memory_type: string, tags: string[], source: string, origin: string,
+ *   expired_at: number|null, shadowOf: string|null, targetId: string|null }}
+ */
+export function writePayload(fields = {}) {
+  return {
+    level: validLevel(fields?.level),
+    memory_type: validMemoryType(fields?.memory_type),
+    tags: normalizeTags(fields?.tags),
+    source: mapSource(fields?.source),
+    origin: String(fields?.origin ?? ''),
+    expired_at: validExpiredAt(fields?.expired_at),
+    shadowOf: fields?.shadowOf ? String(fields.shadowOf) : null,
+    targetId: fields?.targetId ? String(fields.targetId) : null,
+  }
+}
+
 export function recordWrite(db, event, decision) {
   const ident = normalizeIdentity(event?.identity)
-  const payload = {
-    level: validLevel(decision?.level ?? event?.level),
-    memory_type: validMemoryType(decision?.memory_type ?? event?.memory_type),
-    tags: normalizeTags(decision?.tags ?? event?.tags),
-    source: mapSource(decision?.source ?? event?.source),
-    origin: String(event?.origin ?? ''),
-    expired_at: validExpiredAt(event?.expired_at),
-    shadowOf: decision?.shadowOf ? String(decision.shadowOf) : null,
-    targetId: decision?.targetId ? String(decision.targetId) : null,
-  }
+  const payload = writePayload({
+    level: decision?.level ?? event?.level,
+    memory_type: decision?.memory_type ?? event?.memory_type,
+    tags: decision?.tags ?? event?.tags,
+    source: decision?.source ?? event?.source,
+    origin: event?.origin,
+    expired_at: event?.expired_at,
+    shadowOf: decision?.shadowOf,
+    targetId: decision?.targetId,
+  })
   const info = db.prepare(`INSERT INTO writes
     (ts,trace_id,action,node_id,reason,before_text,after_text,mode,payload,user_id,role_id,workspace)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(

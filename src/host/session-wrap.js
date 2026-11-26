@@ -29,7 +29,8 @@ import {
 } from './session-wrap/spool-run.js'
 import { distillPhase } from './session-wrap/distill.js'
 import { dispatchPhase } from './session-wrap/dispatch.js'
-import { INGEST_DEFAULTS, actionsOf, countsOf, runPatchOf } from './session-wrap/ingest.js'
+import { ingestPolicyOf } from '../shared/ingest-policy.js'
+import { actionsOf, countsOf, runPatchOf } from './session-wrap/ingest.js'
 import { buildWrapStatus } from './session-wrap/status.js'
 import { applyReconcile, reconcilePhase } from './session-wrap/reconcile.js'
 import { reportPhase, reportRead, sweepStorage as sweepStorageFiles } from './session-wrap/report.js'
@@ -71,11 +72,7 @@ export function installSessionWrap(ctx, {
       idleMinutes: num(w.idleMinutes, 10),
       maxItems: num(w.maxItems, 8),
       // 普通记忆自动入库（S1）：mode auto|review；review＝0.7.3 回退（全部影子候选）。
-      ingest: {
-        mode: value(w.ingest?.mode) === 'review' ? 'review' : INGEST_DEFAULTS.mode,
-        minConfidence: num(w.ingest?.minConfidence, INGEST_DEFAULTS.minConfidence),
-        dropTaskInstructions: bool(w.ingest?.dropTaskInstructions, INGEST_DEFAULTS.dropTaskInstructions),
-      },
+      ingest: ingestPolicyOf(w.ingest),
       spoolTtlHours: num(w.spoolTtlHours, 24),
       retentionDays: num(w.retentionDays, 180),
       maxRunsPerDay: num(w.maxRunsPerDay, 6),

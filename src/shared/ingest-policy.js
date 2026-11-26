@@ -1,6 +1,43 @@
-// 职责：写入价值闸/歧义闸的纯判据（持久性分类、歧义原因）；零 import、无 IO、不改写正文。
-// 依赖方向：只被 core/writer/process.js 与测试 import；不得 import host/core（架构书 §5.5）。
-// 契约真源：docs/记忆插件-自动沉淀与工具面-架构书-v1-2026-11-26.md §5.3。
+// 职责：写入价值闸/歧义闸的纯判据（持久性分类、歧义原因）+ ingestPolicy 缺省/映射（单一真源）。
+// 依赖方向：只 import ./config-values.js（解 volatile Ref）；被 core/writer/process.js、host/session-wrap*、
+// host/tools.js 与测试 import；不得 import host/core（架构书 §5.5）。
+// 契约真源：docs/记忆插件-自动沉淀与工具面-架构书-v1-2026-11-26.md §5.1/§5.3。
+
+import { value } from './config-values.js'
+
+/**
+ * ingestPolicy 缺省（与 Config `wrap.ingest.*` 缺省同值）。
+ *
+ * 为什么放在这里：收尾、工具、reflect 三处都要传 policy；默认值/映射若各写一份，
+ * `minConfidence` 或 review 回退迟早只在一个入口生效（旧版就有"工具无 confidence 全成候选"）。
+ */
+export const INGEST_DEFAULTS = Object.freeze({
+  mode: 'auto',
+  minConfidence: 0.55,
+  dropTaskInstructions: true,
+})
+
+/**
+ * 配置/事件字段 → ingestPolicy（纯映射；容忍 schemastery Ref）。
+ *
+ * @param {unknown} raw 形如 `{mode,minConfidence,dropTaskInstructions}`（可含 Ref）
+ * @param {{ confidence?: unknown }} [opts] 本次写入的置信度（tool/reflect 固定 1.0；distill 可缺省）
+ * @returns {{ mode:'auto'|'review', minConfidence:number, dropTaskInstructions:boolean, confidence:number }}
+ */
+export function ingestPolicyOf(raw, { confidence = 1 } = {}) {
+  const cfg = raw && typeof raw === 'object' ? raw : {}
+  const minRaw = Number(value(cfg.minConfidence, INGEST_DEFAULTS.minConfidence))
+  const minConfidence = Number.isFinite(minRaw)
+    ? Math.max(0, Math.min(1, minRaw))
+    : INGEST_DEFAULTS.minConfidence
+  const confRaw = Number(value(confidence, 1))
+  return {
+    mode: value(cfg.mode) === 'review' ? 'review' : INGEST_DEFAULTS.mode,
+    minConfidence,
+    dropTaskInstructions: value(cfg.dropTaskInstructions) !== false,
+    confidence: Number.isFinite(confRaw) ? Math.max(0, Math.min(1, confRaw)) : 1,
+  }
+}
 
 /** 分类标签（process.js 据此映射 REJECT/CANDIDATE/auto，本文件不决定动作）。 */
 export const DURABILITY = Object.freeze({

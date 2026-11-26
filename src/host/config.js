@@ -47,6 +47,13 @@ export const Config = z.object({
     ignorePatterns: z.array(z.string()).default([]),
   }).default({}),
 
+  // 模型侧记忆工具面（S2）：enabled=false 时五工具不出现在 step 工具集；
+  // maxWritesPerTurn 只限 remember/update/forget 的每回合尝试次数（读工具不限）。
+  tools: z.object({
+    enabled: z.boolean().default(true).volatile(),
+    maxWritesPerTurn: z.natural().min(1).max(50).default(5).volatile(),
+  }).default({}),
+
   reflect: z.object({
     enabled: z.boolean().default(false),
     model: z.string().default(''),

@@ -11,6 +11,7 @@
  */
 import { now } from './db.js'
 import { identityFilter } from './backend/base.js'
+import { normalizeTags, parseTags } from '../shared/tags.js'
 
 /** context_note 硬顶（字）；与 schema CHECK 同值。 */
 export const NOTE_MAX = 200
@@ -32,28 +33,8 @@ export function clamp01(value, fallback = 0.5) {
   return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : fallback
 }
 
-/** 标签数组（去空、去重、小写比较但保留原样）。 */
-export function normalizeTags(tags) {
-  const out = []
-  const seen = new Set()
-  for (const raw of Array.isArray(tags) ? tags : []) {
-    const tag = String(raw ?? '').trim()
-    if (!tag) continue
-    const key = tag.toLowerCase()
-    if (seen.has(key)) continue
-    seen.add(key)
-    out.push(tag)
-  }
-  return out
-}
-
-/** 解析库里存的 tags JSON；坏数据当空数组（读路径绝不抛）。 */
-export function parseTags(raw) {
-  try {
-    const parsed = JSON.parse(String(raw || '[]'))
-    return Array.isArray(parsed) ? normalizeTags(parsed) : []
-  } catch { return [] }
-}
+// tags 归一/解析的唯一实现在 shared/tags.js（host 投影与关系层共用）；这里保留原导出名。
+export { normalizeTags, parseTags }
 
 /**
  * 演化注记：去重追加，超 200 字时丢最旧片段（覆盖而不是无限增长）。

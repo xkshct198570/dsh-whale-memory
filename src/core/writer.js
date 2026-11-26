@@ -6,10 +6,10 @@
  */
 import { privacyCheck } from './writer/privacy.js'
 import {
-  slotsOf, contradiction, timeOverlap, findCandidates, decideWrite,
+  slotsOf, contradiction, timeOverlap, findCandidates, decideWrite, isProtectedTarget,
 } from './writer/decide.js'
 import {
-  isActiveHashConflict, withTx, recordWrite, recordEvolution,
+  isActiveHashConflict, withTx, recordWrite, recordEvolution, writePayload,
 } from './writer/audit.js'
 import { processEvent } from './writer/process.js'
 import { createWriteQueue } from './writer/queue.js'
@@ -18,6 +18,6 @@ import { createWriteQueue } from './writer/queue.js'
 export {
   privacyCheck,
   slotsOf, contradiction, timeOverlap, findCandidates, decideWrite,
-  isActiveHashConflict, withTx, recordWrite, recordEvolution, processEvent,
-  createWriteQueue,
+  isProtectedTarget, isActiveHashConflict, withTx, recordWrite, recordEvolution, writePayload,
+  processEvent, createWriteQueue,
 }

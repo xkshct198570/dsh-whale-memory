@@ -164,3 +164,25 @@
 - **日志关键词**：所有日志行带 `[whale-memory]`。常见：`worker unavailable`（检索线程没起来，功能降级）、`protocol mismatch`（外部后端协议不符，切回本地即可）、`rules ... fail-open`（规则某一步失败但不挡启动）、`db quarantined`（库损坏已改名隔离，原文件还在同目录 `memory.corrupt-*`）。
 - **备份与现场**：`~/.dsh/whale-memory/backup/`、`~/.dsh/whale-memory/reports/`、`~/.dsh/rules/manifest.json`。求助时附上这三个路径里的对应文件，比截图有用。
 - **建议顺序**：概览 → 召回页 → 写入与关系 → 规则健康。四步都正常还不满意，再动设置里的数字。
+
+## 8. 模型侧记忆工具
+
+模型在对话里可以直接调用五个记忆工具；工具身份固定为当前会话，不接受身份参数，跨身份的 id 一律按不存在处理。
+
+| 工具 | 参数 | 行为 |
+|---|---|---|
+| memory_remember | text（必填）、level?、memory_type?、tags? | 与自动写入过同一道价值闸：长期规则直接入库；歧义/主观/低置信转待审候选；任务指令与版本状态报 NOT_MEMORY；受保护目标转待审。 |
+| memory_search | query（必填）、limit?（1–20，默认 5） | 只在当前身份分区检索，返回 id/正文/层级/类型/分数；空 query 报 INVALID_ARGS。 |
+| memory_read | id | 读同身份节点与相邻关系边；跨身份 id 报 NODE_NOT_FOUND。 |
+| memory_update | id、text?、level?、tags?、expectedUpdatedAt? | 改正文/层级/标签；正文 ≤500 字；带 expectedUpdatedAt 时做 CAS，期间被改过报 NODE_CHANGED；受保护目标（owner/core/procedural）任何字段都不许改，报 PROTECTED_TARGET。 |
+| memory_forget | id、reason（≤200） | 只归档（ARCHIVE），不物理删除行；受保护目标报 PROTECTED_TARGET。 |
+
+- **身份只取当前会话**：userId/roleId 仍按插件身份配置与宿主登录态推导，workspace 由会话工作目录派生；没有 agent、缺会话头或 workspace 为空时直接报 IDENTITY_REQUIRED，不落任何写入。
+- **跨身份 id 视为不存在**：search/read/update/forget 都按当前身份过滤；拿别的分区 id 调用得到 NODE_NOT_FOUND，读不到也改不到别人的记忆。
+- **每回合写类工具限次**：remember/update/forget 每次进入写路径计数（参数非法、身份缺失、节点不存在/受保护等前置失败不计），默认每回合 5 次；超限返回 RATE_LIMITED。回合推进后计数清零。设置 →「模型工具」可把上限改成 1–50。
+- **子代理不可见**：子代理的工具集里没有这五个工具，调用得到 UNKNOWN_TOOL；只有主会话能看到。
+- **受保护记忆不可改/归档**：source=owner、level=core、memory_type=procedural 的节点不能被 update 改任何字段（含只改标签），也不能被 forget 归档；调用返回 PROTECTED_TARGET，规则与默认铁律不会因模型遗忘而被删。面板编辑仍按既有规则只挡正文/等级。
+- **失败是错误而非成功**：参数越界（含标签 >32 个）、身份缺失、跨身份、受保护、CAS 冲突、限次、后端不可用都以稳定错误码抛出，不会回 `{ok:false}` 冒充成功。
+- **重复归档是幂等跳过**：对已归档节点再 forget 返回 ok，但不会再造审计行，启动日志记 `memory_forget noop`（不把“没做什么”说成新写入）。
+- **只支持本地/混合后端**：记忆工具要求后端具备同身份读改能力（`getNode`/`updateNode`）；纯 http 远端协议只有写入/检索，工具面不注册（启动日志会写明缺的能力），面板写入与收尾照常。
+- **开关**：设置 →「模型工具」的「启用模型记忆工具」关闭后，五个工具不再出现在工具集里；面板写入、导入与收尾入库照常工作。

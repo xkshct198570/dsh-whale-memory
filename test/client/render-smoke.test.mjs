@@ -29,6 +29,7 @@ const DEFAULT_CONFIG = {
     enabled: true, reviewMode: 'shadow', maxChars: 500, dailyCap: 200, judge: 'rules',
     searchFeed: false, searchTtlHours: 24, model: '', ignorePatterns: [],
   },
+  tools: { enabled: true, maxWritesPerTurn: 5 },
   rules: {
     enabled: true, dir: '', requireGit: false, askMode: 'panel+chat', llm: false,
     maxProposals: 20, guardStrict: true, mirrorAuto: true, askCooldownDays: 30,

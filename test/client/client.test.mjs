@@ -38,11 +38,12 @@ test('五页签 id 都在 TABS 中', () => {
   }
 })
 
-test('设置页至少 6 个分组标题键，且现有 14 组齐全', () => {
+test('设置页至少 6 个分组标题键，且现有 15 组齐全', () => {
   const groups = Object.keys(dicts.zh).filter((key) => key.startsWith('settings.group'))
   assert.ok(groups.length >= 6, `设置分组只有 ${groups.length} 个`)
   for (const group of [
     'settings.groupBackend', 'settings.groupIdentity', 'settings.groupRecall', 'settings.groupWrite',
+    'settings.groupTools',
     'settings.groupReflect', 'settings.groupWrap', 'settings.groupConsolidate', 'settings.groupEmbed',
     'settings.groupPrivacy', 'settings.groupEdges', 'settings.groupSync', 'settings.groupPanel',
     'settings.groupAdvanced', 'settings.groupDanger',
@@ -685,11 +686,11 @@ test('WP1 推荐开启徽标：四个需外部条件的开关带 recommend，bad
 })
 
 test('WP2 设置信息架构：顺序固定、首屏四组展开、其余默认收起、布局根因修复', () => {
-  assert.match(CLIENT, /const SETTINGS_GROUP_ORDER = Object\.freeze\(\[\s*'recall', 'write', 'identity', 'rules', 'backend', 'sync',\s*'reflect', 'wrap', 'consolidate', 'privacy', 'edges', 'panel', 'advanced', 'embed',\s*\]\)/)
+  assert.match(CLIENT, /const SETTINGS_GROUP_ORDER = Object\.freeze\(\[\s*'recall', 'write', 'tools', 'identity', 'rules', 'backend', 'sync',\s*'reflect', 'wrap', 'consolidate', 'privacy', 'edges', 'panel', 'advanced', 'embed',\s*\]\)/)
   assert.match(CLIENT, /SETTINGS_GROUP_ORDER\.map\(\(key\) => \(groupNodes\[key\]/, '未按顺序渲染分组')
   assert.match(CLIENT, /h\(React\.Fragment, \{ key \}, groupNodes\[key\]\(\)\)/, '分组列表缺稳定 key')
   // 折叠卡自己取文案：调用方必须注入 t，否则首渲染就 ReferenceError。
-  assert.equal((CLIENT.match(/t, titleKey: 'settings\.group/g) || []).length, 15, '14 个网格分组 + 危险区都必须注入 t')
+  assert.equal((CLIENT.match(/t, titleKey: 'settings\.group/g) || []).length, 16, '15 个网格分组 + 危险区都必须注入 t')
   assert.match(CLIENT, /t, titleKey: 'settings\.groupRecall'/)
   assert.match(CLIENT, /SETTINGS_CORE_GROUP_KEYS = new Set\(\[\s*'settings\.groupRecall', 'settings\.groupWrite', 'settings\.groupIdentity', 'settings\.groupRules',\s*\]\)/)
   assert.match(CLIENT, /function readGroupOpen\(/, '缺展开状态读取')
