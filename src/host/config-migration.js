@@ -27,6 +27,11 @@ export const MIGRATED_FROM = 'hub-0.2.0'
 /** 无本地库时的幂等文件（相对 $DSH_HOME）。 */
 export const MIGRATION_FILE = 'migration.json'
 
+/** 已从 schema 删除、但仍可能留在 profile 的配置键：启动时幂等清理（schemas 非 strict 会保留未知键）。 */
+export const DEPRECATED_KEYS = Object.freeze([
+  { group: 'wrap', key: 'autoAccept', id: 'config_migrated:wrap.autoAccept' },
+])
+
 export const ENV_KEYS = Object.freeze({
   gateway: 'AI_ROUTER_GATEWAY',
   timeout: 'AI_ROUTER_HUB_TIMEOUT_MS',
@@ -192,6 +197,52 @@ function writeMarker(backend, file, atIso, log) {
 }
 
 /**
+ * 幂等清理 DEPRECATED_KEYS：只在 profile override 里确实还有该键时 edit 一次，其余零写入。
+ *
+ * 为什么必须做：Config schema 的 object 校验非 strict，未知键会被 merge 回运行态配置；
+ * 不清理就会出现“字段已删、面板/回传仍带着它”，旧语义（autoAccept）继续被误读。
+ *
+ * @param {any} ctx cordis ctx（configEditor / fiber.entry）
+ * @param {{ log?: (line: string) => void }} [opts]
+ * @returns {Promise<string[]>} 实际清理的键 id（无清理时为 []）
+ */
+export async function cleanupDeprecatedConfig(ctx, { log = () => {} } = {}) {
+  const cleaned = []
+  const editor = ctx && typeof ctx.get === 'function' ? ctx.get('configEditor') : null
+  const entry = ctx?.fiber?.entry
+  if (!editor || typeof editor.edit !== 'function' || !entry) return cleaned
+  let rows = null
+  try { rows = typeof editor.configuration === 'function' ? editor.configuration() : null } catch { rows = null }
+  const mine = Array.isArray(rows)
+    ? rows.find((row) => row && row.entry && String(row.entry.id) === String(entry.id))
+    : null
+  const override = mine && mine.override && typeof mine.override === 'object' ? mine.override : null
+  const present = DEPRECATED_KEYS.filter((dep) => {
+    const group = override ? override[dep.group] : null
+    return Boolean(group) && typeof group === 'object'
+      && Object.prototype.hasOwnProperty.call(group, dep.key)
+  })
+  if (present.length === 0) return cleaned
+  try {
+    await editor.edit(entry, (current) => {
+      const plain = resolveRefsDeep(current || {})
+      for (const dep of present) {
+        const group = plain[dep.group]
+        if (group && typeof group === 'object') delete group[dep.key]
+      }
+      return plain
+    })
+    for (const dep of present) {
+      cleaned.push(dep.id)
+      log(`[whale-memory] ${dep.id}`)
+    }
+  } catch (err) {
+    log(`[whale-memory] deprecated config cleanup fail-open: ${err?.message || err?.name || 'error'}`)
+  }
+  return cleaned
+}
+
+/**
  * 安装首启迁移。调用即返回；实际执行在 ctx.effect 里异步进行（不阻塞 apply）。
  *
  * @param {any} ctx cordis ctx（configEditor / fiber.entry）
@@ -254,7 +305,8 @@ export function installConfigMigration(ctx, {
   }
 
   const run = () => {
-    if (!ready) ready = execute()
+    // 已删配置键清理先跑：与旧 env 迁移互不依赖，且幂等（无键时零写入）。
+    if (!ready) ready = (async () => { await cleanupDeprecatedConfig(ctx, { log }); await execute() })()
     return ready
   }
 

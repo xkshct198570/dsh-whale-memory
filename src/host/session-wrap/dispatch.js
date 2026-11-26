@@ -1,12 +1,13 @@
 /**
- * Session Wrap 的分流阶段：记忆候选（写库/强制 shadow）、规则提案、待办不落长期记忆。
+ * Session Wrap 的分流阶段：普通记忆（走 ingest 闸）/ 规则提案 / 待办不落长期记忆。
  *
  * 拆分（P2c）：本文件只做“蒸馏条目→落库/提案”，不调模型、不出报告；
  * 失败分“可重试（write_failed:）”与“终态跳过”，续跑按 item.status 幂等。
- * 依赖方向：host → shared + core/wrap-runs；不 import 门面。
+ * 依赖方向：host → shared + core/wrap-runs + 同目录 ingest；不 import 门面。
  */
 import { bool } from '../../shared/config-values.js'
 import { updateRun } from '../../core/wrap-runs.js'
+import { ingestItem, runPatchOf } from './ingest.js'
 
 /** 单条记忆写入的来源标记：候选按 origin=session-wrap 过滤/回查。 */
 export const WRAP_ORIGIN = 'session-wrap'
@@ -19,27 +20,18 @@ export const TYPE_OF_KIND = Object.freeze({
   lesson: 'procedural', decision: 'semantic', preference: 'semantic', fact: 'semantic', rule: 'procedural',
 })
 
-/** 候选状态计数：从 distilled items 现算，重试/续跑不会把计数越加越多。 */
-export function countsOf(items) {
-  const out = { candidates: 0, rule_proposals: 0, open_loops: 0 }
-  for (const item of Array.isArray(items) ? items : []) {
-    const status = String(item?.status || 'pending')
-    if (status === 'written') out.candidates += 1
-    else if (status === 'proposal') out.rule_proposals += 1
-    else if (status === 'open_loop') out.open_loops += 1
-  }
-  return out
-}
-
 /**
  * 执行分流阶段。
  * @param {{
- *   items:any[], distilled:any, spool:any, runId:number, config:any, backend:any, autoAccept:boolean,
+ *   items:any[], distilled:any, spool:any, runId:number, config:any, backend:any, ingest:object,
  *   withDb:Function, createProposal:Function, log?:Function,
  * }} deps
  * @returns {Promise<{items:any[], failures:any[]}>}
  */
-export async function dispatchPhase({ items, distilled, spool, runId, config, backend, autoAccept, withDb, createProposal, log = () => {} }) {
+export async function dispatchPhase({
+  items, distilled, spool, runId, config, backend, ingest,
+  withDb, createProposal, log = () => {},
+}) {
   const writeEnabled = bool(config?.write?.enabled, true)
   const rulesEnabled = bool(config?.rules?.enabled, true)
   const failures = []
@@ -79,41 +71,34 @@ export async function dispatchPhase({ items, distilled, spool, runId, config, ba
     } else if (!writeEnabled) {
       list[i] = { ...item, status: 'skipped:write_disabled' }
     } else {
-      try {
-        const res = await backend.write({
-          text: item.text,
-          level: LEVEL_OF_KIND[item.kind] || 'normal',
-          memory_type: TYPE_OF_KIND[item.kind] || 'semantic',
-          source: 'owner',
-          tags: ['session-wrap', ...(Array.isArray(item.tags) ? item.tags : [])].slice(0, 8),
-          origin: WRAP_ORIGIN,
-          traceId: `wrap:${runId}`,
-          identity: spool.identity,
-          forceShadow: !autoAccept,
-        })
-        if (res?.ok) {
-          list[i] = {
-            ...item,
-            status: 'written',
-            nodeId: res.id ? String(res.id) : '',
-            action: String(res.action || ''),
-            candidate: Boolean(res.candidate),
-          }
-        } else {
-          const code = String(res?.error || 'write_failed')
-          const permanent = ['write_disabled', 'privacy', 'text_too_long', 'invalid_text', 'invalid_level', 'invalid_memory_type', 'invalid_tags'].includes(code)
-          list[i] = permanent
-            ? { ...item, status: `skipped:${code}` }
-            : { ...item, status: `write_failed:${code}` }
-          if (!permanent) failures.push({ index: i, reason: `write_failed:${code}` })
-        }
-      } catch (err) {
-        list[i] = { ...item, status: 'write_failed:exception' }
-        failures.push({ index: i, reason: `write_exception:${String(err?.message || err).slice(0, 120)}` })
+      const written = await ingestItem({
+        backend,
+        item,
+        identity: spool.identity,
+        runId,
+        ingest,
+        origin: WRAP_ORIGIN,
+        // wrap 自产记忆写 source='self'：owner 属保护面，会让后续相似写入永远只能审核（B14）。
+        source: 'self',
+        level: LEVEL_OF_KIND[item.kind] || 'normal',
+        memoryType: TYPE_OF_KIND[item.kind] || 'semantic',
+        tags: ['session-wrap', ...(Array.isArray(item.tags) ? item.tags : [])].slice(0, 8),
+      })
+      list[i] = {
+        ...item,
+        status: written.status,
+        nodeId: written.nodeId || '',
+        action: String(written.action || ''),
+        ...(written.status.startsWith('write_failed:')
+          ? { failure: written.reason || written.status.slice('write_failed:'.length) }
+          : {}),
+      }
+      if (written.status.startsWith('write_failed:')) {
+        const code = written.status.slice('write_failed:'.length)
+        failures.push({ index: i, reason: `write_failed:${code}` })
       }
     }
-    const counts = countsOf(list)
-    withDb((db) => updateRun(db, runId, { distilled_json: { ...distilled, items: list }, ...counts, phase: 'written' }))
+    withDb((db) => updateRun(db, runId, { ...runPatchOf(distilled, list), phase: 'written' }))
   }
   return { items: list, failures }
 }

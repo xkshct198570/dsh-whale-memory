@@ -45,7 +45,7 @@ test('renderWrapReport：六个二级标题固定且顺序一致，元信息含 
   const report = renderWrapReport({
     run: { day: '2026-11-24', trigger: 'manual', runId: 7 },
     summary: '完成收尾',
-    candidates: [{ kind: 'lesson', text: '依赖装法统一用 pnpm' }],
+    items: [{ kind: 'lesson', text: '依赖装法统一用 pnpm', status: 'review' }],
     ruleProposals: ['收尾前必须先备份'],
     openLoops: ['补测孤儿边'],
     hygiene: { checks: [{ key: 'fts_aligned', status: 'ok', detail: 'nodes=1' }] },
@@ -57,7 +57,7 @@ test('renderWrapReport：六个二级标题固定且顺序一致，元信息含 
   const found = [...report.matchAll(/^## .+$/gm)].map((hit) => hit[0])
   assert.deepEqual(found, HEADINGS)
   assert.match(report, /## 结论\n\n完成收尾/)
-  assert.match(report, /## 记忆候选\n\n- \[lesson\] 依赖装法统一用 pnpm/)
+  assert.match(report, /## 记忆候选\n\n待审 1 条（正文仅供人工审核）：\n- \[lesson\] 依赖装法统一用 pnpm/)
   assert.match(report, /## 规则提案\n\n- 收尾前必须先备份/)
   assert.match(report, /## 待办\n\n- 补测孤儿边/)
   assert.match(report, /## 清洁检查\n\n- fts_aligned: ok — nodes=1/)
@@ -68,9 +68,9 @@ test('renderWrapReport：失败状态进行尾（写入失败/未创建），其
   const report = renderWrapReport({
     run: { day: '2026-11-24', trigger: 'manual', runId: 3 },
     summary: '续跑',
-    candidates: [
+    items: [
       { kind: 'fact', text: '端口 3080', status: 'write_failed:EACCES' },
-      { kind: 'fact', text: '库在 whale.db', status: 'ok' },
+      { kind: 'fact', text: '库在 whale.db', status: 'ingested', nodeId: 'n-1' },
       { kind: 'fact', text: '无状态条目' },
     ],
     ruleProposals: [
@@ -81,9 +81,10 @@ test('renderWrapReport：失败状态进行尾（写入失败/未创建），其
     switchReady: { ready: false, blockers: ['fts_aligned 未对齐'] },
     generatedAt: '2026-11-24T17:00:00+08:00',
   })
-  assert.match(report, /- \[fact\] 端口 3080 （写入失败：EACCES）/)
-  assert.match(report, /- \[fact\] 库在 whale\.db\n/)
-  assert.ok(!report.includes('库在 whale.db （'), '非失败 status 不应加后缀')
+  assert.match(report, /写入失败 1 条：EACCES×1/)
+  assert.ok(!report.includes('端口 3080'), '写入失败条不得打印正文')
+  assert.match(report, /入库 1 条（node: n-1）/)
+  assert.ok(!report.includes('库在 whale.db'), '已入库条不得打印正文')
   assert.match(report, /- 规则甲 （未创建：重复）/)
   assert.match(report, /- 规则乙\n/)
   assert.match(report, /- 规则丙 （未创建：proposal_error）/)
@@ -113,7 +114,7 @@ test('renderWrapReport：绝不输出原始对话/素材字段（只认结构化
       turns: [{ role: 'user', text: secret }],
     },
     summary: '完成收尾',
-    candidates: [],
+    items: [],
     generatedAt: '2026-11-24T17:00:00+08:00',
   })
   assert.ok(!report.includes('hunter2'), '报告不得泄露原始对话')
@@ -135,7 +136,7 @@ test('renderWrapReport：run 无 day 时用 generatedAt 推断；数字 runId �
 test('renderWrapReport：dropped 只输出按原因聚合的计数，不输出丢弃正文', () => {
   const report = renderWrapReport({
     summary: '完成',
-    candidates: [{ kind: 'lesson', text: '保留项' }],
+    items: [{ kind: 'lesson', text: '保留项', status: 'review' }],
     dropped: [
       { text: '不该出现的原文甲', reason: 'evidence_not_found' },
       { text: '不该出现的原文乙', reason: 'evidence_not_found' },
@@ -146,15 +147,33 @@ test('renderWrapReport：dropped 只输出按原因聚合的计数，不输出�
   assert.ok(!report.includes('不该出现的原文'))
 })
 
-test('renderWrapReport：字符串条目/对象条目都能渲染，不丢信息', () => {
+test('renderWrapReport：条目必须是结构化对象；对象提案/待办都能渲染，不丢信息', () => {
   const report = renderWrapReport({
-    candidates: ['纯字符串候选'],
+    items: [{ kind: 'fact', text: '对象候选', status: 'review' }],
     ruleProposals: [{ text: '对象提案' }],
     openLoops: [{ text: '对象待办' }],
     switchReady: true,
   })
-  assert.match(report, /- \[fact\] 纯字符串候选/)
+  assert.match(report, /- \[fact\] 对象候选/)
   assert.match(report, /- 对象提案/)
   assert.match(report, /- 对象待办/)
   assert.match(report, /- 可切：是/)
+})
+
+test('renderWrapReport：ingested 只列计数+node id，skipped 只列分类码，均不含正文', () => {
+  const report = renderWrapReport({
+    items: [
+      { kind: 'lesson', text: '已入库的正文甲', status: 'ingested', nodeId: 'n-a' },
+      { kind: 'lesson', text: '已入库的正文乙', status: 'ingested', nodeId: 'n-b' },
+      { kind: 'decision', text: '任务句正文不得出现', status: 'skipped:gate:task' },
+      { kind: 'fact', text: '过期状态正文不得出现', status: 'skipped:gate:stale' },
+      { kind: 'fact', text: '待审正文必须出现', status: 'review' },
+    ],
+  })
+  assert.match(report, /入库 2 条（node: n-a, n-b）/)
+  assert.match(report, /跳过 2 条：gate:task×1 · gate:stale×1/)
+  assert.ok(!report.includes('已入库的正文'))
+  assert.ok(!report.includes('任务句正文'))
+  assert.ok(!report.includes('过期状态正文'))
+  assert.match(report, /待审 1 条（正文仅供人工审核）：\n- \[fact\] 待审正文必须出现/)
 })

@@ -8,7 +8,8 @@ const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
 
 test('manifest：包名/版本/engines/patch 就位', () => {
   assert.equal(pkg.name, 'dsh-whale-memory')
-  assert.match(pkg.version, /^\d+\.\d+\.\d+$/)
+  // 允许 SemVer 预发布后缀：S1 收口按计划打 0.8.0-beta1（不发布、不推市场）。
+  assert.match(pkg.version, /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/)
   assert.match(pkg.engines.dsh, /^>=/)
   assert.equal(pkg.private, undefined)
   assert.ok(existsSync(join(root, pkg.dsh.bundle.patch)))

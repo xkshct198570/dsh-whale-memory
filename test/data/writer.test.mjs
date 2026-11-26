@@ -846,7 +846,8 @@ test('judge=llm：模型缺失/抛错/坏 JSON → 回落规则（结果与 rule
   ]
   for (const [text, opts, expectedError, why] of cases) {
     const base = rulesOf(text)
-    assert.equal(base.action, 'ADD', `${why}：基线必须是规则 ADD`)
+    // 用例正文包含既有旧文（旧文≥8 字）→ §5.3 第 4 条会把基线判成 MERGE；这里只锁“回落与规则一致”。
+    assert.ok(['ADD', 'MERGE', 'SUPERSEDE'].includes(base.action), `${why}：基线动作非法 ${base.action}`)
     const q = judgeQueue(t, db, opts)
     const result = await q.enqueue(event(text))
     assert.equal(result.action, base.action, `${why}：回落规则后动作与 rules 一致`)

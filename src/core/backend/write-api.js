@@ -71,9 +71,11 @@ export const writeApi = {
       // v3：规则置顶随事件下传（writer 落库；默认 0，不改变既有写入口行为）。
       pinned: q?.pinned === 1 || q?.pinned === true ? 1 : 0,
       expired_at: Number.isFinite(Number(q?.expired_at)) ? Number(q.expired_at) : undefined,
-      // 内部写入口专用：单条强制 shadow（session-wrap 候选不受全局 reviewMode=auto 影响）。
+      // 内部写入口专用：单条强制 shadow（旧调用方；session-wrap 现改用 ingestPolicy.mode='review'）。
       // 路由 /write 不透传该字段，外部无法用它做除“更保守”以外的任何事。
       __forceShadow: q?.forceShadow === true,
+      // 内部写入口专用：价值闸/歧义闸策略（session-wrap/tool/reflect 传）。路由 /write 不透传。
+      __ingest: q?.ingestPolicy && typeof q.ingestPolicy === 'object' ? q.ingestPolicy : undefined,
     }
     const res = await this._writer().enqueue(event)
     if (!res || res.ok === false) {

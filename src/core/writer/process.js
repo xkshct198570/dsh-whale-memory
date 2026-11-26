@@ -1,5 +1,6 @@
-// 职责：事件落库（节点插入/配置归一/processEvent 编排）；依赖：../../shared/config-values.js + ../db.js + ../tokenize.js + ../relations.js + ./decide.js + ./audit.js；不 import 门面。
+// 职责：事件落库（节点插入/配置归一/processEvent 编排/__ingest 唯一闸）；依赖：../../shared/config-values.js + ../../shared/ingest-policy.js + ../db.js + ../tokenize.js + ../relations.js + ./decide.js + ./privacy.js + ./audit.js；不 import 门面。
 import { value } from '../../shared/config-values.js'
+import { DURABILITY, classifyDurability, detectAmbiguity } from '../../shared/ingest-policy.js'
 import { now } from '../db.js'
 import { bigrams, contentHash, normalize } from '../tokenize.js'
 import { linkMutex, linkSupersede, normalizeTags } from '../relations.js'
@@ -7,7 +8,11 @@ import {
   TEXT_LIMIT, decideWrite, finite, mapSource, normalizeIdentity, validExpiredAt,
   validLevel, validMemoryType,
 } from './decide.js'
+import { privacyCheck } from './privacy.js'
 import { isActiveHashConflict, recordEvolution, recordWrite, withTx } from './audit.js'
+
+/** minConfidence 缺省（架构书 §5.1）：distill 缺 confidence 时按 0.5 走，低于它转审核。 */
+const DEFAULT_MIN_CONFIDENCE = 0.55
 
 /**
  * 插一个 active 节点（内部用）：字段全填，双时态 valid_at 置为本次决策时间。
@@ -91,6 +96,72 @@ function resolveConfig(config) {
   }
 }
 
+/** REJECT 审计：价值闸/身份闸拒绝一律不落正文（before/after = NULL）。 */
+function rejectDecision(reason) {
+  return { action: 'REJECT', reason, beforeText: null, afterText: null, mode: 'auto' }
+}
+
+/**
+ * 审核候选：保留正文作审核证据，但先过隐私脱敏（直写路径的候选若带凭证，审核页就是泄漏面）。
+ * @param {string} reason 分类码（gate:*）
+ * @param {string} raw 归一前正文
+ * @param {{ redact: boolean }} options
+ * @returns {object} decision
+ */
+function reviewDecision(reason, raw, options) {
+  const privacy = privacyCheck(raw, { redact: options.redact })
+  if (!privacy.ok) return rejectDecision(privacy.reason || 'privacy')
+  const text = normalize(privacy.text)
+  if (!text) return rejectDecision('invalid_text')
+  const why = privacy.reason === 'privacy_redacted' ? `${reason} · privacy:redacted` : reason
+  return { action: 'CANDIDATE', reason: why, beforeText: null, afterText: text, mode: 'auto' }
+}
+
+/**
+ * 调用方 ingestPolicy → 归一参数（唯一入口；未知字段一律回默认，避免外部拼出半套策略）。
+ * @param {object|null|undefined} raw
+ * @returns {{ mode:'auto'|'review', minConfidence:number, dropTaskInstructions:boolean, confidence:number } | null}
+ */
+function normalizeIngestPolicy(raw) {
+  if (!raw || typeof raw !== 'object') return null
+  const clamp = (v, fallback) => Math.max(0, Math.min(1, finite(value(v), fallback)))
+  return {
+    mode: value(raw.mode) === 'review' ? 'review' : 'auto',
+    minConfidence: clamp(raw.minConfidence, DEFAULT_MIN_CONFIDENCE),
+    dropTaskInstructions: value(raw.dropTaskInstructions) !== false,
+    confidence: clamp(raw.confidence, 1),
+  }
+}
+
+/**
+ * `__ingest` 价值闸/歧义闸（架构书 §5.1 顺序）：
+ * 身份 → stale → task → 歧义/主观 → 置信 → durable（放行 auto）。
+ *
+ * @returns {object|null} decision；null 表示放行到 decideWrite（mode=auto + reviewToCandidate）
+ */
+function ingestGate(event, policy, options) {
+  const ident = normalizeIdentity(event?.identity)
+  // 缺身份不落任何分区（含共享 ''）：否则收尾/工具写入会静默洗白成共享事实。
+  if (!ident.userId || !ident.workspace) return rejectDecision('identity_required')
+  const raw = normalize(String(event?.text ?? ''))
+  const kind = classifyDurability(raw)
+  if (kind === DURABILITY.STALE) return rejectDecision('gate:stale')
+  if (kind === DURABILITY.TASK) {
+    return policy.dropTaskInstructions
+      ? rejectDecision('gate:task')
+      : reviewDecision('gate:task_review', raw, options)
+  }
+  if (kind === DURABILITY.UNCERTAIN) {
+    const { reasons } = detectAmbiguity(raw)
+    const code = reasons.includes('subjective')
+      ? (reasons.includes('deictic') ? 'gate:subjective:deictic' : 'gate:subjective')
+      : reasons.includes('deictic') ? 'gate:ambiguous' : 'gate:unclassified'
+    return reviewDecision(code, raw, options)
+  }
+  if (policy.confidence < policy.minConfidence) return reviewDecision('gate:low_confidence', raw, options)
+  return null
+}
+
 /**
  * 处理一个事件：决策 → 落库/落审计 → 返回结果。
  *
@@ -124,11 +195,21 @@ export function processEvent(db, event, config = {}) {
  */
 function processEventInTx(db, event, config = {}) {
   const options = resolveConfig(config)
-  // 调用方（仅 backend.write 的内部参数）可以对**单条**事件强制 shadow：
-  // Session Wrap 要求即使全局 reviewMode=auto，候选也必须先经审核，且不能靠临时改全局配置
-  // （并发写入会一起被降级）。这是保守方向，不构成提权面。
-  if (event?.__forceShadow === true) options.mode = 'shadow'
-  const decision = decideWrite(db, event, options)
+  // 调用方（仅 backend.write 的内部参数）可以对**单条**事件选择写入策略：
+  // - `__forceShadow` 或 `__ingest.mode='review'`：强制 shadow，跳过价值闸（=0.7.3 行为，可回退）；
+  // - `__ingest.mode='auto'`：先过价值闸/歧义闸，放行项强制 auto + reviewToCandidate（不依赖全局 reviewMode）；
+  // 都不是（面板/导入/直接写）→ 沿用全局 reviewMode，行为不变。
+  // 这是保守方向，不构成提权面：/write 路由不透传这些内部字段。
+  const ingest = normalizeIngestPolicy(event?.__ingest)
+  if (event?.__forceShadow === true || ingest?.mode === 'review') options.mode = 'shadow'
+  else if (ingest) options.mode = 'auto'
+  const gated = ingest && ingest.mode === 'auto' && event?.__forceShadow !== true
+    ? ingestGate(event, ingest, options)
+    : null
+  const decision = gated ?? decideWrite(db, event, {
+    ...options,
+    reviewToCandidate: ingest?.mode === 'auto' && event?.__forceShadow !== true,
+  })
   const ts = now()
   const text = normalize(String(decision.afterText ?? event?.text ?? ''))
   const ident = normalizeIdentity(event?.identity)

@@ -190,8 +190,9 @@ test('召回注入开关（P1-1）：injectLevels 按层级过滤，showSources 
 test('节点详情带 1 跳邻居边（同分区可见，跨分区不泄露）', async () => {
   const b = fresh()
   try {
-    const a = await b.write({ text: '邻居边测试 A 节点', identity: ident })
-    const c = await b.write({ text: '邻居边测试 B 节点', identity: ident })
+    // 两条正文必须低相似：S1 判重会把 0.7+ 的无增益近文转审核候选，不再静默新增节点。
+    const a = await b.write({ text: '邻居边测试甲：磁盘挂载点 /data 只读', identity: ident })
+    const c = await b.write({ text: '邻居边测试乙：夏令时切换脚本每周跑', identity: ident })
     // 同分区 + 跨分区各插一条边：getNode 只回两端都可见的那条。
     b.withDb((db) => {
       const now = Date.now() / 1000

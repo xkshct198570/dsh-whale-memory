@@ -42,7 +42,7 @@
 - `wrap_runs` 唯一 `(session_id,material_hash)`；状态机 `queued→running→done|failed|skipped`；`phase` 续跑断点。
 - `wrap` job payload 只含 `{runId,spoolPath,materialHash}`。
 - 报告字段固定：`summary/candidates/ruleProposals/openLoops/hygiene/switchReady`；不存原文。
-- 候选强制 shadow（除非 `wrap.autoAccept=true`）；规则只创建 proposal。
+- 普通记忆走 `ingestPolicy`（0.8.0 起：durable 自动入库，歧义/低置信转候选）；`ingest.mode=review` 回退全部 shadow；规则只创建 proposal。
 
 ## 5. 回滚
 

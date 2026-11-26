@@ -36,7 +36,8 @@ const DEFAULT_CONFIG = {
   reflect: { enabled: false, model: '', idleMinutes: 30, maxItems: 8, maxRunsPerDay: 24 },
   wrap: {
     enabled: true, explicit: true, idle: false, disposed: false, idleMinutes: 10,
-    maxItems: 8, autoAccept: false, spoolTtlHours: 24, retentionDays: 180, maxRunsPerDay: 6,
+    maxItems: 8, spoolTtlHours: 24, retentionDays: 180, maxRunsPerDay: 6,
+    ingest: { mode: 'auto', minConfidence: 0.55, dropTaskInstructions: true },
     report: true, model: '', maxMaterialChars: 12000, timeoutMs: 60000,
   },
   consolidate: { enabled: true, intervalHours: 6 },

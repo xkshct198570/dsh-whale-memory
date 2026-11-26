@@ -13,6 +13,7 @@ import { openDb, closeDb } from '../../src/core/db.js'
 import { installSessionWrap, resolveDataDir } from '../../src/host/session-wrap.js'
 import { getRun, updateRun } from '../../src/core/wrap-runs.js'
 import { bigrams, contentHash } from '../../src/core/tokenize.js'
+import { processEvent } from '../../src/core/writer.js'
 
 function fresh(t, suffix = '') {
   const dir = mkdtempSync(join(tmpdir(), `whale-wrap-${suffix}`))
@@ -26,7 +27,8 @@ function configOf(dir, overrides = {}) {
     dataDir: dir,
     wrap: {
       enabled: true, explicit: true, idle: true, disposed: true, idleMinutes: 10,
-      maxItems: 8, autoAccept: false, spoolTtlHours: 24, maxRunsPerDay: 6,
+      maxItems: 8, spoolTtlHours: 24, maxRunsPerDay: 6,
+      ingest: { mode: 'auto', minConfidence: 0.55, dropTaskInstructions: true },
       report: true, model: '', maxMaterialChars: 12000, timeoutMs: 5000,
     },
     write: { enabled: true, reviewMode: 'auto' },
@@ -37,6 +39,10 @@ function configOf(dir, overrides = {}) {
   }
 }
 
+/**
+ * 假 backend 但真决策：把 q 映射成 writer 事件后跑 processEvent（价值闸/判重/落库全真），
+ * 只把异步入口包一层。这样收尾测试断言的是真实产物（nodes/writes），不是桩返回值。
+ */
 function fakeBackend(t, dir, db) {
   const writes = []
   const backend = {
@@ -44,7 +50,23 @@ function fakeBackend(t, dir, db) {
     withDb: (fn) => fn(db),
     async write(q) {
       writes.push(q)
-      return { ok: true, id: `n${writes.length}`, action: q.forceShadow ? 'CANDIDATE' : 'ADD', candidate: Boolean(q.forceShadow) }
+      const res = processEvent(db, {
+        traceId: q.traceId,
+        source: q.source,
+        identity: q.identity,
+        text: q.text,
+        tags: q.tags,
+        origin: q.origin,
+        level: q.level,
+        memory_type: q.memory_type,
+        expired_at: q.expired_at,
+        __forceShadow: q.forceShadow === true,
+        __ingest: q.ingestPolicy,
+      }, { write: { reviewMode: 'auto' } })
+      return {
+        ok: res.ok, id: res.id, action: res.action, error: res.reason,
+        reason: res.reason, candidate: res.action === 'CANDIDATE', duplicate: Boolean(res.duplicate),
+      }
     },
   }
   return { backend, writes }
@@ -148,30 +170,40 @@ test('onTrigger：run+spool+job 幂等；spool 0600；job payload 只含指针�
   assert.equal(s.keeper.jobs.filter((job) => job.kind === 'wrap').length, 1, '不得重复入队')
 })
 
-test('execute：蒸馏→候选 shadow→报告无原文→清洁→可切会话→删 spool→巩固入队', async (t) => {
+test('execute：蒸馏→durable 直接入库→报告无原文→清洁→可切会话→删 spool→巩固入队', async (t) => {
   const s = setup(t)
   const { out, job } = await queueRun(s, {})
   const result = await s.keeper.handlers.get('wrap')(job.payload, { jobId: job.id, log: () => {}, now: () => Date.now() / 1000 })
   assert.equal(result.runId, out.runId)
-  assert.equal(result.candidates, 1)
+  assert.equal(result.ingested, 1, 'durable 教训默认自动入库')
+  assert.equal(result.candidates, 0, '不再无条件产候选')
   assert.equal(result.openLoops, 1)
   assert.equal(result.switchReady.ready, true, JSON.stringify(result.switchReady))
 
   assert.equal(s.writes.length, 1)
-  assert.equal(s.writes[0].forceShadow, true, '默认候选必须强制 shadow')
+  assert.equal(s.writes[0].forceShadow, undefined, '不再用 forceShadow，改由 ingestPolicy 决定')
+  assert.equal(s.writes[0].ingestPolicy.mode, 'auto')
+  assert.equal(s.writes[0].ingestPolicy.confidence, 0.9, '必须透传蒸馏置信度')
+  assert.equal(s.writes[0].source, 'self', 'wrap 自产记忆不得标 owner（否则保护面锁死后续合并）')
   assert.equal(s.writes[0].origin, 'session-wrap')
   assert.equal(s.writes[0].traceId, `wrap:${out.runId}`)
   assert.deepEqual(s.writes[0].tags.slice(0, 1), ['session-wrap'])
+  const landed = s.withDb((db) => db.prepare("SELECT id,status,source FROM nodes WHERE origin='session-wrap'").get())
+  assert.equal(landed.status, 'active')
+  assert.equal(landed.source, 'self')
 
   const run = s.withDb((db) => getRun(db, out.runId))
   assert.equal(run.state, 'done')
   assert.equal(run.phase, 'done')
-  assert.equal(run.candidates, 1)
+  assert.equal(run.candidates, 0)
+  assert.deepEqual(run.distilled.counts, { ingested: 1, reviewed: 0, skipped: 0 })
   assert.equal(run.open_loops, 1)
   assert.equal(run.switchReady.ready, true)
   assert.ok(run.report_path && existsSync(run.report_path))
   const report = readFileSync(run.report_path, 'utf8')
   assert.match(report, /## 记忆候选/)
+  assert.match(report, /入库 1 条/, '已入库只列计数')
+  assert.equal(report.includes('- [lesson] 动库前必须先备份'), false, '已入库条不得作为正文行出现')
   assert.equal(report.includes('记住了：动库前先备份。'), false, '报告不得包含原始对话')
   assert.equal(report.includes('“'), false)
   assert.equal(statSync(run.report_path).mode & 0o777, 0o600)
@@ -223,7 +255,8 @@ test('断点续跑：已有 distilled_json 时不调模型，只补 pending/fail
     },
   }))
   const result = await s.keeper.handlers.get('wrap')(job.payload, { jobId: job.id, log: () => {}, now: () => Date.now() / 1000 })
-  assert.equal(result.candidates, 2)
+  assert.equal(result.candidates, 1, 'pending 的普通事实转审核候选')
+  assert.equal(result.ingested, 1, '已写过的旧条目按 ingested 计入')
   assert.equal(s.writes.length, 1, '只允许写 pending 的那一条')
   assert.equal(s.writes[0].text, '断点后要补的事实')
 })
@@ -752,10 +785,11 @@ test('S4 归纳：3 同主题候选 → 1 条合并候选 + 2 merged_into；报�
   const run = s.withDb((db) => getRun(db, out.runId))
   assert.equal(run.state, 'done')
   const items = JSON.parse(run.distilled_json).items
-  assert.equal(items.filter((item) => item.status === 'written').length, 1, '只落 1 条候选')
+  assert.equal(items.filter((item) => item.status === 'ingested').length, 1, '合并后只落 1 条记忆')
   assert.equal(items.filter((item) => String(item.status).startsWith('merged_into:')).length, 2)
   assert.equal(writes.length, 1, '合并后只调一次写')
-  assert.equal(run.candidates, 1, '计数按落库条目算')
+  assert.equal(run.candidates, 0, '自动入库后无待审候选')
+  assert.equal(run.distilled.counts.ingested, 1, '计数按落库条目算')
   // 报告：决策计数可读，且不含候选正文。
   const report = s.withDb((db) => db.prepare('SELECT report_path FROM wrap_runs WHERE id=?').get(out.runId))
   const text = readFileSync(String(report.report_path), 'utf8')

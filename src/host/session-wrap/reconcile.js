@@ -11,6 +11,7 @@ import { buildReconcilePrompt, parseReconcileOutput, validateDecisions } from '.
 import { search } from '../../core/search.js'
 import { updateRun } from '../../core/wrap-runs.js'
 import { recordWrite } from '../../core/writer.js'
+import { ingestItem, runPatchOf } from './ingest.js'
 import { collectModelText } from './distill.js'
 import { KINDS_WRITTEN, LEVEL_OF_KIND, TYPE_OF_KIND, WRAP_ORIGIN } from './dispatch.js'
 
@@ -114,13 +115,18 @@ export async function reconcilePhase({ runId, distilled, spool, cfg, withDb, get
 }
 
 /**
- * 把决策落成影子候选/审计（不直接改 active 记忆）。
+ * 把整合决策落成记忆/审核候选（与 dispatch 共用唯一 ingest 闸）。
  *
  * 只处理“会写长期记忆”的 kind；rule/open_loop 仍交给 dispatchPhase（本函数不动它们的状态）。
+ * - ADD/MERGE/SUPERSEDE：走 ingestPolicy（不再按 autoAccept 提权/降级）；
+ * - NOOP：只记审计；ARCHIVE：仍产 CANDIDATE（人工审核后才改状态）。
  *
  * @returns {Promise<{items:Array<object>, failures:Array<object>, applied:Array<object>}>}
  */
-export async function applyReconcile({ items, distilled, spool, runId, decisions, rejected = [], config, backend, autoAccept, withDb, log = () => {} }) {
+export async function applyReconcile({
+  items, distilled, spool, runId, decisions, rejected = [], config, backend, ingest,
+  withDb, log = () => {},
+}) {
   const list = Array.isArray(items) ? items : []
   const failures = []
   const applied = []
@@ -144,47 +150,42 @@ export async function applyReconcile({ items, distilled, spool, runId, decisions
     const tags = Array.isArray(decision.tags) && decision.tags.length > 0
       ? ['session-wrap', 'reconcile', ...decision.tags]
       : ['session-wrap', 'reconcile', ...(Array.isArray(item.tags) ? item.tags : [])]
-    const baseEvent = {
-      level: String(decision.level || LEVEL_OF_KIND[kind] || 'normal'),
-      memory_type: String(decision.memoryType || TYPE_OF_KIND[kind] || 'semantic'),
-      source: 'owner',
-      tags: tags.slice(0, 8),
-      origin: WRAP_ORIGIN,
-      traceId,
-      identity,
-      forceShadow: !autoAccept,
+    const level = String(decision.level || LEVEL_OF_KIND[kind] || 'normal')
+    const memoryType = String(decision.memoryType || TYPE_OF_KIND[kind] || 'semantic')
+    const audit = {
+      level, memory_type: memoryType, tags: tags.slice(0, 8), origin: WRAP_ORIGIN, source: 'self',
     }
     try {
       if (decision.op === 'NOOP') {
         withDb((db) => recordWrite(db, { identity, traceId }, {
           action: 'NOOP', reason: `reconcile_noop:${decision.reason || ''}`.slice(0, 160),
           nodeId: decision.targetId || null, afterText: text, mode: 'shadow',
-          source: 'owner', level: baseEvent.level, memory_type: baseEvent.memory_type, tags: baseEvent.tags, origin: WRAP_ORIGIN,
-          targetId: decision.targetId || null,
+          ...audit, targetId: decision.targetId || null,
         }))
         list[i] = { ...item, status: 'noop', reconcile: { op: 'NOOP', targetId: decision.targetId || '' } }
       } else if (decision.op === 'ARCHIVE') {
         withDb((db) => recordWrite(db, { identity, traceId }, {
           action: 'CANDIDATE', reason: `reconcile_archive:${decision.reason || ''}`.slice(0, 160),
           nodeId: null, afterText: '', mode: 'shadow',
-          source: 'owner', level: baseEvent.level, memory_type: baseEvent.memory_type, tags: baseEvent.tags, origin: WRAP_ORIGIN,
-          shadowOf: 'ARCHIVE', targetId: decision.targetId,
+          ...audit, shadowOf: 'ARCHIVE', targetId: decision.targetId,
         }))
         list[i] = {
-          ...item, status: 'written', nodeId: '', action: 'CANDIDATE', candidate: true,
+          ...item, status: 'review', nodeId: '', action: 'CANDIDATE',
           reconcile: { op: 'ARCHIVE', targetId: decision.targetId },
         }
       } else {
-        const res = await backend.write({ ...baseEvent, text })
-        if (res?.ok) {
-          list[i] = {
-            ...item, status: 'written', nodeId: res.id ? String(res.id) : '',
-            action: String(res.action || ''), candidate: Boolean(res.candidate),
-            reconcile: { op: decision.op, targetId: decision.targetId || '' },
-          }
-        } else {
-          const code = String(res?.error || 'write_failed')
-          list[i] = { ...item, status: `write_failed:${code}`, reconcile: { op: decision.op, targetId: decision.targetId || '' } }
+        const written = await ingestItem({
+          backend, item: { ...item, text }, identity, runId, ingest,
+          origin: WRAP_ORIGIN, source: 'self', level, memoryType, tags: tags.slice(0, 8),
+        })
+        list[i] = {
+          ...item, status: written.status, nodeId: written.nodeId || '',
+          action: String(written.action || ''),
+          reconcile: { op: decision.op, targetId: decision.targetId || '' },
+        }
+        if (written.status.startsWith('write_failed:')) {
+          const code = written.status.slice('write_failed:'.length)
+          list[i].failure = written.reason || code
           failures.push({ index: i, reason: `write_failed:${code}` })
         }
       }
@@ -195,10 +196,10 @@ export async function applyReconcile({ items, distilled, spool, runId, decisions
       }
       applied.push({ index: i, op: decision.op, targetId: decision.targetId || '', mergeItems: decision.mergeItems || [] })
     } catch (err) {
-      list[i] = { ...item, status: 'write_failed:exception' }
+      list[i] = { ...item, status: 'write_failed:exception', failure: String(err?.message || err).slice(0, 120) }
       failures.push({ index: i, reason: `write_exception:${String(err?.message || err).slice(0, 120)}` })
     }
-    withDb((db) => updateRun(db, runId, { distilled_json: { ...distilled, items: list } }))
+    withDb((db) => updateRun(db, runId, runPatchOf(distilled, list)))
   }
   if (failures.length) log(`[whale-memory] wrap run=${runId} reconcile apply failures=${failures.length}`)
   return { items: list, failures, applied, rejected }

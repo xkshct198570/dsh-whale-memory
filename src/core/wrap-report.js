@@ -115,20 +115,63 @@ function statusSuffix(status, prefix, label) {
   return reason ? `（${label}：${reason}）` : `（${label}）`
 }
 
-/** 渲染候选列表：每行 `- [kind] text`；字符串条目按 fact 处理（不要静默丢信息）。 */
-function renderCandidates(candidates) {
-  const list = Array.isArray(candidates) ? candidates : []
-  const lines = []
+/**
+ * 渲染入库/待审/跳过三段（架构书 §6：报告只打印待审正文）。
+ *
+ * - ingested：只列条数与 node id，不打印正文（已入库的正文档在记忆库，报告不复述）；
+ * - review：人工审核必须看正文，逐条列出；
+ * - skipped/write_failed：只列分类码与计数，绝不打印被闸拒绝的正文。
+ *
+ * 兼容旧 run 的 item 状态：`written` + candidate → 待审；`written` 非候选 → 已入库。
+ *
+ * @param {Array<object>} items 只含会写长期记忆的 kind（调用方已过滤）
+ * @param {string} [droppedNote] 蒸馏剔除说明（无正文）
+ */
+function renderIngestSection(items, droppedNote = '') {
+  const list = Array.isArray(items) ? items : []
+  const review = []
+  const ingested = []
+  const skipped = new Map()
+  const failed = new Map()
   for (const item of list) {
-    const text = pickText(item, ['text', 'summary'])
-    if (!text) continue
-    const kind = typeof item === 'object' && item && typeof item.kind === 'string' && item.kind.trim()
-      ? item.kind.trim()
-      : 'fact'
-    const suffix = statusSuffix(item && item.status, 'write_failed:', '写入失败')
-    lines.push(`- [${kind}] ${text}${suffix ? ` ${suffix}` : ''}`)
+    if (!item || typeof item !== 'object') continue
+    const status = typeof item.status === 'string' ? item.status.trim() : ''
+    if (status === 'review' || (status === 'written' && item.candidate === true)) review.push(item)
+    else if (status === 'ingested' || (status === 'written' && item.candidate !== true)) ingested.push(item)
+    else if (status.startsWith('skipped:')) {
+      const code = status.slice('skipped:'.length) || 'skipped'
+      skipped.set(code, (skipped.get(code) || 0) + 1)
+    } else if (status.startsWith('write_failed:')) {
+      const code = status.slice('write_failed:'.length) || 'write_failed'
+      failed.set(code, (failed.get(code) || 0) + 1)
+    }
   }
-  return lines.length ? lines.join('\n') : EMPTY
+  const tally = (map) => [...map].map(([code, n]) => `${code}×${n}`).join(' · ')
+  const lines = []
+  if (ingested.length > 0) {
+    const ids = ingested.map((item) => pickText(item, ['nodeId', 'id'])).filter(Boolean)
+    lines.push(`入库 ${ingested.length} 条（node: ${ids.length ? ids.join(', ') : '-'}）`)
+  }
+  if (review.length > 0) {
+    lines.push(`待审 ${review.length} 条（正文仅供人工审核）：`)
+    for (const item of review) {
+      const text = pickText(item, ['text', 'summary'])
+      if (!text) continue
+      const kind = typeof item.kind === 'string' && item.kind.trim() ? item.kind.trim() : 'fact'
+      lines.push(`- [${kind}] ${text}`)
+    }
+  }
+  if (skipped.size > 0) {
+    const total = [...skipped.values()].reduce((sum, n) => sum + n, 0)
+    lines.push(`跳过 ${total} 条：${tally(skipped)}`)
+  }
+  if (failed.size > 0) {
+    const total = [...failed.values()].reduce((sum, n) => sum + n, 0)
+    lines.push(`写入失败 ${total} 条：${tally(failed)}`)
+  }
+  if (lines.length === 0) lines.push(EMPTY)
+  if (droppedNote) lines.push('', droppedNote)
+  return lines.join('\n')
 }
 
 /**
@@ -213,7 +256,7 @@ function renderSwitchReady(switchReady) {
  * @param {object} input
  * @param {{day?: string, trigger?: string, runId?: string, id?: string}} [input.run] 本次收尾元信息
  * @param {string} [input.summary] 一句话结论
- * @param {Array<{kind?: string, text?: string}>} [input.candidates] 记忆候选
+ * @param {Array<object>} [input.items] 记忆条目（状态 ingested/review/skipped/write_failed；旧 written 兼容）
  * @param {Array<string|{text?: string}>} [input.ruleProposals] 规则提案
  * @param {Array<string|{text?: string}>} [input.openLoops] 待办 / open loops
  * @param {{checks?: Array<{key: string, status: string, detail?: string}>}} [input.hygiene] 清洁检查结果
@@ -223,7 +266,7 @@ function renderSwitchReady(switchReady) {
  * @returns {string} Markdown 报告
  */
 export function renderWrapReport({
-  run, summary, candidates, ruleProposals, openLoops, hygiene, switchReady, generatedAt, dropped, decisions = null,
+  run, summary, items, ruleProposals, openLoops, hygiene, switchReady, generatedAt, dropped, decisions = null,
 } = {}) {
   const runMeta = run && typeof run === 'object' ? run : {}
   const runId = pickId(runMeta, ['runId', 'id']) || '-'
@@ -236,10 +279,7 @@ export function renderWrapReport({
         : '',
   )
   const conclusion = typeof summary === 'string' && summary.trim() ? summary.trim() : NO_SUMMARY
-  const droppedNote = renderDroppedNote(dropped)
-  const candidatesSection = droppedNote
-    ? `${renderCandidates(candidates)}\n\n${droppedNote}`
-    : renderCandidates(candidates)
+  const itemsSection = renderIngestSection(items, renderDroppedNote(dropped))
   const metaLine = `trigger: ${trigger} · runId: ${runId} · 生成时间: ${
     typeof generatedAt === 'string' && generatedAt.trim() ? generatedAt.trim() : '-'
   }`
@@ -254,7 +294,7 @@ export function renderWrapReport({
     '',
     '## 记忆候选',
     '',
-    candidatesSection,
+    itemsSection,
     '',
     ...(decisions ? ['## 整合决策', '', renderDecisions(decisions), ''] : []),
     '## 规则提案',

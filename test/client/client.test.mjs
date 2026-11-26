@@ -279,7 +279,11 @@ test('缺失/null 指标降级为「—」，渲染不出 NaN/undefined', () => 
 
 const CONFIG_SRC = fs.readFileSync(path.join(ROOT, 'src/host/config.js'), 'utf8')
 
-/** 解析 config.js：组 → 字段 → { def 字面量, volatile }，外加顶层 dataDir。 */
+/**
+ * 解析 config.js：组 → 字段 → { def 字面量, volatile }，外加顶层 dataDir。
+ * 嵌套对象（如 `wrap.ingest`）解析为 `{ 子字段: {...} }`：
+ * Config 从 14 组平铺演进为“组 + 一层子对象”后，设置元数据契约必须能表达三层叶子。
+ */
 function configSchema() {
   const out = {}
   const groupRe = /^  (\w+): z\.object\(\{([\s\S]*?)\n  \}\)\.default\(\{\}\),?$/gm
@@ -291,6 +295,17 @@ function configSchema() {
     while ((field = fieldRe.exec(group[2]))) {
       fields[field[1]] = { def: field[2], volatile: Boolean(field[3]) }
     }
+    const nestedRe = /^    (\w+): z\.object\(\{([\s\S]*?)\n    \}\)\.default\(\{\}\),?$/gm
+    let nested
+    while ((nested = nestedRe.exec(group[2]))) {
+      const sub = {}
+      const subRe = /^      (\w+):.*?\.default\((.*?)\)(\.volatile\(\))?(?:,\s*\/\/.*)?,?$/gm
+      let leaf
+      while ((leaf = subRe.exec(nested[2]))) {
+        sub[leaf[1]] = { def: leaf[2], volatile: Boolean(leaf[3]) }
+      }
+      fields[nested[1]] = sub
+    }
     out[group[1]] = fields
   }
   const dataDir = /^  dataDir: .*?\.default\((.*?)\),?$/m.exec(CONFIG_SRC)
@@ -298,6 +313,17 @@ function configSchema() {
   out.dataDir = { def: dataDir[1], volatile: false }
   return out
 }
+
+/** 取三层叶子 schema（组.字段 或 组.子对象.子字段）；不存在返回 undefined。 */
+function leafSchema(schema, key) {
+  let node = schema
+  for (const part of key.split('.')) {
+    if (!node || typeof node !== 'object') return undefined
+    node = node[part]
+  }
+  return node && typeof node === 'object' ? node : undefined
+}
+
 
 function contractBlock(marker) {
   const start = CLIENT.indexOf(`// >>> ${marker}`)
@@ -320,16 +346,16 @@ const EFFECT_EXCEPTIONS = {
   'panel.tab': 'instant', // 保存后 Panel 立即切换页签（onSaved）
 }
 
-test('设置项元数据单处定义：68 字段默认值对齐 config.js', () => {
+test('设置项元数据单处定义：70 叶子默认值对齐 config.js', () => {
   const meta = settingsMeta()
   const schema = configSchema()
-  assert.equal(Object.keys(meta).length, 68, 'SETTINGS_META 字段数必须等于 Config 的 14 组 / 68 字段')
+  // 反向不要求覆盖全部 Config 叶子：rules 组独立成块、S2–S4 未暴露字段（maxQueued/provider/
+  // reconcile.*）按契约不在设置页出现；这里只锁“设置页列出的每个叶子都真实存在”。
   for (const [key, item] of Object.entries(meta)) {
-    const [group, field = null] = key.split('.')
-    const raw = schema[group] ? (field === null ? schema[group].def : schema[group][field] && schema[group][field].def) : null
-    assert.ok(raw !== null && raw !== undefined, `config.js 找不到 ${key}`)
+    const leaf = leafSchema(schema, key)
+    assert.ok(leaf && leaf.def !== undefined, `config.js 找不到 ${key}`)
     assert.ok(Object.prototype.hasOwnProperty.call(item, 'def'), `${key} 缺少默认值`)
-    assert.deepEqual(item.def, eval(`(${raw})`), `${key} 默认值与 config.js 不一致`)
+    assert.deepEqual(item.def, eval(`(${leaf.def})`), `${key} 默认值与 config.js 不一致`)
     assert.ok(['instant', 'reload', 'daily'].includes(item.effect), `${key} effect 非法：${item.effect}`)
     assert.ok(['general', 'local', 'needsConfig'].includes(item.badge), `${key} badge 非法：${item.badge}`)
   }
@@ -339,9 +365,9 @@ test('生效徽标按 config.js 的 .volatile() 快照对齐（含 7 处纠错�
   const meta = settingsMeta()
   const schema = configSchema()
   for (const [key, item] of Object.entries(meta)) {
-    const [group, field] = key.split('.')
-    if (!schema[group] || !schema[group][field]) continue
-    const expected = EFFECT_EXCEPTIONS[key] || (schema[group][field].volatile ? 'instant' : 'reload')
+    const leaf = leafSchema(schema, key)
+    if (!leaf) continue
+    const expected = EFFECT_EXCEPTIONS[key] || (leaf.volatile ? 'instant' : 'reload')
     assert.equal(item.effect, expected, `${key} 生效徽标应为 ${expected}`)
   }
   const corrected = {
@@ -617,7 +643,8 @@ test('R10：设置只提交脏叶子；提案 apply/reject 用同步 ref 闸防�
 test('WP1 首启推荐：只在全默认配置出现，应用只提交差异，同步以 dry-run 起步', () => {
   assert.ok(CLIENT.includes('function configIsDefaults(cfg)'), '缺少首启默认值判定')
   assert.match(CLIENT, /key === 'sync\.bridgeUrl' \|\| key === 'panel\.tab'/, '桥地址/上次页签不应算作用户改动')
-  assert.match(CLIENT, /const current = field === undefined \? cfg\[group\]/, 'dataDir 顶层键必须参与首启判定（否则推荐卡永不出现）')
+  assert.match(CLIENT, /for \(const part of key\.split\('\.'\)\)/, '三层叶子（wrap.ingest.mode）必须逐层下钻')
+  assert.match(CLIENT, /只取两层会恒 undefined/, 'dataDir/三层键都必须参与首启判定（否则推荐卡永不出现）')
   assert.match(CLIENT, /const firstRunSeenRef = useRef\(readFirstRunSeen\(\)\)/, '缺少首启已读标记')
   assert.match(CLIENT, /if \(load\.status !== 'ok' \|\| firstRunSeenRef\.current\) return/, '已处理过仍会弹')
   assert.match(CLIENT, /if \(!configIsDefaults\(serverRef\.current\)\) return/, '已有配置也会弹 / 会覆盖')

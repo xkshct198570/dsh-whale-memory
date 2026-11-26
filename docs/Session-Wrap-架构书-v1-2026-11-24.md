@@ -156,7 +156,7 @@ switch_ready_json, error, created_at, updated_at`；唯一 `(session_id, materia
 | open_loop | 报告 + 面板计数 | 仅报告 |
 | summary | 报告 | 仅报告 |
 
-- `wrap.autoAccept=false` 默认：即使全局 `write.reviewMode=auto`，wrap 候选仍走 `__forceShadow` 候选；只有显式打开 autoAccept 才直接落库。
+- 0.8.0 起：wrap 普通项走 `ingestPolicy`（`wrap.ingest.mode=auto` 默认）——durable 自动入库，歧义/低置信转候选；`mode=review` 回退全部候选。
 - 候选 accept 保留原始 `origin`（不再统一改写 `shadow-review`），受理后可回查来源；旧候选无 origin 仍回落 `shadow-review`。
 - `/writes` 返回条目附扁平 `origin` 供面板过滤；不返回整段 payload。
 
@@ -189,7 +189,7 @@ switch_ready_json, error, created_at, updated_at`；唯一 `(session_id, materia
 | `wrap.disposed` | false | 即时 | 会话关闭收尾（默认关） |
 | `wrap.idleMinutes` | 10 | 重载 | 空闲阈值（5–1440） |
 | `wrap.maxItems` | 8 | 即时 | 单次最多条目 |
-| `wrap.autoAccept` | false | 即时 | 自动接受候选（绕过 shadow，默认关） |
+| `wrap.ingest.mode` | auto | 即时 | auto＝价值闸放行直接入库；review＝全部先审（回退 0.7.3） |
 | `wrap.spoolTtlHours` | 24 | 重载 | spool 保留 |
 | `wrap.retentionDays` | 180 | 重载 | 终态 run/报告保留天数；0=永久；queued/running 不删 |
 | `wrap.maxRunsPerDay` | 6 | 重载 | **只限制 idle/disposed**；显式/手动是人工动作不受限 |

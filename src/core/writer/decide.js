@@ -2,15 +2,19 @@
 // 依赖：../../shared/config-values.js + ../db.js + ../tokenize.js + ./privacy.js；不 import 门面。
 import { value } from '../../shared/config-values.js'
 import { now } from '../db.js'
-import { contentHash, normalize, similarity } from '../tokenize.js'
+import { bagKey, contentHash, normalize, similarity } from '../tokenize.js'
 import { insideSpans, privacyCheck, sentenceHasPortHint, spansOf } from './privacy.js'
 
 /** 冲突/合并候选上限（单身份）。 */
 const CANDIDATE_LIMIT = 300
-/** MERGE 相似度下限。 */
+/** MERGE 相似度下限（信息只增不减的“近文”合并）。 */
 const MERGE_SIM = 0.85
-/** MERGE 信息增益：新文本比旧文本至少多这么多字（或直接包含旧文本）。 */
+/** 近文合并的信息增益：新文本比旧文本至少多这么多字。 */
 const MERGE_GROWTH = 8
+/** 包含合并的旧文最短长度：太短的旧文被新文包住不算“信息增益”（§5.3 第 4 条）。 */
+const MERGE_CONTAIN_MIN = 8
+/** 疑似改写（无增益）的相似度下限：只转审核，不自动合并。 */
+const PARA_SIM = 0.7
 /** 冲突判定（否定/槽位）的最低相似度。 */
 const CONFLICT_SIM = 0.3
 /** 会真正落 nodes 的动作；影子模式下它们统一降级为 CANDIDATE。 */
@@ -246,6 +250,8 @@ export function resolveOptions(opts) {
     dailyCap: Math.max(0, Math.floor(finite(value(o.dailyCap), 200))),
     protect: value(o.protect) !== false,
     redact: value(o.redact) !== false,
+    // auto 模式下 REVIEW 不落 active，转人工审核候选（架构书 B1/§5.1 第 6 条）。
+    reviewToCandidate: value(o.reviewToCandidate) === true,
     // 忽略规则：面板每行一条正则；只做「不进库」判定，不参与合并/去重。
     ignorePatterns: Array.isArray(o.ignorePatterns)
       ? o.ignorePatterns.map((item) => String(item ?? '').trim()).filter(Boolean)
@@ -253,7 +259,12 @@ export function resolveOptions(opts) {
   }
 }
 
-/** 给 decision 补 mode；影子模式把落库动作降级为 CANDIDATE。 */
+/**
+ * 给 decision 补 mode。
+ * - shadow：落库动作统一降级为 CANDIDATE（=0.7.3 行为，候选按原动作审核落库）；
+ * - auto + reviewToCandidate：REVIEW 不落 active，转 CANDIDATE 且 shadowOf='REVIEW'，
+ *   accept 时按 REVIEW 语义建互斥边（否则自动入库会把“同词不同义”静默写成普通新增）。
+ */
 export function settle(decision, opts, { text = '', redacted = false } = {}) {
   const reason = [decision.reason, redacted && decision.action !== 'REJECT' ? 'privacy:redacted' : '']
     .filter(Boolean)
@@ -267,6 +278,16 @@ export function settle(decision, opts, { text = '', redacted = false } = {}) {
       afterText: text,
       mode: 'shadow',
       shadowOf: base.action,
+    }
+  }
+  if (opts.mode === 'auto' && opts.reviewToCandidate === true && base.action === 'REVIEW') {
+    return {
+      ...base,
+      action: 'CANDIDATE',
+      reason: [`review:${base.action}`, reason].filter(Boolean).join(' · '),
+      afterText: text,
+      mode: 'auto',
+      shadowOf: 'REVIEW',
     }
   }
   return base
@@ -419,24 +440,87 @@ function decideByRules(db, event, opts = {}) {
   }
 
   const candidates = findCandidates(db, event)
+  const incomingBag = bagKey(text)
+  const validAt = now()
 
-  // 6. 相似合并：只有"信息只增不减"才合并，否则交给冲突/新增
+  // 6. 同身份判重（§5.3 固定顺序）：
+  //    字符袋相同/语序 → 矛盾 → 包含 MERGE → 近文 REVIEW → 疑似改写 REVIEW。
+  //    一次遍历收集各分支的最佳候选，再按顺序裁决；语义同义自动合并留 0.8.1。
+  let bagSame = null
   let mergeRow = null
   let mergeScore = 0
+  let mergeByContains = false
+  let nearRow = null
+  let nearScore = 0
+  let paraRow = null
+  let paraScore = 0
+  let conflictRow = null
+  let conflictScore = 0
+  let conflictKind = null
   for (const row of candidates) {
     const oldText = String(row.text ?? '')
     if (!oldText) continue
+    // 6.1 字符袋相同但 hash 不同：语序/极性可能反转（相似度可到 1.0），只转审核。
+    if (bagKey(oldText) === incomingBag) { bagSame = row; break }
     const sim = similarity(text, oldText)
-    if (sim < MERGE_SIM) continue
-    const gains = text.includes(oldText) || text.length - oldText.length >= MERGE_GROWTH
-    if (!gains) continue
-    if (sim > mergeScore) { mergeRow = row; mergeScore = sim }
+    // 6.2 矛盾先行：包含/近文都不得覆盖“否定/槽位相反”的事实。
+    if (sim >= CONFLICT_SIM && timeOverlap(row, { valid_at: validAt }) === 'overlap') {
+      const kind = contradiction(row, text)
+      if (kind && sim > conflictScore) { conflictRow = row; conflictScore = sim; conflictKind = kind }
+    }
+    // 6.3 包含：新文完整包含旧文且旧文 ≥8 字 → 信息只增不减，不受 0.85 相似度限制。
+    if (oldText.length >= MERGE_CONTAIN_MIN && text.includes(oldText)) {
+      if (sim > mergeScore) { mergeRow = row; mergeScore = sim; mergeByContains = true }
+      continue
+    }
+    const gains = text.length - oldText.length >= MERGE_GROWTH
+    if (sim >= MERGE_SIM) {
+      // 6.4 近文且有增益（旧口径的相似合并）；无增益转审核，不静默合并。
+      if (gains) {
+        if (sim > mergeScore) { mergeRow = row; mergeScore = sim; mergeByContains = false }
+      } else if (sim > nearScore) { nearRow = row; nearScore = sim }
+      continue
+    }
+    // 6.5 疑似改写且无增益：只转审核（语义同义判重不在本轮承诺）。
+    if (sim >= PARA_SIM && !gains && sim > paraScore) { paraRow = row; paraScore = sim }
   }
+
+  // 顺序 1：同字符袋 → REVIEW（语序/极性歧义；绝不 NOOP、绝不 MERGE）。
+  if (bagSame) {
+    const targetId = String(bagSame.id)
+    return settle({
+      action: 'REVIEW',
+      reason: 'word_order_ambiguous',
+      targetId,
+      beforeText: String(bagSame.text ?? ''),
+      afterText: text,
+    }, options, { text, redacted })
+  }
+
+  // 顺序 2：矛盾（否定/槽位）——计划句延后、保护面转审核、否则取代。
+  if (conflictRow) {
+    const targetId = String(conflictRow.id)
+    const beforeText = String(conflictRow.text ?? '')
+    // 计划/承诺还没落地，不得取代已落地事实
+    if (PLAN_WORDS.test(text)) {
+      return settle({ action: 'ADD', reason: 'plan_deferred', targetId, beforeText, afterText: text }, options, { text, redacted })
+    }
+    if (isProtectedTarget(conflictRow, options)) {
+      return settle({ action: 'REVIEW', reason: 'protected', targetId, beforeText, afterText: text }, options, { text, redacted })
+    }
+    return settle({
+      action: 'SUPERSEDE',
+      reason: `supersede:${conflictKind}`,
+      targetId,
+      beforeText,
+      afterText: text,
+    }, options, { text, redacted })
+  }
+
+  // 顺序 3：包含/近文合并——保护面不得被自动改写，改走 REVIEW。
   if (mergeRow) {
     const targetId = String(mergeRow.id)
     const beforeText = String(mergeRow.text ?? '')
-    // 保护面同样适用于合并：owner/core/procedural 的正文不得被自动改写，
-    // 改走 REVIEW（新节点 + mutex），旧节点正文保持一行不动。
     if (isProtectedTarget(mergeRow, options)) {
       return settle({
         action: 'REVIEW',
@@ -448,41 +532,29 @@ function decideByRules(db, event, opts = {}) {
     }
     return settle({
       action: 'MERGE',
-      reason: 'merge_similar',
+      reason: mergeByContains ? 'merge_contains' : 'merge_similar',
       targetId,
       beforeText,
       afterText: text,
     }, options, { text, redacted })
   }
 
-  // 7. 冲突：同身份 active 候选里找"否定/槽位"冲突且时间重叠的最近一条
-  const validAt = now()
-  let conflictRow = null
-  let conflictScore = 0
-  let conflictKind = null
-  for (const row of candidates) {
-    const kind = contradiction(row, text)
-    if (!kind) continue
-    if (timeOverlap(row, { valid_at: validAt }) !== 'overlap') continue
-    const sim = similarity(text, String(row.text ?? ''))
-    if (sim > conflictScore) { conflictRow = row; conflictScore = sim; conflictKind = kind }
-  }
-  if (conflictRow) {
-    const targetId = String(conflictRow.id)
-    const beforeText = String(conflictRow.text ?? '')
-    // 计划/承诺还没落地，不得取代已落地事实
-    if (PLAN_WORDS.test(text)) {
-      return settle({ action: 'ADD', reason: 'plan_deferred', targetId, beforeText, afterText: text }, options, { text, redacted })
-    }
-    const protectedTarget = isProtectedTarget(conflictRow, options)
-    if (protectedTarget) {
-      return settle({ action: 'REVIEW', reason: 'protected', targetId, beforeText, afterText: text }, options, { text, redacted })
-    }
+  // 顺序 4：近文无增益 → 审核；疑似改写无增益 → 审核（都不落 active）。
+  if (nearRow) {
     return settle({
-      action: 'SUPERSEDE',
-      reason: `supersede:${conflictKind}`,
-      targetId,
-      beforeText,
+      action: 'REVIEW',
+      reason: 'near_duplicate',
+      targetId: String(nearRow.id),
+      beforeText: String(nearRow.text ?? ''),
+      afterText: text,
+    }, options, { text, redacted })
+  }
+  if (paraRow) {
+    return settle({
+      action: 'REVIEW',
+      reason: 'possible_paraphrase',
+      targetId: String(paraRow.id),
+      beforeText: String(paraRow.text ?? ''),
       afterText: text,
     }, options, { text, redacted })
   }

@@ -66,7 +66,14 @@ export const Config = z.object({
     disposed: z.boolean().default(false).volatile(),
     idleMinutes: z.natural().min(5).max(1440).default(10),
     maxItems: z.natural().min(1).max(32).default(8).volatile(),
-    autoAccept: z.boolean().default(false).volatile(),
+    // 普通记忆自动入库（S1）：auto=价值闸放行的 durable 直接落 active；review=全部影子候选（0.7.3 回退）。
+    // minConfidence：distill 未给 confidence 时按 0.5 计，低于阈值转审核；dropTaskInstructions=false 时
+    // 任务句转审核而不是直接拒绝（仍不入库）。
+    ingest: z.object({
+      mode: z.union(['auto', 'review']).default('auto').volatile(),
+      minConfidence: z.number().min(0).max(1).default(0.55).volatile(),
+      dropTaskInstructions: z.boolean().default(true).volatile(),
+    }).default({}),
     spoolTtlHours: z.natural().min(1).max(720).default(24),
     // 终态 run/报告的保留天数；0=永久。queued/running 永不删。
     retentionDays: z.natural().min(0).max(3650).default(180),

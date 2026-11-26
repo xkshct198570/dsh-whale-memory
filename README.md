@@ -77,7 +77,9 @@ Session wrap group:
 | `wrap.disposed` | `false` | Enqueue when a session is closed/archived (opt-in) |
 | `wrap.idleMinutes` | `10` | Idle threshold |
 | `wrap.maxItems` | `8` | Maximum candidates/proposals per run |
-| `wrap.autoAccept` | `false` | Bypass shadow review (not recommended) |
+| `wrap.ingest.mode` | `auto` | `auto`: durable rules pass the value gate and land directly; `review`: everything stays a review candidate (0.7.3 rollback) |
+| `wrap.ingest.minConfidence` | `0.55` | Items without confidence count as 0.5; below this goes to review |
+| `wrap.ingest.dropTaskInstructions` | `true` | Task instructions are rejected (never stored); `false` keeps them as review candidates |
 | `wrap.maxRunsPerDay` | `6` | Automatic triggers per day; explicit/manual are not capped |
 | `wrap.retentionDays` | `180` | Delete finished runs and unreferenced reports older than this; `0` keeps forever |
 | `wrap.report` | `true` | Write a Markdown report without raw conversation |

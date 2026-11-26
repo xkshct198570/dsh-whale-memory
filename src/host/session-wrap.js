@@ -28,7 +28,8 @@ import {
   spoolStats, spoolPathOf, sweepSpool as sweepSpoolFiles, resolveDataDir,
 } from './session-wrap/spool-run.js'
 import { distillPhase } from './session-wrap/distill.js'
-import { countsOf, dispatchPhase } from './session-wrap/dispatch.js'
+import { dispatchPhase } from './session-wrap/dispatch.js'
+import { INGEST_DEFAULTS, actionsOf, countsOf, runPatchOf } from './session-wrap/ingest.js'
 import { buildWrapStatus } from './session-wrap/status.js'
 import { applyReconcile, reconcilePhase } from './session-wrap/reconcile.js'
 import { reportPhase, reportRead, sweepStorage as sweepStorageFiles } from './session-wrap/report.js'
@@ -69,7 +70,12 @@ export function installSessionWrap(ctx, {
       disposed: bool(w.disposed, true),
       idleMinutes: num(w.idleMinutes, 10),
       maxItems: num(w.maxItems, 8),
-      autoAccept: bool(w.autoAccept, false),
+      // 普通记忆自动入库（S1）：mode auto|review；review＝0.7.3 回退（全部影子候选）。
+      ingest: {
+        mode: value(w.ingest?.mode) === 'review' ? 'review' : INGEST_DEFAULTS.mode,
+        minConfidence: num(w.ingest?.minConfidence, INGEST_DEFAULTS.minConfidence),
+        dropTaskInstructions: bool(w.ingest?.dropTaskInstructions, INGEST_DEFAULTS.dropTaskInstructions),
+      },
       spoolTtlHours: num(w.spoolTtlHours, 24),
       retentionDays: num(w.retentionDays, 180),
       maxRunsPerDay: num(w.maxRunsPerDay, 6),
@@ -222,7 +228,7 @@ export function installSessionWrap(ctx, {
         const applied = await applyReconcile({
           items, distilled, spool, runId, decisions,
           rejected: reconcileInfo.rejected, config, backend,
-          autoAccept: cfg.autoAccept, withDb, log,
+          ingest: cfg.ingest, withDb, log,
         })
         items = applied.items
         failures.push(...applied.failures)
@@ -232,7 +238,7 @@ export function installSessionWrap(ctx, {
     // 3) 分流：规则提案 / 待办 / 未整合条目（applyReconcile 只处理写记忆的 kind）
     const dispatched = await dispatchPhase({
       items, distilled, spool, runId, config, backend,
-      autoAccept: cfg.autoAccept, withDb, createProposal, log,
+      ingest: cfg.ingest, withDb, createProposal, log,
     })
     items = dispatched.items
     failures.push(...dispatched.failures)
@@ -244,9 +250,9 @@ export function installSessionWrap(ctx, {
     })
     const counts = countsOf(items)
     const common = {
-      phase: 'reported', summary: distilled.summary || '', distilled_json: { ...distilled, items },
+      phase: 'reported', summary: distilled.summary || '', ...runPatchOf(distilled, items),
       report_path: reportOut.reportWritten ? reportOut.reportPath : '',
-      hygiene_json: reportOut.hygiene, switch_ready_json: reportOut.switchReady, ...counts,
+      hygiene_json: reportOut.hygiene, switch_ready_json: reportOut.switchReady,
     }
     if (failures.length > 0) {
       const error = `candidate_write_failed:${failures.length}`
@@ -273,10 +279,12 @@ export function installSessionWrap(ctx, {
     } catch (err) {
       log(`[whale-memory] wrap consolidate enqueue fail-open: ${err?.message || err}`)
     }
-    log(`[whale-memory] wrap done run=${runId} candidates=${counts.candidates} proposals=${counts.rule_proposals} open=${counts.open_loops} switchReady=${reportOut.switchReady.ready}`)
+    const acts = actionsOf(items)
+    log(`[whale-memory] wrap run=${runId} ingest added=${acts.added} merged=${acts.merged} superseded=${acts.superseded} noop=${acts.noop} review=${counts.reviewed} rejected=${acts.rejected} skipped=${counts.skipped} proposals=${counts.rule_proposals} open=${counts.open_loops} switchReady=${reportOut.switchReady.ready}`)
     return {
-      runId, candidates: counts.candidates, ruleProposals: counts.rule_proposals,
-      openLoops: counts.open_loops, report: reportOut.reportWritten ? reportOut.reportPath : '',
+      runId, candidates: counts.candidates, ingested: counts.ingested, skipped: counts.skipped,
+      ruleProposals: counts.rule_proposals, openLoops: counts.open_loops,
+      report: reportOut.reportWritten ? reportOut.reportPath : '',
       switchReady: reportOut.switchReady,
     }
   }

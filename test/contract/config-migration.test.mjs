@@ -10,7 +10,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { getMeta } from '../../src/core/db.js'
-import { installConfigMigration, migrationFilePath, readLegacyEnv } from '../../src/host/config-migration.js'
+import {
+  cleanupDeprecatedConfig, installConfigMigration, migrationFilePath, readLegacyEnv,
+} from '../../src/host/config-migration.js'
 import { Config } from '../../src/host/config.js'
 
 const LEGACY_ENV = {
@@ -36,6 +38,9 @@ function fakeEditor(initial) {
     get(name) {
       if (name !== 'configEditor') return undefined
       return {
+        configuration() {
+          return [{ entry: ctx.fiber.entry, inherited: {}, override: structuredClone(state.current) }]
+        },
         async edit(entry, fn) {
           state.calls += 1
           state.entry = entry
@@ -175,4 +180,26 @@ test('非法/越界 env：数值夹到 schema 范围，布尔只认明确值，�
   assert.equal(partial.patch.backend.timeoutMs, 30000)
   assert.equal(partial.patch.panel.allowRemote, false)
   assert.equal(partial.patch.identity, undefined)
+})
+
+test('已删配置键幂等清理：wrap.autoAccept 存在时 edit 一次并记 config_migrated；第二次零写入', async () => {
+  const { ctx, state } = fakeEditor({ wrap: { enabled: true, autoAccept: true, idle: true } })
+  const logs = []
+  const cleaned = await cleanupDeprecatedConfig(ctx, { log: (line) => logs.push(line) })
+  assert.deepEqual(cleaned, ['config_migrated:wrap.autoAccept'])
+  assert.equal(state.calls, 1)
+  assert.equal('autoAccept' in state.current.wrap, false, '旧键必须从持久化配置删除')
+  assert.equal(state.current.wrap.idle, true, '其余叶子原样保留')
+  assert.ok(logs.includes('[whale-memory] config_migrated:wrap.autoAccept'))
+
+  const again = await cleanupDeprecatedConfig(ctx, { log: () => {} })
+  assert.deepEqual(again, [])
+  assert.equal(state.calls, 1, '幂等：第二次不得再写配置')
+})
+
+test('已删配置键清理：配置里没有旧键时零写入（不无脑 edit）', async () => {
+  const { ctx, state } = fakeEditor({ wrap: { enabled: true, ingest: { mode: 'auto' } } })
+  const cleaned = await cleanupDeprecatedConfig(ctx, { log: () => {} })
+  assert.deepEqual(cleaned, [])
+  assert.equal(state.calls, 0)
 })

@@ -87,6 +87,20 @@ function bag(text) {
 }
 
 /**
+ * 字符袋指纹：与 `similarity` 使用同一 bag 口径，排序后拼接。
+ *
+ * 判重口径需要区分“同 hash（真同文）”与“字符袋相同但语序/极性不同”（如
+ * `pnpm 而不是 npm` ↔ `npm 而不是 pnpm`，相似度 1.0 但语义相反）。只比较排序后的
+ * 集合字符串，不引入新切词口径。
+ *
+ * @param {unknown} text
+ * @returns {string} 稳定指纹；空文本返回 ''
+ */
+export function bagKey(text) {
+  return [...bag(text)].sort().join('\u0001')
+}
+
+/**
  * bigram Jaccard 相似度（0..1）；两边全空视为 0（无证据），完全相同文本为 1。
  * @param {unknown} a @param {unknown} b
  * @returns {number}

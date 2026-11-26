@@ -33,6 +33,22 @@ export function projectRetrying(latest, job = null) {
 }
 
 /**
+ * 最新 run 的写入计数：新 run 读 distilled_json.counts；旧 run 无该字段时按列回退
+ * （reviewed=candidates，ingested/skipped=0），面板不因旧行缺字段而报错。
+ * @param {object|null} latest decodeRun 结果
+ * @returns {{ ingested:number, reviewed:number, skipped:number }}
+ */
+export function countsOfRun(latest) {
+  const raw = latest && latest.distilled && typeof latest.distilled === 'object'
+    ? latest.distilled.counts : null
+  if (raw && typeof raw === 'object') {
+    const n = (v) => (Number.isFinite(Number(v)) ? Math.max(0, Number(v)) : 0)
+    return { ingested: n(raw.ingested), reviewed: n(raw.reviewed), skipped: n(raw.skipped) }
+  }
+  return { ingested: 0, reviewed: Number(latest && latest.candidates || 0), skipped: 0 }
+}
+
+/**
  * 状态响应（总纲 §5.3 字段形状）。
  *
  * @param {{
@@ -69,6 +85,7 @@ export function buildWrapStatus({
       createdAt: Number(latest.created_at || 0),
       updatedAt: Number(latest.updated_at || 0),
       candidates: Number(latest.candidates || 0),
+      counts: countsOfRun(latest),
       ruleProposals: Number(latest.rule_proposals || 0),
       openLoops: Number(latest.open_loops || 0),
       switchReady: latest.switchReady || null,
