@@ -543,3 +543,31 @@ test('执行闸兜底：子代理 exec（origin 或 delegationDepth）调任何�
   await rejectsWith(run(defs, 'memory_search', { query: '门禁' }, byOrigin), TOOL_ERROR.SUBAGENT_FORBIDDEN)
   assert.deepEqual(calls, [], '执行闸必须前置，后端零调用')
 })
+
+test('开关执行期兜底：tools.enabled=false 时任何工具调用 → TOOLS_DISABLED（不靠目录准入）', async (t) => {
+  const backend = freshBackend(t)
+  const config = { tools: { enabled: { get: () => false } } }
+  const host = fakeHost({ config })
+  const { definitions } = host.install({ backend, config })
+  await host.preStep(agentOf(), 1)
+  for (const name of ['memory_search', 'memory_remember', 'memory_read']) {
+    const args = name === 'memory_remember' ? { text: '开关关闭时必须拒绝写入' }
+      : name === 'memory_read' ? { id: 'n1' } : { query: '门禁' }
+    await rejectsWith(run(definitions, name, args), TOOL_ERROR.TOOLS_DISABLED)
+  }
+  // 关闭后后端零调用：拒绝发生在读/写之前。
+  const calls = []
+  const defs = createMemoryToolDefinitions({
+    backend: {
+      mode: 'local',
+      write: async () => { calls.push('write'); return { ok: true } },
+      search: async () => { calls.push('search'); return { hits: [] } },
+      getNode: async () => { calls.push('getNode'); return { ok: false, error: 'node_not_found' } },
+      updateNode: async () => { calls.push('updateNode'); return { ok: true } },
+    },
+    config, getIdentityCfg: () => ({ mode: 'auto' }), getIdentityHint: () => null, getHostUserId: () => 'u1',
+    limiter: createWriteRateLimiter({ ctx: { on: () => () => {} } }),
+  })
+  await rejectsWith(run(defs, 'memory_search', { query: '门禁' }), TOOL_ERROR.TOOLS_DISABLED)
+  assert.deepEqual(calls, [])
+})

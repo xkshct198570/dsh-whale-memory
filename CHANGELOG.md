@@ -9,7 +9,7 @@
 - **计数与报告**：run 落 `distilled_json.counts={ingested,reviewed,skipped}`，`/wrap/status.latest.counts` 同源；面板收尾卡显示入库/待审/跳过三计数；报告只打印待审正文，已入库只列 node id，跳过只列分类码。
 - **迁移**：`scripts/migrate-wrap-candidates.mjs`（随包发布）默认 dry-run；`--apply` 自动备份后重放旧候选，原行改 `MIGRATED`，历史 `auto_ingested:%` REJECT 归一；靠 `trace_id=migrate:*` 排除自身产物，两遍幂等。
 - **模型记忆工具面（S2）**：新增 `memory_remember / memory_search / memory_read / memory_update / memory_forget`（`src/host/tools.js` + `tool-output.js` / `tool-errors.js` / `tool-rate-limit.js`）。身份固定当前会话，缺会话 cwd 一律 `IDENTITY_REQUIRED`；跨分区 id 按不存在（`NODE_NOT_FOUND`）；remember 走与收尾同一 `ingestPolicy`（含 `wrap.ingest.mode=review` 回退），任务/一次性句抛 `NOT_MEMORY`，歧义/保护面转 CANDIDATE；update 有 CAS（`NODE_CHANGED`）、保护面/重复正文分别拒；forget 只归档不物理删。
-- **限次与开关（S2）**：每回合 `remember/update/forget` 写尝试上限 `tools.maxWritesPerTurn`（默认 5，第 6 次 `RATE_LIMITED`，turn 变化清零）；`tools.enabled=false` 或子代理会话时五工具不进 step 工具集；设置页新增「模型工具」组（三语）。
+- **限次与开关（S2）**：每回合 `remember/update/forget` 写尝试上限 `tools.maxWritesPerTurn`（默认 5，第 6 次 `RATE_LIMITED`，turn 变化清零）；`tools.enabled=false` 或子代理会话时调用被拒（`TOOLS_DISABLED`/`SUBAGENT_FORBIDDEN`，live rc.5 准入不调用 `when`，执行期闸为真关闭）；设置页新增「模型工具」组（三语）。
 - **审计与重构（S2）**：`updateNode` 审计行补 `writes.payload.origin`（面板/同步/工具三口径）并复用 `isProtectedTarget`（删除抄写）；`writePayload` 抽成唯一构造；tags 归一/解析移到 `src/shared/tags.js`（关系层再导出）；`write()` 透传 reason。
 - 测试：全量 **1154（1153 pass / 1 skip / 0 fail）**；新增写入闸 §7.1 十二条 + §7.2 判重、dispatch/reconcile 集成、迁移幂等、配置清理用例、工具面 18 例、真注册表 1 例、审计来源 3 例。
 

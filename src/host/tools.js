@@ -51,6 +51,9 @@ function makeContext(deps) {
     // 执行期兜底（2026-11-27 live 实测：子代理的工具集仍含 memory_* 且可执行，
     // 说明 step 准入的 when 在真实宿主里不够；这里对同一判据再拦一次，绝不静默放行）。
     if (isDelegatedHeader(header)) throw toolError(TOOL_ERROR.SUBAGENT_FORBIDDEN)
+    // 开关的执行期兜底（2026-11-27 live 实测：rc.5 的 step 准入不调用本注册的 when，
+    // 关掉开关后工具仍被列出/可调；这里保证“关闭”一定是真关闭，而不是目录级假开关）。
+    if (value(config?.tools?.enabled) === false) throw toolError(TOOL_ERROR.TOOLS_DISABLED)
     const sessionWorkspace = header ? deriveWorkspace(header) : ''
     if (!header || !sessionWorkspace) throw toolError(TOOL_ERROR.IDENTITY_REQUIRED)
     const resolved = resolveIdentity(getIdentityCfg(), getIdentityHint(), getHostUserId(), sessionWorkspace)
@@ -324,16 +327,11 @@ export function installMemoryTools({ ctx, backend, config, getIdentityCfg, getId
   const definitions = createMemoryToolDefinitions({
     backend, config, getIdentityCfg, getIdentityHint, getHostUserId, limiter, log,
   })
-  const traced = new Set()
+  // `when` 是宿主支持准入时的一层目录级收紧（隔离注册表实测有效）；rc.5 live 不调用它，
+  // 真正的边界由执行期闸保证（见 identityOf），所以这里不再保留诊断日志。
   const when = (context) => {
-    const header = context?.agent?.session?.header
-    const sessionId = String(context?.agent?.session?.id || '')
-    if (sessionId && !traced.has(sessionId)) {
-      traced.add(sessionId)
-      log(`[whale-memory] tools.when session=${sessionId} origin=${header?.origin ?? '-'} depth=${header?.delegationDepth ?? '-'} parent=${header?.parentSession ? 'y' : 'n'} enabled=${String(value(config?.tools?.enabled))}`)
-    }
     if (value(config?.tools?.enabled) === false) return false
-    return !isDelegatedHeader(header)
+    return !isDelegatedHeader(context?.agent?.session?.header)
   }
   const offs = []
   try {

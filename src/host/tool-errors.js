@@ -24,6 +24,7 @@ export const TOOL_ERROR = Object.freeze({
   WRITE_FAILED: 'WRITE_FAILED',
   BACKEND_FAILED: 'BACKEND_FAILED',
   SUBAGENT_FORBIDDEN: 'SUBAGENT_FORBIDDEN',
+  TOOLS_DISABLED: 'TOOLS_DISABLED',
 })
 
 /** 稳定码 → 模型可读文案（不含任何记忆正文）。 */
@@ -41,6 +42,7 @@ const MESSAGES = Object.freeze({
   [TOOL_ERROR.WRITE_FAILED]: '记忆写入失败。',
   [TOOL_ERROR.BACKEND_FAILED]: '记忆后端调用失败（读/写不可用）。',
   [TOOL_ERROR.SUBAGENT_FORBIDDEN]: '子代理会话不能使用记忆工具；请回到主会话操作记忆。',
+  [TOOL_ERROR.TOOLS_DISABLED]: '模型记忆工具已关闭（tools.enabled=false）；面板写入与收尾入库不受影响。',
 })
 
 /**

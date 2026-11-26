@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-11-26T19:30:16.130Z",
+  "generatedAt": "2026-11-26T20:13:46.252Z",
   "thresholds": {
     "plan": 800,
     "freeze": 1200,
@@ -118,10 +118,10 @@
     "src/host/session-wrap/report.js": 162,
     "src/host/session-wrap/spool-run.js": 284,
     "src/host/session-wrap/status.js": 71,
-    "src/host/tool-errors.js": 36,
+    "src/host/tool-errors.js": 38,
     "src/host/tool-output.js": 148,
     "src/host/tool-rate-limit.js": 51,
-    "src/host/tools.js": 285,
+    "src/host/tools.js": 279,
     "src/shared/config-values.js": 41,
     "src/shared/day-stamp.js": 6,
     "src/shared/error-table.mjs": 208,
@@ -186,7 +186,7 @@
     "test/hook/search-feed.test.mjs": 84,
     "test/hook/session-capture.test.mjs": 273,
     "test/hook/session-wrap.test.mjs": 697,
-    "test/hook/tools.test.mjs": 463,
+    "test/hook/tools.test.mjs": 489,
     "test/hook/wrap-ingest.test.mjs": 185,
     "test/integration/plugin-load.test.mjs": 71,
     "test/integration/session-wrap-host.test.mjs": 105,
