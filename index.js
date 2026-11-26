@@ -7,6 +7,7 @@
  */
 import { createRoutes, PREFIX } from './src/host/routes.js'
 import { installHook } from './src/host/hook.js'
+import { installProfileContext } from './src/host/profile-context.js'
 import { createBackend } from './src/core/backend.js'
 import { Config } from './src/host/config.js'
 import { installSearchFeed } from './src/host/search-feed.js'
@@ -401,6 +402,12 @@ export function apply(ctx, config) {
     hook = installHook(ctx, { backend: backendProxy, config, getIdentityCfg, getIdentityHint, getHostUserId, identityState, log })
     return () => hook?.dispose()
   }, 'whale-memory: recall hook')
+
+  // 首轮画像（S3）：每会话一次、装配零 IO；与召回各用各的 context 名（129 < 130）。
+  ctx.effect(() => {
+    const profile = installProfileContext({ ctx, backend: backendProxy, getIdentityCfg, getIdentityHint, getHostUserId, log })
+    return () => profile.dispose()
+  }, 'whale-memory: profile context')
 
   // 规则文件启动自愈（R7/R8）：规则真源在文件仓，DB 镜像/AGENTS 摘要只是投影。
   // init 只建定时器；恢复/播种/镜像/摘要全部放到后台执行（不阻塞 DSH 启动）。

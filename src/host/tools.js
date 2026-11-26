@@ -4,7 +4,7 @@
 // 不 import 路由/DB/规则仓，不复制价值闸判据（由 backend.write 的 __ingest 统一应用）。
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { deriveWorkspace, resolveIdentity } from './identity.js'
+import { isDelegatedHeader, sessionIdentityOf } from './identity.js'
 import { value } from '../shared/config-values.js'
 import { ingestPolicyOf } from '../shared/ingest-policy.js'
 import { normalizeTags } from '../shared/tags.js'
@@ -14,11 +14,6 @@ import { TOOL_ERROR, toolError } from './tool-errors.js'
 import {
   LEVELS, MEMORY_TYPES, TAGS_LIMIT, TOOL_OUTPUT, num, projectNode, round4,
 } from './tool-output.js'
-
-/** 子代理会话判据（origin 或持久化的 delegationDepth；两条都认，避免 header 变体漏判）。 */
-function isDelegatedHeader(header) {
-  return header?.origin === 'subagent' || Number(header?.delegationDepth) > 0
-}
 
 /** 写类工具（受每回合限次）；读工具不限次。 */
 export const WRITE_TOOL_NAMES = Object.freeze(['memory_remember', 'memory_update', 'memory_forget'])
@@ -54,13 +49,10 @@ function makeContext(deps) {
     // 开关的执行期兜底（2026-11-27 live 实测：rc.5 的 step 准入不调用本注册的 when，
     // 关掉开关后工具仍被列出/可调；这里保证“关闭”一定是真关闭，而不是目录级假开关）。
     if (value(config?.tools?.enabled) === false) throw toolError(TOOL_ERROR.TOOLS_DISABLED)
-    const sessionWorkspace = header ? deriveWorkspace(header) : ''
-    if (!header || !sessionWorkspace) throw toolError(TOOL_ERROR.IDENTITY_REQUIRED)
-    const resolved = resolveIdentity(getIdentityCfg(), getIdentityHint(), getHostUserId(), sessionWorkspace)
-    if (!resolved?.ok || !resolved.identity.userId || !resolved.identity.workspace) {
-      throw toolError(TOOL_ERROR.IDENTITY_REQUIRED)
-    }
-    return resolved.identity
+    // 会话身份判据与首轮画像共用 identity.sessionIdentityOf（同一判据一处实现）。
+    const got = sessionIdentityOf({ header, getIdentityCfg, getIdentityHint, getHostUserId })
+    if (!got.ok) throw toolError(TOOL_ERROR.IDENTITY_REQUIRED)
+    return got.identity
   }
 
   /** 写工具入口：先过限次再进写路径；超限抛 RATE_LIMITED（文案带本次计数）。 */

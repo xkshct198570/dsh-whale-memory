@@ -19,7 +19,8 @@
  */
 import { value } from '../shared/config-values.js'
 
-export { deriveWorkspace } from './identity-source.js'
+import { deriveWorkspace } from './identity-source.js'
+export { deriveWorkspace }
 
 /** @typedef {{ userId?: string, roleId?: string, workspace?: string }} IdentityHint */
 /** @typedef {{ userId: string, roleId: string, workspace: string }} Identity */
@@ -119,4 +120,46 @@ export function resolveIdentity(cfg, hint = null, hostUserId = '', sessionWorksp
     source: stronger(stronger(user.source, role.source), ws.source),
     sources: { userId: user.source, roleId: role.source, workspace: ws.source },
   }
+}
+
+/**
+ * 子代理会话判据（唯一实现）：`origin==='subagent'` 或持久化 `delegationDepth>0`。
+ *
+ * 为什么两条都认：header 在恢复会话/不同宿主版本里的字段形态不一致，漏判会让子代理
+ * 拿到写工具或首轮画像（都按"有人类可裁定"的前提设计）。
+ *
+ * @param {{ origin?: unknown, delegationDepth?: unknown } | null | undefined} header
+ * @returns {boolean}
+ */
+export function isDelegatedHeader(header) {
+  return header?.origin === 'subagent' || Number(header?.delegationDepth) > 0
+}
+
+/**
+ * 会话身份（唯一判据）：会话 header 派生 workspace → resolveIdentity；不可判定返回失败。
+ *
+ * 为什么必须要求 `header.cwd`：auto 模式缺 cwd 时会回落到 Config 分区（如 'web'），
+ * 把不同工作区混成同一分区。工具/画像/收尾都只接受"可判定"的会话身份，判据只此一处。
+ *
+ * @param {{
+ *   header: object|null|undefined,
+ *   getIdentityCfg: () => any,
+ *   getIdentityHint: () => object|null|undefined,
+ *   getHostUserId: () => string,
+ * }} deps
+ * @returns {{ ok: true, identity: Identity, sources?: object } | { ok: false, error: 'identity_required' }}
+ */
+export function sessionIdentityOf({ header, getIdentityCfg, getIdentityHint, getHostUserId }) {
+  const sessionWorkspace = header ? deriveWorkspace(header) : ''
+  if (!header || !sessionWorkspace) return { ok: false, error: 'identity_required' }
+  const resolved = resolveIdentity(
+    typeof getIdentityCfg === 'function' ? getIdentityCfg() : undefined,
+    typeof getIdentityHint === 'function' ? getIdentityHint() : null,
+    typeof getHostUserId === 'function' ? String(getHostUserId() || '') : '',
+    sessionWorkspace,
+  )
+  if (!resolved?.ok || !resolved.identity?.userId || !resolved.identity?.workspace) {
+    return { ok: false, error: 'identity_required' }
+  }
+  return { ok: true, identity: resolved.identity, sources: resolved.sources }
 }

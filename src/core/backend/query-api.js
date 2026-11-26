@@ -104,6 +104,34 @@ export const queryApi = {
   },
 
   /**
+   * 首轮画像取数（v7）：同身份 active 节点按 layer 分组取前 N，只读 id/text/layer。
+   *
+   * 排序 `pinned DESC, weight DESC, updated_at DESC`（置顶规则优先，其次权重，其次最新）；
+   * layer 精确匹配三值：DB 无 CHECK，未知值/NULL 自然不进画像（读路径把未知当未分层）。
+   *
+   * @param {{ user?: number, lesson?: number, fact?: number }} [limits] 每组条数上限（0 表示不取）
+   * @param {{ identity?: Identity }} [opts]
+   * @returns {Promise<{ user: Array<{id:string,text:string,layer:string}>,
+   *   lesson: Array<{id:string,text:string,layer:string}>,
+   *   fact: Array<{id:string,text:string,layer:string}> }>}
+   */
+  async profileLayers(limits = {}, opts = {}) {
+    const db = this._db()
+    const out = { user: [], lesson: [], fact: [] }
+    const filter = identityFilter(opts?.identity)
+    for (const layer of ['user', 'lesson', 'fact']) {
+      const cap = Math.max(0, Math.min(20, Math.trunc(Number(limits?.[layer]) || 0)))
+      if (!cap) continue
+      out[layer] = db.prepare(`SELECT id,text,layer FROM nodes
+        WHERE status='active' AND layer=?${filter.sql ? ` AND ${filter.sql}` : ''}
+        ORDER BY pinned DESC, weight DESC, updated_at DESC LIMIT ?`)
+        .all(layer, ...filter.params, cap)
+        .map((row) => ({ id: String(row.id), text: String(row.text ?? ''), layer: String(row.layer) }))
+    }
+    return out
+  },
+
+  /**
    * 最近召回摘要（面板首页）：按身份过滤，避免首页把别人分区的查询词显示出来。
    * @param {number} [limit] 1..10
    * @param {{ identity?: Identity }} [opts]

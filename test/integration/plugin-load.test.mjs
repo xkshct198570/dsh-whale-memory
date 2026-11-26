@@ -33,7 +33,7 @@ function hostContext({ timer = false } = {}) {
   })
   ctx.provide('systemPrompt', {
     section: (entry) => { calls.push({ kind: 'systemPrompt.section', name: entry?.name }); return noopDisposer() },
-    context: (entry) => { calls.push({ kind: 'systemPrompt.context', name: entry?.name }); return noopDisposer() },
+    context: (entry) => { calls.push({ kind: 'systemPrompt.context', name: entry?.name, order: entry?.order }); return noopDisposer() },
   })
   return { ctx, calls }
 }
@@ -64,7 +64,14 @@ for (const timer of [false, true]) {
     // 接线证据：路由前缀 + 注入 context 都必须注册（hook 不是"只在日志里说装了"）。
     assert.ok(calls.some((call) => call.kind === 'webServer.register' && call.path === '/whale-memory/api' && call.mode === 'prefix'),
       JSON.stringify(calls))
-    assert.ok(calls.some((call) => call.kind === 'systemPrompt.context'), JSON.stringify(calls))
+    // 两个 context 必须都真的注册：召回 130、首轮画像 129（画像先于召回；名字独立）。
+    const contextEntries = calls.filter((call) => call.kind === 'systemPrompt.context')
+    const recallEntry = contextEntries.find((call) => call.name === 'whale-memory:recall')
+    const profileEntry = contextEntries.find((call) => call.name === 'whale-memory:profile')
+    assert.ok(recallEntry, JSON.stringify(calls))
+    assert.ok(profileEntry, `首轮画像必须由 index.js 接线注册：${JSON.stringify(calls)}`)
+    assert.equal(profileEntry.order, 129)
+    assert.equal(recallEntry.order, 130)
 
     // 提案链路：真实 waterfall（listener 的最后参数是 next）。一条标准规则陈述必须产出候选文件。
     const decision = await ctx.waterfall('agent/pre-step', {
