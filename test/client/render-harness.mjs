@@ -159,9 +159,8 @@ export function loadSlots(configOverride = null, extra = {}) {
     // 保留 props：S1 起断言 select/option/button 的可访问性与事件要读真实属性（不只是文本）。
     return { type: String(node.type), props: node.props || {}, children: node.children.map(renderNode) }
   }
-  const mount = async (Component, props, rounds = 8) => {
-    // 固定跑几轮让 effect 里的异步加载/轮询落地；返回最后一轮渲染树，
-    // 供测试断言"页签真的渲染出内容"而不是只断言源码字符串。
+  /** 跑若干轮渲染直到稳定：effect 里的异步加载/轮询落地后才返回最后一棵树。 */
+  const renderRounds = async (Component, props, rounds) => {
     let tree = null
     for (let round = 0; round < rounds; round += 1) {
       cursor = 0
@@ -175,6 +174,21 @@ export function loadSlots(configOverride = null, extra = {}) {
     return tree
   }
 
+  /**
+   * 新挂载：清空 hooks 状态/ref/deps 再渲染（等价 React 的新组件实例）。
+   * 为什么必须清：states/refs/effectDeps 按 hook 序号存，不清就会让「同一个 loadSlots 里先挂 A 再挂 B」
+   * 的 B 继承 A 的 state（例如设置页的 load 顶掉 Panel 的 useVisible）——冒烟会假绿。
+   */
+  const mount = async (Component, props, rounds = 8) => {
+    states.length = 0
+    refs.length = 0
+    effectDeps.length = 0
+    return renderRounds(Component, props, rounds)
+  }
+
+  /** 重渲染同一实例：保留 hooks 状态（用于模拟用户操作后的下一帧）。 */
+  const rerender = async (Component, props, rounds = 8) => renderRounds(Component, props, rounds)
+
   const slots = {}
   const ctx = {
     locale: { register() {}, bind() { return (key) => key }, current() { return 'zh' } },
@@ -186,7 +200,7 @@ export function loadSlots(configOverride = null, extra = {}) {
   }
   factory((name) => (name === 'react' ? React : {}))
     .apply(ctx)
-  return { slots, mount }
+  return { slots, mount, rerender }
 }
 
 /** 渲染树 → 纯文本（只用于断言关键文案是否真的出现）。 */

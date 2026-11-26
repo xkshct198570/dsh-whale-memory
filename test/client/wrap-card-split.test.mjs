@@ -52,6 +52,7 @@ test('主体不复写被搬走的实现（文案映射/useWrapCard/报告/设置
     'function WrapControls',
     'const copyReport',
     'const downloadReport',
+    'const triggerTitle',
   ]) {
     assert.ok(!main.includes(forbidden), `${MAIN} 不应再包含 ${forbidden}（应留在分片）`)
   }
@@ -62,6 +63,7 @@ test('主体不复写被搬走的实现（文案映射/useWrapCard/报告/设置
   assert.match(slice('51-wrap-card-actions.js'), /function useWrapCard/)
   assert.match(slice('51-wrap-card-report.js'), /function WrapReport/)
   assert.match(slice('51-wrap-card-settings.js'), /function WrapControls/)
+  assert.match(slice('51-wrap-card-settings.js'), /const triggerTitle = !enabled/, '按钮禁用原因必须在设置片算')
 })
 
 test('主体有效行 ≤ 350（Session-Wrap v2 设计预算；lint-size 的 800 闸看不到这条）', () => {

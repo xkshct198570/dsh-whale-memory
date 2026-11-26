@@ -58,13 +58,13 @@ The model can call five tools: `memory_remember`, `memory_search`, `memory_read`
 
 ### Layers and the first-turn profile
 
-- Every memory carries a layer: `fact` (facts/decisions), `lesson` (procedural lessons), `user` (preferences). Legacy rows keep `NULL`; rules have no layer.
+- Wrap and reflection writes carry a layer: `fact` (facts/decisions), `lesson` (procedural lessons), `user` (preferences). Direct panel writes and `memory_*` tool writes are currently `NULL` (0.8.1); legacy rows also keep `NULL`; rules have no layer.
 - On the first turn of a session the plugin renders a ≤800-character profile from the same identity's `user`/`lesson`/`fact` nodes (top 5/5/3) and injects it once via `systemPrompt.context`. It never repeats on later turns, is skipped for subagents or undetermined identity, and fails open with a log line.
 
 ### Reflection (off by default)
 
 - When enabled, reflection runs after a turn that used distinct non-memory tools in ≥7 steps, or when the session goes idle. It writes lessons/facts with `source=self`, `origin=reflect`, under the same ingest policy as wrap.
-- Automatic runs obey `reflect.maxRunsPerDay` (local calendar day) and `maintenance.suppressWindows` (`HH:MM-HH:MM`, local time, `23:00-07:00` spans midnight; unparseable entries are skipped and logged once).
+- Automatic runs obey `reflect.maxRunsPerDay` (counted per process, reset on local-calendar-day boundary and on restart) and `maintenance.suppressWindows` (`HH:MM-HH:MM`, local time, `23:00-07:00` spans midnight; unparseable entries are skipped and logged once).
 - The manual `/reflect` route and the panel action bypass peak windows and the daily cap, but still require an identity. The switch is off by default; enabling it spends model tokens.
 
 ## Configuration
@@ -112,7 +112,7 @@ Reflection and peak windows:
 | `reflect.model` | `''` | Model override for reflection |
 | `reflect.idleMinutes` | `30` | Idle minutes before an idle reflection run |
 | `reflect.maxItems` | `8` | Items per run |
-| `reflect.maxRunsPerDay` | `24` | Automatic runs per local calendar day (manual bypasses) |
+| `reflect.maxRunsPerDay` | `24` | Automatic runs per local calendar day, counted in-process (resets on restart); manual bypasses |
 | `maintenance.suppressWindows` | `[]` | Local-time `HH:MM-HH:MM` windows; automatic reflection is skipped inside them (`23:00-07:00` spans midnight; bad entries fail open with one log) |
 
 Model tools:

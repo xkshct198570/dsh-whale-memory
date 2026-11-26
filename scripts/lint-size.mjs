@@ -283,5 +283,19 @@ function main() {
   )
 }
 
-const isMain = Boolean(process.argv[1]) && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href
-if (isMain) main()
+/**
+ * 是否被直接执行：两侧都先 realpath 再比。
+ * 为什么不能只比 `import.meta.url === pathToFileURL(resolve(argv[1]))`：包管理器/CI 常用 symlink
+ * 包装脚本，argv[1] 是链接路径而 import.meta.url 是真实路径，直比会 false → 门禁静默不跑（fail-open）。
+ */
+function isMainModule() {
+  if (!process.argv[1]) return false
+  try {
+    const self = pathToFileURL(fs.realpathSync(fileURLToPath(import.meta.url))).href
+    const entry = pathToFileURL(fs.realpathSync(path.resolve(process.argv[1]))).href
+    return self === entry
+  } catch {
+    return false
+  }
+}
+if (isMainModule()) main()

@@ -211,7 +211,6 @@
   "reflect.button": "内省を実行",
   "reflect.done": "内省しました：+{added}（素材 {material}）",
   "reflect.busy": "内省しています…",
-  "reflect.disabled": "内省は無効です：設定で reflect.enabled を有効にしてください",
   "import.export": "エクスポート",
   "import.accept": ".jsonl,.txt,text/plain",
   "status.active": "アクティブ",

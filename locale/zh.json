@@ -210,7 +210,6 @@
   "reflect.button": "反思",
   "reflect.done": "反思完成：新增 {added} 条（素材 {material}）",
   "reflect.busy": "反思中…",
-  "reflect.disabled": "反思未启用：去设置打开 reflect.enabled",
   "import.export": "导出",
   "import.accept": ".jsonl,.txt,text/plain",
   "status.active": "活跃",

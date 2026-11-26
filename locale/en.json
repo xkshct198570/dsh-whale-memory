@@ -211,7 +211,6 @@
   "reflect.button": "Reflect",
   "reflect.done": "Reflected: +{added} (material {material})",
   "reflect.busy": "Reflecting…",
-  "reflect.disabled": "Reflect disabled: enable reflect.enabled in settings",
   "import.export": "Export",
   "import.accept": ".jsonl,.txt,text/plain",
   "status.active": "Active",

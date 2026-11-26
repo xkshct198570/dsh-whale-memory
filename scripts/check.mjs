@@ -321,7 +321,8 @@ function detailProblems(detail) {
 gate('E9', () => {
   const r = []
   const files = pkg.files || []
-  for (const detail of ['docs/DETAIL.en.md', 'docs/DETAIL.zh.md']) r.push(...detailProblems(detail))
+  // 三语详情页都要过硬门（ja 此前只随 files 发布、未被校验：图片/viewBox/外链漏检）。
+  for (const detail of ['docs/DETAIL.en.md', 'docs/DETAIL.zh.md', 'docs/DETAIL.ja.md']) r.push(...detailProblems(detail))
   for (const need of REQUIRED_FILES) if (!files.includes(need)) r.push(`files 必含 ${need}`)
   for (const need of REQUIRED_DOC_FILES) {
     if (!files.includes('docs') && !files.includes(need)) r.push(`files 必含 ${need}（或整目录 docs）`)

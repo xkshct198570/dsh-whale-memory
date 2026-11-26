@@ -10,20 +10,21 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { DEFAULT_CONFIG, loadSlots, walkTree, treeText } from './render-harness.mjs'
+import { DEFAULT_CONFIG, loadSlots, walkTree, treeText, findNode } from './render-harness.mjs'
 
 test('面板渲染冒烟：settings.section 与 main 都能无异常渲染（防白屏）', async () => {
-  const { slots, mount } = loadSlots()
-  assert.equal(typeof slots['settings.section'], 'function', '缺少 settings.section 组件')
-  assert.equal(typeof slots.main, 'function', '缺少 main 面板组件')
-  await mount(slots['settings.section'], { t: (key) => key })
-  await mount(slots.main, { t: (key) => key, locale: 'zh' })
+  const section = loadSlots()
+  assert.equal(typeof section.slots['settings.section'], 'function', '缺少 settings.section 组件')
+  await section.mount(section.slots['settings.section'], { t: (key) => key })
+  const main = loadSlots()
+  assert.equal(typeof main.slots.main, 'function', '缺少 main 面板组件')
+  await main.mount(main.slots.main, { t: (key) => key, locale: 'zh' })
 })
 
 test('六页签逐个执行组件函数：任一页签白屏/ReferenceError 都会红', async () => {
   const tabs = ['overview', 'memory', 'rules', 'recall', 'writes', 'settings']
   for (const tab of tabs) {
-    const { slots, mount } = loadSlots({ panel: { ...DEFAULT_CONFIG.panel, tab } })
+    const { slots, mount, rerender } = loadSlots({ panel: { ...DEFAULT_CONFIG.panel, tab } })
     const tree = await mount(slots.main, { t: (key) => key, locale: 'zh' }, 1)
     assert.ok(tree, `${tab} 页签未产出渲染树`)
     const text = treeText(tree)
@@ -32,7 +33,7 @@ test('六页签逐个执行组件函数：任一页签白屏/ReferenceError 都�
 })
 
 test('全默认配置下首启推荐卡真实出现（configIsDefaults 回归）', async () => {
-  const { slots, mount } = loadSlots({ panel: { ...DEFAULT_CONFIG.panel, tab: 'settings' } })
+  const { slots, mount, rerender } = loadSlots({ panel: { ...DEFAULT_CONFIG.panel, tab: 'settings' } })
   const tree = await mount(slots.main, { t: (key) => key, locale: 'zh' })
   const text = treeText(tree)
   assert.match(text, /settings\.firstRunTitle/, '默认配置应出现首启推荐卡')
@@ -50,7 +51,7 @@ test('Session Wrap 概览卡：真实状态渲染出状态/计数/可切会话�
     },
     recent: [], spool: { files: 0, bytes: 0 }, lastSkip: null, lastManual: null, capture: null,
   }
-  const { slots, mount } = loadSlots(
+  const { slots, mount, rerender } = loadSlots(
     { panel: { ...DEFAULT_CONFIG.panel, tab: 'overview' } },
     { wrapStatus, wrapReport: { ok: true, runId: 7, text: '# 会话收尾报告' } },
   )
@@ -64,7 +65,7 @@ test('Session Wrap 概览卡：真实状态渲染出状态/计数/可切会话�
 })
 
 test('Session Wrap 设置组与候选过滤：分组/开关真实渲染，收尾候选可筛', async () => {
-  const { slots, mount } = loadSlots(
+  const { slots, mount, rerender } = loadSlots(
     { panel: { ...DEFAULT_CONFIG.panel, tab: 'settings' } },
     { openGroups: { 'settings.groupWrap': true } },
   )
@@ -76,7 +77,7 @@ test('Session Wrap 设置组与候选过滤：分组/开关真实渲染，收尾
 })
 
 test('S1 空态：没有收尾记录也有引导，且 409 点击失败可见（不再“什么都没发生”）', async () => {
-  const { slots, mount } = loadSlots(
+  const { slots, mount, rerender } = loadSlots(
     { panel: { ...DEFAULT_CONFIG.panel, tab: 'overview' } },
     {
       wrapStatus: {
@@ -98,14 +99,14 @@ test('S1 空态：没有收尾记录也有引导，且 409 点击失败可见（
   walkTree(tree, (node) => { if (node.type === 'button') labels.push(node.props && node.props['aria-label']) })
   assert.ok(button && typeof button.props.onClick === 'function', '空态也必须能点立即收尾 buttons=' + JSON.stringify(labels) + ' wrapTitle?' + treeText(tree).includes('overview.wrapTitle') + ' full=' + treeText(tree).slice(-400))
   button.props.onClick()
-  const after = await mount(slots.main, { t: (key) => key, locale: 'zh', pollMs: 1 })
+  const after = await rerender(slots.main, { t: (key) => key, locale: 'zh', pollMs: 1 })
   const text = treeText(after)
   assert.match(text, /overview\.wrapFailed/, '409 必须出现失败行')
   assert.match(text, /overview\.wrapErrorTurn/, '错误码必须映射成中文一句话')
 })
 
 test('S1 会话下拉：列出采集会话（轮数/状态），选中项提交 sessionId', async () => {
-  const { slots, mount } = loadSlots(
+  const { slots, mount, rerender } = loadSlots(
     { panel: { ...DEFAULT_CONFIG.panel, tab: 'overview' } },
     {
       wrapStatus: { ok: true, supported: true, enabled: true, latest: null, recent: [], lastSkip: null },
@@ -131,7 +132,7 @@ test('S1 会话下拉：列出采集会话（轮数/状态），选中项提交 
 })
 
 test('S1 警告与失败折叠：warnings 可见；失败默认只显示计数，不刷原始码', async () => {
-  const { slots, mount } = loadSlots(
+  const { slots, mount, rerender } = loadSlots(
     { panel: { ...DEFAULT_CONFIG.panel, tab: 'overview' } },
     {
       wrapStatus: {
@@ -159,7 +160,7 @@ test('S1 警告与失败折叠：warnings 可见；失败默认只显示计数�
 })
 
 test('S1b 进度点与重试：running 显示阶段、retrying 显示 N/4', async () => {
-  const { slots, mount } = loadSlots(
+  const { slots, mount, rerender } = loadSlots(
     { panel: { ...DEFAULT_CONFIG.panel, tab: 'overview' } },
     {
       wrapStatus: {
@@ -189,7 +190,7 @@ test('S2 自动/跳过开关：auto 勾选反映服务端，选中会话后出�
     ok: true, auto: { enabled: true, idleMinutes: 10 },
     items: [{ sessionId: 's1', lastActivity: 2, materialTurns: 3, open: false, hasMaterial: true, skipAuto: true, lastRunState: 'done' }],
   }
-  const { slots, mount } = loadSlots(
+  const { slots, mount, rerender } = loadSlots(
     { panel: { ...DEFAULT_CONFIG.panel, tab: 'overview' } },
     { wrapStatus: { ok: true, supported: true, enabled: true, latest: null, recent: [], lastSkip: null }, wrapSessions: sessions },
   )
@@ -202,7 +203,7 @@ test('S2 自动/跳过开关：auto 勾选反映服务端，选中会话后出�
   let select = null
   walkTree(tree, (node) => { if (node.type === 'select') select = node })
   select.props.onChange({ target: { value: 's1' } })
-  const after = await mount(slots.main, { t: (key) => key, locale: 'zh', pollMs: 1 })
+  const after = await rerender(slots.main, { t: (key) => key, locale: 'zh', pollMs: 1 })
   const inputs2 = new Map()
   walkTree(after, (node) => { if (node.type === 'input' && node.props.id) inputs2.set(node.props.id, node) })
   assert.equal(inputs2.get('wrap-skip-switch')?.props.checked, true, 'skipAuto=true 必须显示为勾选')
@@ -234,7 +235,7 @@ test('S3 阶段投影：reconcile 关闭绝不出现整合阶段；开启且 pha
 })
 
 test('页签不可被压缩：nav flexShrink=0/minHeight、tab 显式 28px 盒高（真机 0 高回归）', async () => {
-  const { slots, mount } = loadSlots({ panel: { ...DEFAULT_CONFIG.panel, tab: 'overview' } })
+  const { slots, mount, rerender } = loadSlots({ panel: { ...DEFAULT_CONFIG.panel, tab: 'overview' } })
   const tree = await mount(slots.main, { t: (key) => key, locale: 'zh' }, 1)
   let nav = null
   walkTree(tree, (node) => { if (node.type === 'nav' && node.props && node.props.role === 'tablist') nav = node })
@@ -252,3 +253,19 @@ test('页签不可被压缩：nav flexShrink=0/minHeight、tab 显式 28px 盒�
 })
 
 // ---------------------------------------------------------------------------
+
+test('手动反思按钮不受 reflect.enabled 约束（S4 契约：显式动作绕过开关）', async () => {
+  const calls = []
+  const { slots, mount } = loadSlots(
+    { reflect: { ...DEFAULT_CONFIG.reflect, enabled: false }, panel: { ...DEFAULT_CONFIG.panel, tab: 'overview' } },
+    { calls },
+  )
+  const tree = await mount(slots.main, { t: (key) => key, locale: 'zh' })
+  const button = findNode(tree, (n) => n.type === 'button' && treeText(n).includes('reflect.button'))
+  assert.ok(button, '缺少「立即反思」按钮')
+  assert.notEqual(button.props.disabled, true, '开关关闭时手动反思按钮必须可点（自动开关只管自动触发）')
+  calls.length = 0
+  await button.props.onClick()
+  assert.ok(calls.some((call) => call.method === 'POST' && call.path.endsWith('/reflect')),
+    '点击必须真的 POST /reflect（不是假按钮）')
+})

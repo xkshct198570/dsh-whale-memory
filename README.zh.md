@@ -64,13 +64,13 @@
 
 ### 记忆分层与首轮画像
 
-- 每条记忆带分层：`fact`（事实/决策）、`lesson`（可复用的教训）、`user`（偏好）。旧行保持 `NULL`；规则没有分层。
+- 收尾与反思写入带分层：`fact`（事实/决策）、`lesson`（可复用的教训）、`user`（偏好）；面板直接写入与 `memory_*` 工具写入目前为 `NULL`（0.8.1），旧行同样保持 `NULL`；规则没有分层。
 - 会话首轮会把同身份的 `user` top5 / `lesson` top5 / `fact` top3 渲染成 ≤800 字符的「长期画像」，经 `systemPrompt.context` 注入一次；第二轮不再出现，子代理或身份不可判定时跳过，失败只记日志不阻断对话。
 
 ### 自动反思（默认关）
 
 - 开启后，回合一里 distinct 非记忆工具步数 ≥7 或会话空闲到点时自动跑；产出教训/事实，落库 `source=self`、`origin=reflect`，走与收尾同一套入库判据。
-- 自动运行受 `reflect.maxRunsPerDay`（本地自然日）与 `maintenance.suppressWindows`（本地时区 `HH:MM-HH:MM`，`23:00-07:00` 表示跨午夜；无法解析的项跳过并记一次日志）约束。
+- 自动运行受 `reflect.maxRunsPerDay`（按进程内计数、本地自然日边界与重启清零）与 `maintenance.suppressWindows`（本地时区 `HH:MM-HH:MM`，`23:00-07:00` 表示跨午夜；无法解析的项跳过并记一次日志）约束。
 - 手动 `/reflect` 与面板「立即反思」绕过峰时与日限，但仍要求身份；开关默认关，打开会花模型 token。
 
 ## 配置
@@ -84,7 +84,7 @@
 | 身份 | 记忆按谁分区 | `identity.mode='auto'`（DSH 登录 userId + 会话工作目录）；固定分区用 `fixed` + `userId/roleId/workspace` |
 | 注入 | 召回与注入 | `enabled=true`、`maxHits=5`、`charBudget=1500`（**0 = 关闭注入**）、`intentBudget=true`、`minRel=0.34`、`timeoutMs=2000` |
 | 写入 | 记不记、怎么审 | `enabled=true`、`reviewMode='shadow'`（候选需在面板接受才入库；`auto` 直接落库）、`maxChars=500`、`dailyCap=200`、`judge='rules'`、`searchFeed=false`、`searchTtlHours=24` |
-| 反思 | 后台提炼 + 峰时 | `enabled=false`、`idleMinutes=30`、`maxItems=8`、`maxRunsPerDay=24`、`model=''`、`maintenance.suppressWindows=[]`（本地时区 `HH:MM-HH:MM`，跨午夜，坏值 fail-open 跳过；只抑制自动反思） |
+| 反思 | 后台提炼 + 峰时 | `enabled=false`、`idleMinutes=30`、`maxItems=8`、`maxRunsPerDay=24`、`model=''`、`maintenance.suppressWindows=[]`（本地时区 `HH:MM-HH:MM`，跨午夜，坏值 fail-open 跳过；只抑制自动反思；日限按进程内计数，重启清零） |
 | 模型工具 | 对话里直接读写记忆 | `tools.enabled=true`、`tools.maxWritesPerTurn=5`（remember/update/forget 每回合尝试上限） |
 | 收尾 | 会话结束沉淀 | `enabled=true`、`explicit=true`、`idle=false`、`disposed=false`（后台两路默认关）、`idleMinutes=10`、`maxItems=8`、`ingest.mode=auto`（durable 自动入库 / review 全部先审）、`ingest.minConfidence=0.55`、`ingest.dropTaskInstructions=true`、`maxRunsPerDay=6`（只限自动）、`retentionDays=180`、`report=true`、`model=''`、`maxMaterialChars=12000` |
 | 巩固 | 定期合并 | `enabled=true`、`intervalHours=6` |
