@@ -623,17 +623,13 @@ export function installHook(ctx, {
       if (payload?.signal?.aborted) return decision
 
       const sid = String(sessionId)
-      const recallOn = bool(config?.recall?.enabled, true)
-      const rulesOn = bool(config?.rules?.enabled, true)
-      if (!recallOn && !rulesOn) return decision
-
-      const query = extractQuery(payload.messages)
       const hostUserId = typeof getHostUserId === 'function' ? String(getHostUserId() || '') : ''
       const sessionWorkspace = deriveWorkspace(agent?.session?.header)
       const ident = resolveIdentity(getIdentityCfg(), getIdentityHint(), hostUserId, sessionWorkspace)
       if (!ident.ok) return decision
-      // 面板/routes 没有会话 header，读不到会话 workspace；这里把"最近一次召回真正用的身份"
-      // 记到共享 state，/stats 与 /config 只读展示，避免面板把 Config 值当成生效值。
+      // 面板/routes 没有会话 header；这里把“最近一次进入的会话身份”记到共享 state，
+      // /stats 与 /config 只读展示。必须在 recall/rules 双关早退之前更新：
+      // 否则双关配置下面板永远显示旧 workspace，S0 的写/审身份闸会误判。
       if (identityState && typeof identityState === 'object') {
         identityState.lastRecall = {
           workspace: ident.identity.workspace,
@@ -644,6 +640,11 @@ export function installHook(ctx, {
         }
       }
 
+      const recallOn = bool(config?.recall?.enabled, true)
+      const rulesOn = bool(config?.rules?.enabled, true)
+      if (!recallOn && !rulesOn) return decision
+
+      const query = extractQuery(payload.messages)
       cache.delete(sid)
       // 上一步的回复已完整落进 assistant-stream：进入新步前先结算，别让证据过期被下一轮覆盖。
       settle(sessionId)

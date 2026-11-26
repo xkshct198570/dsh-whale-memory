@@ -36,6 +36,7 @@
     "ok": true,
     "keys": [
       "config",
+      "identityOverride",
       "ok",
       "runtimeIdentity"
     ]

@@ -114,7 +114,7 @@ test('设置控件带 aria-describedby 关联说明', () => {
 
 test('shadow 候选走服务端 action 过滤，并有空态卡', () => {
   assert.ok(CLIENT.includes("t('writes.pendingEmpty')"), '缺少“暂无待审”空态')
-  assert.ok(CLIENT.includes("callJson('/writes?action=CANDIDATE&limit=100')"), '候选未按要求查询')
+  assert.ok(CLIENT.includes("callJson(withIdentity('/writes?action=CANDIDATE&limit=100'))"), '候选未按要求查询')
   assert.ok(!CLIENT.includes("item.action === 'CANDIDATE'"), '仍在用前端过滤候选')
 })
 

@@ -14,7 +14,7 @@ import {
 } from './config-util.js'
 
 export async function handleConfigSync({
-  req, res, path, method, config, backend, identity, identityView, ctx, log, traceId, reflect, sendJson, sendMethodNotAllowed,
+  req, res, path, method, config, backend, identity, identityView, identityOverride, ctx, log, traceId, reflect, sendJson, sendMethodNotAllowed,
 }) {
     if (path === `${PREFIX}/sync`) {
       if (req.method !== 'POST') return sendMethodNotAllowed(res, 'POST')
@@ -85,6 +85,8 @@ export async function handleConfigSync({
         ok: true,
         config: echoConfig(config),
         runtimeIdentity: identityView(),
+        // 客户端据此决定是否给读写请求带显式身份；远端只读面板不得覆盖。
+        identityOverride: Boolean(identityOverride),
       })
     }
   return false

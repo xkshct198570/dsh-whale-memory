@@ -70,6 +70,7 @@ export const ERROR_TABLE = Object.freeze({
   git_unavailable: mapped(503, 'git_unavailable'),
   http_not_configured: statusOnly(400),
   identity_required: mapped(400, 'identity_required'),
+  identity_mismatch: statusOnly(403),
   immutable_field: mapped(400, 'immutable_field'),
   invalid_config: mapped(400, 'invalid_config'),
   invalid_decision: statusOnly(400),

@@ -540,8 +540,8 @@ test('report：有 dbFile 写 reports/<日期>.md；无 dbFile 跳过', async ()
     assert.match(body, /零注入不计/)
     // 日报新增：指标表（十一项）与 metrics 表落行。
     assert.match(body, /## 指标（架构书 §9\.1，十一项）/)
-    assert.match(body, /## 命中但未注入 Top10/)
-    assert.match(body, /## 未采纳 Top10/)
+    assert.match(body, /## 命中但未注入（按来源，近 24h）/)
+    assert.match(body, /## 未采纳（按来源，近 24h）/)
     assert.match(body, /## 近 24h 失败 job/)
     assert.ok(Number(f.db.prepare('SELECT count(*) AS n FROM metrics').get().n) > 0, '日报必须把当天指标写进 metrics 表')
   } finally { f.close() }
@@ -595,7 +595,7 @@ test('report：命中未注入/未采纳/失败 job 三段与指标落表（手�
       .run(d.kind, d.state, d.attempts ?? 0, d.lastError ?? null, d.ts, d.ts)
 
     // 近 24h：同一查询两次"命中未注入"；一条已注入未采纳；一条已注入已采纳（必须出表）；
-    // 一条零命中（只进零注入率，不进 Top10）。
+    // 一条零命中（只进零注入率，不进两张来源表）。
     recallRow({ ts: ts - 3600, query: '低分命中规则', hitIds: '["n1"]', injected: 0 })
     recallRow({ ts: ts - 3500, query: '低分命中规则', hitIds: '["n1"]', injected: 0 })
     recallRow({ ts: ts - 3400, query: '已注入未采纳', hitIds: '["n2"]', injected: 1, chars: 20 })
@@ -619,12 +619,13 @@ test('report：命中未注入/未采纳/失败 job 三段与指标落表（手�
       assert.ok(body.includes(label), `指标表缺 ${label}`)
     }
     assert.match(body, /未接入/)
-    assert.match(body, /## 命中但未注入 Top10/)
-    assert.match(body, /schema v3/)
-    assert.match(body, /低分命中规则/)
-    assert.match(body, /## 未采纳 Top10/)
-    assert.match(body, /已注入未采纳/)
-    assert.doesNotMatch(body, /已注入已采纳/, '已采纳的查询不进未采纳表')
+    assert.match(body, /## 命中但未注入（按来源，近 24h）/)
+    assert.match(body, /\| 来源 \| 命中次数 \|/)
+    assert.match(body, /## 未采纳（按来源，近 24h）/)
+    // P2-10：日报不得出现任何召回 query 原文。
+    assert.doesNotMatch(body, /低分命中规则/)
+    assert.doesNotMatch(body, /已注入未采纳/)
+    assert.doesNotMatch(body, /零命中查询/)
     assert.match(body, /## 近 24h 失败 job/)
     assert.match(body, /reflect/)
     assert.match(body, /boom_boom/)

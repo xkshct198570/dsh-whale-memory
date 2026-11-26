@@ -44,6 +44,27 @@ test('hook：pre-step 写缓存，context 本轮可读到；dispose 后清空', 
   assert.equal(state.context.text({ scope: { session: { id: 's1' } } }), '')
 })
 
+test('hook：recall+rules 双关时仍在早退前更新 lastRecall（面板身份闸依赖）', async () => {
+  const { ctx, state } = fakeCtx()
+  const identityState = {}
+  installHook(ctx, {
+    backend: { async recall() { return null } },
+    config: {
+      identity: { mode: 'auto', userId: '', roleId: '', workspace: '' },
+      recall: { enabled: false },
+      rules: { enabled: false },
+    },
+    getHostUserId: () => 'host-user',
+    identityState,
+  })
+  await state.pre({
+    agent: { session: { id: 's-last', header: { cwd: '/home/hy/hy' } } },
+    messages: [{ source: { kind: 'user' }, content: [{ type: 'text', text: '问' }] }],
+  }, async () => ({ kind: 'enter' }))
+  assert.equal(identityState.lastRecall.userId, 'host-user')
+  assert.equal(identityState.lastRecall.workspace, '/home/hy/hy')
+})
+
 test('hook：subagent 不召回', async () => {
   const { ctx, state } = fakeCtx()
   let called = 0

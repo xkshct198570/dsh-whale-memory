@@ -58,7 +58,7 @@ export async function handleNodesReview({
         const body = await readJson(req)
         if (!body.ok) return sendJson(res, body.status, { ok: false, error: body.error })
         const idn = requestIdentity(body.value)
-        if (!idn.ok) return sendJson(res, 400, { ok: false, error: idn.error })
+        if (!idn.ok) return sendJson(res, idn.status || 400, { ok: false, error: idn.error })
         const got = await backend.updateNode(
           id,
           body.value?.patch || body.value || {},

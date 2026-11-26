@@ -9,7 +9,7 @@ import assert from 'node:assert/strict'
 import http from 'node:http'
 import { createRoutes } from '../../src/host/routes.js'
 
-const calls = { write: [], importJsonl: [], exportJsonl: [], nodes: [] }
+const calls = { write: [], importJsonl: [], exportJsonl: [], nodes: [], review: null, updateNode: null }
 const backend = {
   async stats() { return { totals: { nodes_total: 0 } } },
   async recent() { return { items: [] } },
@@ -33,6 +33,14 @@ const backend = {
     calls.nodes.push(args)
     return { items: [{ id: 'n1', text: '条目一' }], total: 7 }
   },
+  async reviewWrite(id, decision, reason, opts) {
+    calls.review = { id, decision, reason, opts }
+    return { ok: true, id: 'n9' }
+  },
+  async updateNode(id, patch, opts) {
+    calls.updateNode = { id, patch, opts }
+    return { ok: true, id, updated_at: 1 }
+  },
 }
 const config = {
   identity: { mode: 'fixed', userId: 'u1', roleId: '', workspace: '' },
@@ -40,9 +48,12 @@ const config = {
   recall: { enabled: true, maxHits: 5, timeoutMs: 1000 },
   write: { enabled: true, reviewMode: 'shadow', maxChars: 500 },
 }
+const identityState = {
+  lastRecall: { userId: 'u1', roleId: '', workspace: '/home/hy/hy', workspaceSource: 'session', at: 1 },
+}
 let server, base
 before(async () => {
-  const handler = createRoutes({ config, backend })
+  const handler = createRoutes({ config, backend, identityState })
   server = http.createServer(handler)
   await new Promise((r) => server.listen(0, '127.0.0.1', r))
   base = `http://127.0.0.1:${server.address().port}`
@@ -192,4 +203,38 @@ test('方法不符 -> 405；未知路径 404 与现有只读路由保持现状',
   const stats = await get('/whale-memory/api/stats')
   assert.equal(stats.status, 200)
   assert.equal((await stats.json()).ok, true)
+})
+
+
+test('write：body 身份只允许 runtime/config，跨身份 403', async () => {
+  const runtime = { userId: 'u1', roleId: '', workspace: '/home/hy/hy' }
+  const ok = await post('/whale-memory/api/write', { text: '记到 runtime 分区', identity: runtime })
+  assert.equal(ok.status, 200)
+  assert.deepEqual(calls.write.at(-1).identity, runtime)
+
+  const bad = await post('/whale-memory/api/write', { text: '越权', identity: { userId: 'u1', roleId: '', workspace: '/other' } })
+  assert.equal(bad.status, 403)
+  assert.equal(bad.body.error, 'identity_mismatch')
+})
+
+test('write/review：body 身份只允许 runtime/config，跨身份 403', async () => {
+  const runtime = { userId: 'u1', roleId: '', workspace: '/home/hy/hy' }
+  const ok = await post('/whale-memory/api/write/review', { id: 7, decision: 'accept', identity: runtime })
+  assert.equal(ok.status, 200)
+  assert.deepEqual(calls.review.opts.identity, runtime)
+
+  const bad = await post('/whale-memory/api/write/review', { id: 8, decision: 'reject', identity: { userId: 'u1', roleId: '', workspace: '/other' } })
+  assert.equal(bad.status, 403)
+  assert.equal(bad.body.error, 'identity_mismatch')
+
+  const noBody = await post('/whale-memory/api/write/review', { id: 9, decision: 'reject' })
+  assert.equal(noBody.status, 200)
+  assert.deepEqual(calls.review.opts.identity, { userId: 'u1', roleId: '', workspace: '' })
+})
+
+
+test('/config 返回 identityOverride（回环 true）', async () => {
+  const res = await get('/whale-memory/api/config')
+  assert.equal(res.status, 200)
+  assert.equal((await res.json()).identityOverride, true)
 })

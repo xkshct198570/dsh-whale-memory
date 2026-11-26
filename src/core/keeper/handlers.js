@@ -205,30 +205,19 @@ function rateText(value) {
   return `${(Number(value) * 100).toFixed(1)}%`
 }
 
-/**
- * Top10 表里的查询截断：recalls.query 最长 500 字（整段用户提示词），原样入表会把
- * 日报撑成一篇聊天记录，也看不出聚合意图；80 字足够识别同一类查询。
- * @param {unknown} query
- * @returns {string}
- */
-function shortQuery(query) {
-  const text = String(query ?? '')
-  return text.length > 80 ? `${text.slice(0, 80)}…` : text
-}
-
-/** Markdown 表格单元格转义：query 里可能有 | 或换行，不转义会把表结构打断。 */
+/** Markdown 表格单元格转义：值里可能有 | 或换行，不转义会把表结构打断。 */
 function markdownCell(value) {
   return String(value ?? '').replace(/\|/g, '\\|').replace(/\r?\n/g, ' ').trim()
 }
 
-/** 两个审计 Top10 表的渲染（空数据写「（无）」，不留空表头）。 */
-function countTable(rows, column) {
+/** 审计计数表：按来源聚合，无 query 原文；空数据写「（无）」，不留空表头。 */
+function sourceCountTable(rows, column) {
   const list = Array.isArray(rows) ? rows : []
   if (list.length === 0) return ['（无）']
   return [
-    `| 查询 | ${column} |`,
+    `| 来源 | ${column} |`,
     '| --- | --- |',
-    ...list.map((row) => `| ${markdownCell(shortQuery(row.query))} | ${Number(row.n || 0)} |`),
+    ...list.map((row) => `| ${markdownCell(row.source || 'unknown')} | ${Number(row.n || 0)} |`),
   ]
 }
 
@@ -356,13 +345,13 @@ export function installDefaultHandlers(keeper, deps) {
         injected: one(`SELECT count(*) AS n FROM recalls WHERE ts >= ? AND injected=1`, ts - 86400),
       }
       // 「命中但未注入」是"低分命中"在没有分数列时的代理口径：检索命中了，但注入侧被
-      // 预算/层级裁光。按 query 聚合才能看出反复发生的是同一类问题。
-      const lowScoreHits = db.prepare(`SELECT query, count(*) AS n FROM recalls
+      // 预算/层级裁光。日报只按 source 聚合计数，不落 query 原文（审计 P2-10）。
+      const lowScoreHits = db.prepare(`SELECT source, count(*) AS n FROM recalls
         WHERE ts >= ? AND injected = 0 AND hit_ids NOT IN ('[]','')
-        GROUP BY query ORDER BY n DESC, query LIMIT 10`).all(ts - 86400)
-      const unadopted = db.prepare(`SELECT query, count(*) AS n FROM recalls
+        GROUP BY source ORDER BY n DESC, source LIMIT 10`).all(ts - 86400)
+      const unadopted = db.prepare(`SELECT source, count(*) AS n FROM recalls
         WHERE ts >= ? AND injected = 1 AND used = 0
-        GROUP BY query ORDER BY n DESC, query LIMIT 10`).all(ts - 86400)
+        GROUP BY source ORDER BY n DESC, source LIMIT 10`).all(ts - 86400)
       const failedJobs = db.prepare(`SELECT kind, attempts, last_error, updated_at FROM jobs
         WHERE state='failed' AND updated_at >= ? ORDER BY updated_at DESC LIMIT 20`).all(ts - 86400)
       // embed 关 → pending 滞留记 0（§9.1），日报不该每天挂一个没有消费方的 ✗。
@@ -406,17 +395,17 @@ export function installDefaultHandlers(keeper, deps) {
       `- 召回：${stats.recalls} 次（有命中 ${stats.withHits} 次）`,
       `- 注入：${stats.injected} 次，注入率 ${injectRate}%（零注入不计：无命中的召回不进分母）`,
       '',
-      '## 命中但未注入 Top10（近 24h）',
+      '## 命中但未注入（按来源，近 24h）',
       '',
-      '> 代理口径：无分数明细列，暂以「检索有命中但 injected=0」近似「低分命中」；分数明细待 schema v3 挂账。',
+      '> 代理口径：无分数明细列，暂以「检索有命中但 injected=0」近似「低分命中」；日报不落 query 原文，只按 source 计数。',
       '',
-      ...countTable(data.lowScoreHits, '命中次数'),
+      ...sourceCountTable(data.lowScoreHits, '命中次数'),
       '',
-      '## 未采纳 Top10（近 24h）',
+      '## 未采纳（按来源，近 24h）',
       '',
-      '> 口径：injected=1 且 used=0（used 由回复引用弱信号回写：注入节点原文 10 字窗口或中文 bigram 覆盖命中即记采纳；改写幅度大的回复可能漏判）。',
+      '> 口径：injected=1 且 used=0（used 由回复引用弱信号回写：注入节点原文 10 字窗口或中文 bigram 覆盖命中即记采纳；改写幅度大的回复可能漏判）。日报不落 query 原文，只按 source 计数。',
       '',
-      ...countTable(data.unadopted, '未采纳次数'),
+      ...sourceCountTable(data.unadopted, '未采纳次数'),
       '',
       '## 近 24h 失败 job（state=failed，updated_at 降序）',
       '',

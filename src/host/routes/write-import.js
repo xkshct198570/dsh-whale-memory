@@ -20,12 +20,14 @@ const WRITE_ERROR_CODES = new Set([
 ])
 
 export async function handleWriteImport({
-  req, res, path, backend, identity, traceId, log, sendJson, sendMethodNotAllowed,
+  req, res, path, backend, identity, validatedIdentityOverride, traceId, log, sendJson, sendMethodNotAllowed,
 }) {
     if (path === `${PREFIX}/write`) {
       if (req.method !== 'POST') return sendMethodNotAllowed(res, 'POST')
       const body = await readJson(req)
       if (!body.ok) return sendJson(res, body.status, { ok: false, error: body.error })
+      const idn = validatedIdentityOverride(body.value?.identity)
+      if (!idn.ok) return sendJson(res, idn.status || 400, { ok: false, error: idn.error })
       const text = typeof body.value?.text === 'string' ? body.value.text.trim() : ''
       if (!text || text.length > MAX_WRITE_CHARS) return sendJson(res, 400, { ok: false, error: 'invalid_text' })
 
@@ -52,7 +54,7 @@ export async function handleWriteImport({
           level: rawLevel || 'normal',
           memory_type: rawType || 'semantic',
           tags,
-          identity,
+          identity: idn.identity,
           traceId,
         })
       } catch (err) {
@@ -172,8 +174,10 @@ export async function handleWriteImport({
       if (!Number.isFinite(id) || !['accept', 'reject'].includes(decision)) {
         return sendJson(res, 400, { ok: false, error: 'invalid_review' })
       }
+      const idn = validatedIdentityOverride(body.value?.identity)
+      if (!idn.ok) return sendJson(res, idn.status || 400, { ok: false, error: idn.error })
       if (typeof backend.reviewWrite !== 'function') return sendJson(res, 502, { ok: false, error: 'backend_unavailable' })
-      const got = await backend.reviewWrite(id, decision, String(body.value?.reason || '').slice(0, 200), { identity })
+      const got = await backend.reviewWrite(id, decision, String(body.value?.reason || '').slice(0, 200), { identity: idn.identity })
       if (!got?.ok) return sendJson(res, statusOf(got.error, 400), got)
       return sendJson(res, 200, got)
     }
