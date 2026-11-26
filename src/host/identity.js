@@ -90,8 +90,9 @@ function resolveWorkspace(cfgWorkspace, hint, sessionWorkspace) {
  * @param {string} [hostUserId] 宿主会话身份（identity-source 当前值；可空）
  * @param {string} [sessionWorkspace] 会话 header.cwd 派生值（仅 cfg.workspace 为空时生效）
  * @param {HostState | { phase: HostState } | undefined} [hostState]
- *   identity-source 四态。缺省时按 `hostUserId` 有值=ready、无值=absent（兼容老调用/测试）；
- *   生产接线必须显式传，否则 `pending` 会被误当成 `absent` 回落出临时分区。
+ *   identity-source 四态。缺省时按 `hostUserId` 有值=ready、无值=absent（兼容老调用/测试）。
+ *   会话面（收尾/工具/反思/画像）与全部自动动作必须显式传，否则 `pending` 会被误当成 `absent`
+ *   回落出临时分区；**唯一例外是控制面 routes**——它只做展示/读，按 Config 身份工作（架构书 §5.5.1 第 4 条）。
  * @returns {{ ok: true, identity: Identity, source: IdentitySource, sources: { userId: IdentitySource, roleId: IdentitySource, workspace: IdentitySource } }
  *   | { ok: false, error: 'identity_required' }}
  */
