@@ -27,7 +27,19 @@ export async function handleVersionStats({
 
 
     if (path === `${PREFIX}/stats` && req.method === 'GET') {
-      const data = await backend.stats()
+      let data
+      try {
+        data = await backend.stats()
+      } catch (err) {
+        // 迁移快照 fail-closed：没有库可读，但原因必须可见（统一 502 backend_error 会把它吞成
+        // 不可行动的"后端错误"）；error 带完整 `migration_backup_failed:<reason>`，
+        // 面板离线卡按 errText 原样显示，health 区就是这条。
+        if (err?.code !== 'migration_backup_failed') throw err
+        return sendJson(res, 502, {
+          ok: false, offline: true, error: String(err.message || err).slice(0, 200),
+          identity: identityView(), migration: migrationView(), backend: backendView(), reason: String(err.reason || ''),
+        })
+      }
       const outbox = backendOutbox()
       return sendJson(res, 200, data
         ? {

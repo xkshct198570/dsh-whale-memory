@@ -273,8 +273,8 @@ test('ensureSchema：v1 库补 writes.payload 并升到 v2；重复执行幂等�
     // 幂等：再跑一次不报错、版本不变
     assert.deepEqual(ensureSchema(db), { version: SCHEMA_VERSION, deduped: 0, uniqueIndex: true })
 
-    // 高版本仍拒绝（只增不减）
-    db.prepare("UPDATE meta SET value='7' WHERE key='schema_version'").run()
+    // 高版本仍拒绝（只增不减）：v7 之后的下一个版本号必须红，防止旧代码打开新库。
+    db.prepare("UPDATE meta SET value='8' WHERE key='schema_version'").run()
     assert.throws(() => ensureSchema(db), /schema_incompatible/)
   } finally {
     db.close()

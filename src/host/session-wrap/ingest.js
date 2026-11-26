@@ -106,13 +106,13 @@ function statusOf(res) {
  * @param {{
  *   backend:any, item:object, identity:object, runId:number,
  *   ingest:object, origin:string, level:string, memoryType:string,
- *   source?:string, tags:string[],
- * }} deps
+ *   layer?:string|null, source?:string, tags:string[],
+ * }} deps layer 由调用方按 LAYER_OF_KIND 传入（v7）；不传=未分层（NULL）
  * @returns {Promise<{status:string, nodeId?:string, action:string, reason?:string}>}
  */
 export async function ingestItem({
   backend, item, identity, runId, ingest, origin, level, memoryType,
-  source = 'self', tags = [],
+  layer = null, source = 'self', tags = [],
 }) {
   try {
     const res = await backend.write({
@@ -124,6 +124,7 @@ export async function ingestItem({
       origin,
       traceId: `wrap:${runId}`,
       identity,
+      layer,
       ingestPolicy: ingestPolicyOf(ingest, { confidence: item?.confidence }),
     })
     return statusOf(res)

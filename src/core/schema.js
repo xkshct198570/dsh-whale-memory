@@ -1,5 +1,5 @@
 /**
- * schema v3（数据层唯一真源）：DDL 全量、幂等。
+ * schema v7（数据层唯一真源）：DDL 全量、幂等。
  *
  * 设计约束（与架构书 §4.1/§4.2 一致）：
  * - 加法演进：v1 之后只允许 ALTER TABLE ADD COLUMN / 新建表，禁改既有列语义。
@@ -11,6 +11,9 @@
  * - v2 只做一件事：writes 增加 payload TEXT，保存影子候选的决策载荷（等级/类型/tags/来源/双时态/
  *   shadowOf/targetId）。为什么必须落库：影子模式下 nodes 一行不写，审核 accept 时若只能拿到
  *   after_text，就只能硬编码 normal/semantic/self，等于把"当时为什么这样判"丢掉了。
+ * - v7（2026-11-27，分层画像）：nodes 只加 `layer TEXT NULL` 一列（fact/lesson/user；NULL=未分层）。
+ *   不加 CHECK：老库 ALTER 加 CHECK 不可行；取值由写入层白名单保证（decide.js validLayer），
+ *   读路径把未知值当 NULL（profile 只认 IN 三值）。
  * - 旧库（v1）由 ensureSchema 幂等迁移：PRAGMA table_info(writes) 无 payload 才 ALTER；高版本仍拒绝。
  * - 双时态：valid_at/invalid_at（事实时间）+ created_at/expired_at（系统时间）。
  * - 软删：只改 status（archived/superseded/stale），除配置到期归档外不物理删。
@@ -25,16 +28,18 @@
  */
 import { qualityOrderSql } from './node-rank.js'
 
-export const SCHEMA_VERSION = 6
+export const SCHEMA_VERSION = 7
 
 /**
  * 对既有表的加法列：[表, 列, 类型]。迁移与 DDL 必须保持一致。
  * v1→v2：writes.payload（影子候选决策载荷）。
  * v2→v3：nodes.pinned（规则置顶标记）。
+ * v6→v7：nodes.layer（分层标签；NULL=未分层）。
  */
 const ADDITIVE_COLUMNS = [
   ['writes', 'payload', 'TEXT'],
   ['nodes', 'pinned', 'INTEGER NOT NULL DEFAULT 0'],
+  ['nodes', 'layer', 'TEXT'],
 ]
 
 export const DDL = `
@@ -68,6 +73,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   weight        REAL NOT NULL DEFAULT 1.0,
   hits          INTEGER NOT NULL DEFAULT 0,
   pinned        INTEGER NOT NULL DEFAULT 0,          -- v3：规则置顶（每会话首次注入）
+  layer         TEXT NULL,                           -- v7：分层标签 fact/lesson/user（NULL=未分层）
   last_hit_at   REAL,
   vector_state  TEXT NOT NULL DEFAULT 'none'
                 CHECK (vector_state IN ('none','pending','ready','failed')),

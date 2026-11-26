@@ -19,6 +19,14 @@ export const LEVEL_OF_KIND = Object.freeze({
 export const TYPE_OF_KIND = Object.freeze({
   lesson: 'procedural', decision: 'semantic', preference: 'semantic', fact: 'semantic', rule: 'procedural',
 })
+/**
+ * 蒸馏条目 kind → nodes.layer（v7 单一映射表；rule 只产提案、open_loop 不落库，故都无 layer）。
+ * 为什么集中在这里：与 LEVEL_OF_KIND/TYPE_OF_KIND 同处一处定义，dispatch 与 reconcile 共用，
+ * 禁止在落库侧再写一张 switch（铁律 2）。
+ */
+export const LAYER_OF_KIND = Object.freeze({
+  lesson: 'lesson', decision: 'fact', fact: 'fact', preference: 'user',
+})
 
 /**
  * 执行分流阶段。
@@ -82,6 +90,7 @@ export async function dispatchPhase({
         source: 'self',
         level: LEVEL_OF_KIND[item.kind] || 'normal',
         memoryType: TYPE_OF_KIND[item.kind] || 'semantic',
+        layer: LAYER_OF_KIND[item.kind],
         tags: ['session-wrap', ...(Array.isArray(item.tags) ? item.tags : [])].slice(0, 8),
       })
       list[i] = {

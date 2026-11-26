@@ -28,6 +28,8 @@ export const TEXT_LIMIT = 500
 
 const LEVELS = new Set(['core', 'important', 'normal'])
 const MEMORY_TYPES = new Set(['semantic', 'procedural', 'episodic', 'mixed'])
+/** 分层标签（v7）合法值：DB 无 CHECK，写入层白名单是唯一保证。 */
+const LAYERS = new Set(['fact', 'lesson', 'user'])
 /** 事件来源 → nodes.source（schema CHECK 只认这几种，'chat'/'search' 不是合法列值）。 */
 const SOURCE_MAP = {
   chat: 'self',
@@ -666,6 +668,20 @@ export function validLevel(level) {
 export function validMemoryType(type) {
   const v = String(type ?? '')
   return MEMORY_TYPES.has(v) ? v : 'semantic'
+}
+
+/**
+ * 分层标签（v7）：只允许 fact/lesson/user，其余（含缺省/旧调用方/脏导入）一律 NULL。
+ *
+ * 为什么不在 DB 加 CHECK：老库走 ALTER TABLE 加不了 CHECK；且未知值的语义是"未分层"
+ * （读路径按 NULL 处理），用写入层白名单 + 读路径 IN 三值同样安全，且迁移不需要重建表。
+ *
+ * @param {unknown} layer
+ * @returns {'fact'|'lesson'|'user'|null}
+ */
+export function validLayer(layer) {
+  const v = String(layer ?? '')
+  return LAYERS.has(v) ? v : null
 }
 
 /** expired_at：只在显式传入有限正数时落库。 */

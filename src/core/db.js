@@ -36,8 +36,8 @@ function sqlString(value) {
  *
  * 为什么必须在 ensureSchema 之前做：v2→v3 是 ALTER TABLE，虽然只加列，但一旦库里数据/索引
  * 状态异常，回退只能靠迁移前整库快照；覆盖式备份会毁掉唯一可回滚点。
- * 为什么失败不阻断启动：记忆是 fail-open 组件，快照失败（磁盘满/权限）不该让对话起不来；
- * 返回 `{ performed:false, reason }` 由调用方决定是否告警，迁移本身仍继续。
+ * 为什么失败返回而不是抛：本函数只负责取证；是否阻断由调用方按版本策略决定
+ * （v7 起 fail-closed：没有回滚点就不迁移；见 openDb）。
  *
  * @param {import('node:sqlite').DatabaseSync} db
  * @param {string} dataDir 库所在目录（决定 backup/ 落点）
@@ -67,6 +67,26 @@ export function backupOnMigrate(db, dataDir) {
   } catch (err) {
     return { performed: false, reason: String(err?.message || err) }
   }
+}
+
+/** 迁移快照失败的稳定错误码：面板/health 按 code 显示，不靠匹配文案。 */
+export const MIGRATION_BACKUP_FAILED = 'migration_backup_failed'
+
+/**
+ * 构造 fail-closed 迁移错误：`migration_backup_failed:<reason>`。
+ *
+ * 为什么把 reason 并进 message 而不是只放字段：统一错误出口只会把 message 记日志，
+ * 面板离线卡渲染的是 `[<code>]`；reason 跟着 code 一起出现才是可行动的。
+ *
+ * @param {unknown} reason 快照失败原因（磁盘满/权限/路径非法等）
+ * @returns {Error & { code: string, reason: string }}
+ */
+export function migrationBackupError(reason) {
+  const text = String(reason ?? 'unknown') || 'unknown'
+  const err = new Error(`${MIGRATION_BACKUP_FAILED}:${text}`)
+  err.code = MIGRATION_BACKUP_FAILED
+  err.reason = text
+  return err
 }
 
 function statSyncSafe(path) {
@@ -137,8 +157,9 @@ function readSchemaVersion(db) {
 /**
  * @param {string} dataDir 数据目录（不存在则创建）
  * @param {{ readOnly?: boolean, backupOnMigrate?: boolean }} [opts]
- *   backupOnMigrate=false：跳过快照（单测/临时库可用；生产默认开）。
+ *   backupOnMigrate=false：跳过快照与 v7 fail-closed 闸（单测/临时库专用；生产默认开）。
  * @returns {import('node:sqlite').DatabaseSync}
+ * @throws {Error & { code?: string }} 迁移快照失败时 `code='migration_backup_failed'`，且**不执行迁移**
  */
 export function openDb(dataDir, { readOnly = false, backupOnMigrate: doBackup = true } = {}) {
   const raw = String(dataDir ?? '').trim()
@@ -177,6 +198,12 @@ export function openDb(dataDir, { readOnly = false, backupOnMigrate: doBackup = 
       if (doBackup && current > 0 && current < SCHEMA_VERSION) {
         // 快照结果挂在连接上供诊断（db.js 无 logger；不阻断、不静默：调用方可读）。
         db.migrationBackup = backupOnMigrate(db, dir)
+        // v7 起 fail-closed：没有回滚点就不迁移。任何 current<7 的升级都包含 v7 的 ALTER，
+        // 半迁移的库既回不到旧 schema，也没有快照可恢复——宁可整体不可用（backend.ready=false、
+        // hook/工具 fail-open 跳过、health 显示原因），也不留下一个"看起来能跑"的混合态。
+        if (db.migrationBackup.performed !== true) {
+          throw migrationBackupError(db.migrationBackup.reason)
+        }
       }
       db.schemaInfo = ensureSchema(db)
     }

@@ -49,14 +49,16 @@ function makeV2Db(dir) {
   insertNode(db, { id: 'n2', text: '旧库事实二：DSH 端口 3080', workspace: '/home/hy/hy' })
   db.exec('DROP INDEX IF EXISTS idx_nodes_pinned')
   db.exec('ALTER TABLE nodes DROP COLUMN pinned')
+  // v7 也回退掉：v2 库不该有 layer 列；迁移必须把它补上（与 pinned 同一套 ADD COLUMN 判据）。
+  db.exec('ALTER TABLE nodes DROP COLUMN layer')
   db.close()
 }
 
-test('新库：DDL 直接带 pinned 列与 idx_nodes_pinned，版本=6', (t) => {
+test('新库：DDL 直接带 pinned/layer 列与 idx_nodes_pinned，版本=7', (t) => {
   const dir = tmpDir()
   const db = openDb(dir)
   t.after(() => closeDb(db))
-  assert.equal(SCHEMA_VERSION, 6)
+  assert.equal(SCHEMA_VERSION, 7)
   const cols = db.prepare('PRAGMA table_info(nodes)').all().map((c) => c.name)
   assert.ok(cols.includes('pinned'), 'nodes 必须有 pinned')
   const pinnedCol = db.prepare('PRAGMA table_info(nodes)').all().find((c) => c.name === 'pinned')
@@ -64,20 +66,19 @@ test('新库：DDL 直接带 pinned 列与 idx_nodes_pinned，版本=6', (t) => 
   assert.equal(String(pinnedCol.dflt_value), '0')
   const idx = db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_nodes_pinned'").get()
   assert.ok(idx, 'pinned 索引必须存在')
-  assert.equal(String(db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value), '6')
+  assert.equal(String(db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value), '7')
 })
 
-test('v2→v6：补 pinned 列（旧行全 0）、FTS 不变、重复打开幂等且只快照一次', (t) => {
+test('v2→v7：补 pinned/layer 列（旧行全 0/NULL）、FTS 不变、重复打开幂等且只快照一次', (t) => {
   const dir = tmpDir()
   makeV2Db(dir)
 
   const db = openDb(dir)
   const cols = db.prepare('PRAGMA table_info(nodes)').all().map((c) => c.name)
   assert.ok(cols.includes('pinned'), '迁移后必须有 pinned')
-  assert.equal(String(db.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value), '6')
-
-  const rows = db.prepare('SELECT id,pinned FROM nodes ORDER BY id').all()
-  assert.deepEqual(rows.map((r) => [r.id, Number(r.pinned)]), [['n1', 0], ['n2', 0]], '旧行默认不置顶')
+  assert.ok(cols.includes('layer'), '迁移后必须有 layer')
+  const rows = db.prepare('SELECT id,pinned,layer FROM nodes ORDER BY id').all()
+  assert.deepEqual(rows.map((r) => [r.id, Number(r.pinned), r.layer]), [['n1', 0, null], ['n2', 0, null]], '旧行默认不置顶、未分层')
 
   // FTS 闸门：迁移不得让索引与节点失配（docsize 才是真索引行数）。
   const nodes = Number(db.prepare('SELECT count(*) AS n FROM nodes').get().n)
@@ -99,8 +100,8 @@ test('v2→v6：补 pinned 列（旧行全 0）、FTS 不变、重复打开幂�
   assert.equal(Number(db2.prepare('SELECT count(*) AS n FROM nodes_fts_docsize').get().n), nodes)
 
   // ensureSchema 反复执行不报错（迁移的幂等性由列存在性判断，不看版本号）。
-  assert.deepEqual(ensureSchema(db2), { version: 6, deduped: 0, uniqueIndex: true })
-  assert.deepEqual(ensureSchema(db2), { version: 6, deduped: 0, uniqueIndex: true })
+  assert.deepEqual(ensureSchema(db2), { version: 7, deduped: 0, uniqueIndex: true })
+  assert.deepEqual(ensureSchema(db2), { version: 7, deduped: 0, uniqueIndex: true })
 })
 
 test('迁移快照：VACUUM INTO 可打开、只保留最新 MAX_BACKUPS 份', (t) => {
@@ -122,7 +123,7 @@ test('迁移快照：VACUUM INTO 可打开、只保留最新 MAX_BACKUPS 份', (
   // 快照必须是可打开的完整 SQLite 库（不是空文件/坏页）
   const snap = new DatabaseSync(out.path, { readOnly: true })
   try {
-    assert.equal(String(snap.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value), '6')
+    assert.equal(String(snap.prepare("SELECT value FROM meta WHERE key='schema_version'").get().value), '7')
   } finally {
     snap.close()
   }

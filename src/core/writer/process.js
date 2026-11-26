@@ -34,7 +34,7 @@ export function validAtOf(event, ts) {
   return Number.isFinite(n) && n > 0 && n <= ts ? n : ts
 }
 
-export function insertNodeRow(db, event, text, { ts, validAt, source, origin, level, memoryType, expiredAt }) {
+export function insertNodeRow(db, event, text, { ts, validAt, source, origin, level, memoryType, layer, expiredAt }) {
   const ident = normalizeIdentity(event?.identity)
   const hash = contentHash(text)
   // v3：规则置顶随事件下传；只有显式 1/true 才算置顶（导入/旧调用方默认 0）。
@@ -47,13 +47,14 @@ export function insertNodeRow(db, event, text, { ts, validAt, source, origin, le
     at += 1
     id = `n${at}_${hash.slice(0, 10)}`
   }
+  // v7：layer 由写入口（backend.write / 导入）收敛成三值或 NULL，这里只落列不重判。
   db.prepare(`INSERT INTO nodes
     (id,text,text_hash,text_bigrams,level,memory_type,source,status,role_id,user_id,workspace,tags,
-     context_note,weight,pinned,hits,vector_state,origin,trace_id,valid_at,expired_at,created_at,updated_at)
-    VALUES (?,?,?,?,?,?,?,'active',?,?,?,?,?,1,?,0,'none',?,?,?,?,?,?)`).run(
+     context_note,weight,pinned,layer,hits,vector_state,origin,trace_id,valid_at,expired_at,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,'active',?,?,?,?,?,1,?,?,0,'none',?,?,?,?,?,?)`).run(
     id, text, hash, bigrams(text), level, memoryType, source,
     ident.roleId, ident.userId, ident.workspace,
-    JSON.stringify(normalizeTags(event?.tags)), '', pinned,
+    JSON.stringify(normalizeTags(event?.tags)), '', pinned, layer ?? null,
     origin, String(event?.traceId ?? ''),
     validAt, expiredAt, ts, ts,
   )
@@ -173,8 +174,8 @@ function ingestGate(event, policy, options) {
  * - ADD：插新节点（active），valid_at=本次时间。
  * - MERGE：改目标节点的 text/text_hash/text_bigrams/updated_at，不新增节点；同 origin 复写或
  *   相似合并时若事件带 expired_at 则同时续期。来源升级（source_upgrade）只改 source/updated_at。
- * - SUPERSEDE：插新节点；旧节点 status='superseded'、invalid_at/expired_at=本次时间、superseded_by=新 id；
- *   并写 supersede 边。
+ * - SUPERSEDE：插新节点（layer 用本次事件）；旧节点 status='superseded'、invalid_at/expired_at=本次时间、
+ *   superseded_by=新 id；并写 supersede 边。MERGE 不改目标 layer（一次写入不得升级/清空分层）。
  * - REVIEW：插新节点 + mutex 边（同词不同义，永不扩散）。
  * - NOOP：目标 hits+1、last_hit_at=本次时间。
  * - CANDIDATE：不进 nodes，只写 writes（影子审核队列）。
@@ -297,6 +298,7 @@ function processEventInTx(db, event, config = {}) {
         origin: String(event?.origin ?? ''),
         level: validLevel(event?.level),
         memoryType: validMemoryType(event?.memory_type),
+        layer: event?.layer ?? null,
         expiredAt: validExpiredAt(event?.expired_at),
       }))
     } catch (err) {
@@ -322,6 +324,7 @@ function processEventInTx(db, event, config = {}) {
           origin: String(event?.origin ?? ''),
           level: validLevel(event?.level),
           memoryType: validMemoryType(event?.memory_type),
+          layer: event?.layer ?? null,
           expiredAt: validExpiredAt(event?.expired_at),
         })
       } catch (err) {

@@ -8,7 +8,7 @@ export const NODE_EXPORT_FIELDS = [
   'id', 'role_id', 'user_id', 'workspace', 'text', 'level', 'memory_type', 'source', 'status',
   'tags', 'context_note', 'weight', 'pinned', 'hits', 'last_hit_at', 'vector_state',
   'created_at', 'updated_at', 'valid_at', 'invalid_at', 'expired_at', 'superseded_by',
-  'origin', 'trace_id', 'text_hash',
+  'origin', 'trace_id', 'text_hash', 'layer',
 ]
 
 /**

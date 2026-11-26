@@ -13,7 +13,7 @@ import { updateRun } from '../../core/wrap-runs.js'
 import { recordWrite } from '../../core/writer.js'
 import { ingestItem, runPatchOf } from './ingest.js'
 import { collectModelText } from './distill.js'
-import { KINDS_WRITTEN, LEVEL_OF_KIND, TYPE_OF_KIND, WRAP_ORIGIN } from './dispatch.js'
+import { KINDS_WRITTEN, LAYER_OF_KIND, LEVEL_OF_KIND, TYPE_OF_KIND, WRAP_ORIGIN } from './dispatch.js'
 
 const DEFAULTS = Object.freeze({ topK: 5, maxNeighborChars: 200 })
 
@@ -179,7 +179,8 @@ export async function applyReconcile({
       } else {
         const written = await ingestItem({
           backend, item: { ...item, text }, identity, runId, ingest,
-          origin: WRAP_ORIGIN, source: 'self', level, memoryType, tags: tags.slice(0, 8),
+          origin: WRAP_ORIGIN, source: 'self', level, memoryType, layer: LAYER_OF_KIND[kind],
+          tags: tags.slice(0, 8),
         })
         list[i] = {
           ...item, status: written.status, nodeId: written.nodeId || '',

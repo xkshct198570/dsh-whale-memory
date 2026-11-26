@@ -1,7 +1,7 @@
 // 职责：backend 本地底座——LocalBackend 类本体（连接/健康/迁移/dispose）与三域方法装配。
 // 依赖方向：base/db/workers 门面 ← 本文件；被 hybrid-bridge 引用；不 import host，也不 import 其它域的内部文件。
 
-import { closeDb, openDb, setMeta } from '../db.js'
+import { closeDb, migrationBackupError, openDb, setMeta } from '../db.js'
 import { DbWorkerClient } from '../workers/index.js'
 import { installMethods } from './base.js'
 import { queryApi } from './query-api.js'
@@ -34,6 +34,9 @@ export class LocalBackend {
       ? (typeof config === 'function' ? config : () => config)
       : () => ({ write: { reviewMode: 'auto' } })
     this.writeQueue = null
+    // 迁移快照 fail-closed 的原因（进程内记忆）。为什么记忆：快照失败是确定性阻断，
+    // 每步 retry 会反复跑 VACUUM INTO 失败路径（P1-10 类自愈死循环）；修复后由重启重试。
+    this.openBlocked = ''
   }
 
   /**
@@ -44,10 +47,24 @@ export class LocalBackend {
     try { this._db(); return true } catch { return false }
   }
 
+  /** 迁移 fail-closed 阻断原因（空串=未阻断）；面板/health 只读展示。 */
+  get openError() {
+    return this.openBlocked
+  }
+
   _db() {
     if (this.closed) throw new Error('backend_disposed')
+    if (this.openBlocked) throw migrationBackupError(this.openBlocked)
     if (!this.db) {
-      this.db = openDb(this.dataDir || undefined)
+      try {
+        this.db = openDb(this.dataDir || undefined)
+      } catch (err) {
+        // 只记忆 fail-closed 原因；busy/权限抖动等瞬时错误保持可重试（原有语义）。
+        if (err?.code === 'migration_backup_failed') {
+          this.openBlocked = String(err.reason || err.message || 'unknown')
+        }
+        throw err
+      }
       this.dbPath = this.db.prepare('PRAGMA database_list').get()?.file || this.dbPath
       setMeta(this.db, 'boot_id', String(process.pid))
       const info = this.db.schemaInfo

@@ -39,6 +39,8 @@ export function makeBackendView({ backend, config }) {
       protocol: status ? (status.protocol ?? null) : WHALE_PROTOCOL,
       expected: String(status?.expected || WHALE_PROTOCOL),
       match: status ? Boolean(status.ok) : true,
+      // 迁移 fail-closed 原因（未阻断时省略该键）：面板离线卡要能说出"为什么打不开"，而不是只说不可用。
+      ...(backend?.openError ? { reason: String(backend.openError) } : {}),
     }
   }
 }

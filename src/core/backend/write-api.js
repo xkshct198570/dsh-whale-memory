@@ -3,7 +3,7 @@
 
 /** @typedef {import('./base.js').Identity} Identity */
 
-import { createWriteQueue, isActiveHashConflict, isProtectedTarget, recordEvolution, withTx, writePayload } from '../writer.js'
+import { createWriteQueue, isActiveHashConflict, isProtectedTarget, recordEvolution, validLayer, withTx, writePayload } from '../writer.js'
 import { bigrams, contentHash, normalize } from '../tokenize.js'
 import { now } from '../db.js'
 import { applyNeighborNotes, parseTags } from '../relations.js'
@@ -46,7 +46,7 @@ export const writeApi = {
   /**
    * 写入入口（S4 决策流水线）：校验 → 落 jobs 队列 → decideWrite → processEvent。
    * shadow 模式只留 writes CANDIDATE，不落 nodes；auto 模式才写记忆库。
-   * @param {{ text:string, level?:string, memory_type?:string, source?:string, tags?:string[], expired_at?:number, origin?:string, traceId?:string, identity:Identity }} q
+   * @param {{ text:string, level?:string, memory_type?:string, source?:string, tags?:string[], expired_at?:number, origin?:string, traceId?:string, identity:Identity, layer?:string }} q
    */
   async write(q) {
     const text = normalize(String(q?.text || ''))
@@ -70,6 +70,8 @@ export const writeApi = {
       memory_type: q?.memory_type || 'semantic',
       // v3：规则置顶随事件下传（writer 落库；默认 0，不改变既有写入口行为）。
       pinned: q?.pinned === 1 || q?.pinned === true ? 1 : 0,
+      // v7：分层标签在写入口收敛成三值或 NULL（模型工具/面板/旧调用方不带 kind → NULL）。
+      layer: validLayer(q?.layer),
       expired_at: Number.isFinite(Number(q?.expired_at)) ? Number(q.expired_at) : undefined,
       // 内部写入口专用：单条强制 shadow（旧调用方；session-wrap 现改用 ingestPolicy.mode='review'）。
       // 路由 /write 不透传该字段，外部无法用它做除“更保守”以外的任何事。

@@ -5,7 +5,7 @@
  * “被测试当查询键”的偶然覆盖（删 origin 全绿且往返丢值）。这里用冻结清单锁键集与顺序，
  * 并验 export→import 往返保真；删任一字段 → 键集断言红，导入侧丢值 → 往返断言红。
  *
- * 注意：导出 25 列（`text_bigrams` 是 INSERT 派生列，不在导出白名单）。
+ * 注意：导出 26 列（`text_bigrams` 是 INSERT 派生列，不在导出白名单；v7 `layer` 追加在末尾）。
  * 已知存量缺陷（P3e 冻结期只登记不修）：导出 `tags` 是 JSON 字符串，导入侧只认数组，
  * 故 export→import 会把 tags 清空；修复需改导入侧类型兼容，单独立项。
  */
@@ -21,7 +21,7 @@ const EXPECTED_EXPORT_FIELDS = [
   'id', 'role_id', 'user_id', 'workspace', 'text', 'level', 'memory_type', 'source', 'status',
   'tags', 'context_note', 'weight', 'pinned', 'hits', 'last_hit_at', 'vector_state',
   'created_at', 'updated_at', 'valid_at', 'invalid_at', 'expired_at', 'superseded_by',
-  'origin', 'trace_id', 'text_hash',
+  'origin', 'trace_id', 'text_hash', 'layer',
 ]
 
 const ident = { userId: 'u-origin', roleId: '', workspace: 'web' }
@@ -36,7 +36,7 @@ function parseJsonl(jsonl) {
   return String(jsonl || '').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
 }
 
-test('导出键集与顺序 == 冻结白名单（25 字段）', async () => {
+test('导出键集与顺序 == 冻结白名单（26 字段）', async () => {
   const { backend: b, dir } = fresh()
   try {
     const w = await b.write({ text: '导出契约：网关端口规则', identity: ident, origin: 'gateway.py:3982' })

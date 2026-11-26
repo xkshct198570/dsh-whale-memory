@@ -6,7 +6,7 @@
  */
 import { privacyCheck } from './writer/privacy.js'
 import {
-  slotsOf, contradiction, timeOverlap, findCandidates, decideWrite, isProtectedTarget,
+  slotsOf, contradiction, timeOverlap, findCandidates, decideWrite, isProtectedTarget, validLayer,
 } from './writer/decide.js'
 import {
   isActiveHashConflict, withTx, recordWrite, recordEvolution, writePayload,
@@ -18,6 +18,6 @@ import { createWriteQueue } from './writer/queue.js'
 export {
   privacyCheck,
   slotsOf, contradiction, timeOverlap, findCandidates, decideWrite,
-  isProtectedTarget, isActiveHashConflict, withTx, recordWrite, recordEvolution, writePayload,
+  isProtectedTarget, validLayer, isActiveHashConflict, withTx, recordWrite, recordEvolution, writePayload,
   processEvent, createWriteQueue,
 }

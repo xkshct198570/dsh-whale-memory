@@ -5,7 +5,7 @@
 
 import { getMeta, now, setMeta } from '../db.js'
 import { bigrams, contentHash, normalize } from '../tokenize.js'
-import { isActiveHashConflict, recordWrite } from '../writer.js'
+import { isActiveHashConflict, recordWrite, validLayer } from '../writer.js'
 import { NODE_EXPORT_FIELDS, identityFilter } from './base.js'
 
 /** 导入字段白名单（非法枚举回落默认，避免把 export 的脏值写进 CHECK 约束）。 */
@@ -32,12 +32,13 @@ const ERROR_DETAIL_LIMIT = 20
  * 导入 INSERT：显式列出全部可保真字段（v1 导入写死 active/''/1/0/none 会让
  * superseded/archived/stale 在 export→import 后复活）。
  * v3 起补 `pinned`：规则置顶是节点属性，导出/导入必须往返（旧 JSONL 缺列按 0）。
+ * v7 起补 `layer`：分层标签必须往返（旧 JSONL 缺列按 NULL），否则灾备/迁移静默丢分层。
  */
 const IMPORT_INSERT_SQL = `INSERT INTO nodes
   (id,text,text_hash,text_bigrams,level,memory_type,source,status,role_id,user_id,workspace,tags,
    context_note,weight,pinned,hits,last_hit_at,vector_state,origin,trace_id,valid_at,invalid_at,expired_at,
-   superseded_by,created_at,updated_at)
-  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+   superseded_by,layer,created_at,updated_at)
+  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
 
 /** 枚举回落。 @param {unknown} value @param {Set<string>} allowed @param {string} fallback */
 function pickEnum(value, allowed, fallback) {
@@ -140,6 +141,8 @@ function planImportRows(row, identity, { ts, seq, forceIdentity = false }) {
     superseded_by: row?.superseded_by === null || row?.superseded_by === undefined || row?.superseded_by === ''
       ? null
       : String(row.superseded_by),
+    // v7：只认三值（未知/缺列→NULL）。这里与 write 路径共用 validLayer，判据只有一处实现。
+    layer: validLayer(row?.layer),
     created_at: finiteOr(row?.created_at, ts),
     updated_at: finiteOr(row?.updated_at, ts),
   }
@@ -256,7 +259,7 @@ function landImportRows(db, items, { insert, exists, dryRun = false }) {
           node.context_note, node.weight, node.pinned, node.hits, node.last_hit_at,
           node.vector_state, node.origin, node.trace_id,
           node.valid_at, node.invalid_at, node.expired_at, node.superseded_by,
-          node.created_at, node.updated_at,
+          node.layer, node.created_at, node.updated_at,
         )
       } catch (err) {
         // 并发竞态：别的进程刚插了同文 → 索引拒绝；按“已存在”跳过，不让整批回滚/失败。

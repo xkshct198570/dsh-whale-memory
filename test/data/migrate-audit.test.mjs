@@ -184,7 +184,7 @@ test('dry-run：计数/映射/FTS/双读齐全，且不写边、不备份', asyn
     const { report, markdown } = await runAudit(auditOpts(dirs))
     assert.equal(report.mode, 'dry-run')
     assert.equal(report.python.schemaVersion, '4')
-    assert.equal(report.plugin.schemaVersion, '6')
+    assert.equal(report.plugin.schemaVersion, '7')
     assert.equal(report.python.nodes.total, 6)
     assert.equal(report.python.nodes.active, 5)
     assert.equal(report.python.nodes.archived, 1)
