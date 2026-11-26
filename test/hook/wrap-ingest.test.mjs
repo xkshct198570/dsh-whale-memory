@@ -165,3 +165,44 @@ test('reconcile：ADD 走 ingestPolicy、ARCHIVE 仍 CANDIDATE、NOOP 只审计�
   assert.deepEqual(saved.distilled.counts, { ingested: 1, reviewed: 1, skipped: 0 })
   assert.equal(saved.candidates, 1)
 })
+
+test('reconcile 续跑：终态条目不得重放（已入库不会被改 NOOP，计数不丢）', async (t) => {
+  const { db, run, withDb } = freshWrap(t)
+  const items = [
+    { kind: 'lesson', text: '动库前必须先备份', confidence: 0.9 },
+    { kind: 'fact', text: '发布前必须跑全量门禁', confidence: 0.9 },
+  ]
+  const decisions = items.map((item, i) => ({ item: i, op: 'ADD', targetId: '', afterText: item.text, reason: 'new' }))
+  let failOnce = true
+  const backend = {
+    writes: [],
+    async write(q) {
+      this.writes.push(q)
+      if (failOnce && String(q.text) === '发布前必须跑全量门禁') {
+        failOnce = false
+        return { ok: false, error: 'db_locked' }
+      }
+      return { ok: true, id: `n-${this.writes.length}`, action: 'ADD' }
+    },
+  }
+  const first = await applyReconcile({
+    items, distilled: { items }, spool: { identity: IDENT }, runId: run.id,
+    decisions, rejected: [], config: {}, backend, ingest: INGEST, withDb,
+  })
+  assert.equal(first.items[0].status, 'ingested')
+  assert.equal(first.items[1].status, 'write_failed:db_locked')
+  assert.equal(backend.writes.length, 2)
+  const runAfterFirst = getRun(db, run.id)
+  assert.deepEqual(runAfterFirst.distilled.counts, { ingested: 1, reviewed: 0, skipped: 0 })
+
+  // 重试：只补 write_failed 的那条；已入库条目不得再次写库
+  const second = await applyReconcile({
+    items: first.items, distilled: { items: first.items }, spool: { identity: IDENT }, runId: run.id,
+    decisions, rejected: [], config: {}, backend, ingest: INGEST, withDb,
+  })
+  assert.equal(backend.writes.length, 3, '第二遍只允许补写失败条目一次')
+  assert.equal(second.items[0].status, 'ingested')
+  assert.equal(second.items[1].status, 'ingested')
+  const runAfterSecond = getRun(db, run.id)
+  assert.deepEqual(runAfterSecond.distilled.counts, { ingested: 2, reviewed: 0, skipped: 0 })
+})

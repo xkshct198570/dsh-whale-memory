@@ -24,6 +24,8 @@ function seedDb(t) {
   }
   // durable → 应自动入库
   insert('CANDIDATE', '动库前必须先备份并校验备份可恢复', { origin: 'session-wrap', shadowOf: 'ADD', source: 'self' })
+  // 真实旧 payload 一律 source='owner'（0.7.3 硬编码）：迁移必须归一到 self，否则落保护面。
+  insert('CANDIDATE', '发布前必须跑全量门禁并检查退出码', { origin: 'session-wrap', shadowOf: 'ADD', source: 'owner' })
   // stale → 应 REJECT
   insert('CANDIDATE', '0.7.3 live 重启后六页签验证通过', { origin: 'session-wrap', shadowOf: 'ADD', source: 'self' })
   // 歧义 → 仍是审核候选（且第二遍不得重复处理）
@@ -60,7 +62,8 @@ test('dry-run：只读、零副作用；apply：备份+重放+MIGRATED；第二�
   const before = rowsOf(path)
 
   const dry = run({ db: path, apply: false })
-  assert.equal(dry.candidates, 3, 'ARCHIVE/无身份由 SQL 排除，只计划可迁移的 3 条')
+  assert.equal(dry.candidates, 6, '全部 CANDIDATE 都进计划（ARCHIVE/无身份在计划阶段显式跳过）')
+  assert.equal(dry.skipped, 2, 'ARCHIVE 与无身份必须可见地跳过')
   assert.equal(dry.migrated, 0)
   assert.equal(dry.backup, '')
   assert.deepEqual(rowsOf(path), before, 'dry-run 不得写库')
@@ -68,14 +71,15 @@ test('dry-run：只读、零副作用；apply：备份+重放+MIGRATED；第二�
   const applied = run({ db: path, apply: true })
   assert.ok(applied.backup && existsSync(applied.backup), 'apply 必须先备份')
   assert.ok(statSync(applied.backup).size > 0)
-  assert.equal(applied.migrated, 3, 'durable/stale/歧义三条被重放')
+  assert.equal(applied.migrated, 4, 'durable×2/stale/歧义四条被重放')
+  assert.equal(applied.skipped, 2)
   assert.equal(applied.rejected, 1, 'stale 落 REJECT 且原行 MIGRATED')
   assert.equal(applied.review, 1, '歧义仍产审核候选')
   assert.equal(applied.normalized, 1, '历史 auto_ingested REJECT 归一 MIGRATED')
 
   const after = rowsOf(path)
   const migrated = after.filter((row) => row.action === 'MIGRATED')
-  assert.equal(migrated.length, 4, '三条候选原行 + 1 条历史 auto_ingested REJECT 归一 MIGRATED')
+  assert.equal(migrated.length, 5, '四条候选原行 + 1 条历史 auto_ingested REJECT 归一 MIGRATED')
   const rejects = after.filter((row) => row.action === 'REJECT')
   assert.ok(rejects.every((row) => String(row.trace_id || '').startsWith('migrate:')), '只允许迁移重放产生的 REJECT 审计行')
   assert.ok(migrated.some((row) => String(row.reason).startsWith('migrated:ADD:') && row.node_id))
@@ -85,11 +89,12 @@ test('dry-run：只读、零副作用；apply：备份+重放+MIGRATED；第二�
     '歧义候选由迁移重建，并带 migrate: 前缀供幂等排除')
 
   const landed = nodesOf(path).filter((row) => row.status === 'active')
-  assert.equal(landed.length, 1, 'durable 只落 1 条 active')
-  assert.equal(landed[0].source, 'self')
+  assert.equal(landed.length, 2, '两条 durable 各落 1 条 active')
+  assert.ok(landed.every((row) => row.source === 'self'), '迁移落库一律 source=self（旧 owner payload 必须归一）')
 
   const second = run({ db: path, apply: true })
-  assert.equal(second.candidates, 0, '第二遍不得再选中已迁移/迁移产候选')
+  assert.equal(second.candidates, 2, '第二遍只剩 ARCHIVE/无身份两条（仍可见地跳过）')
+  assert.equal(second.skipped, 2)
   assert.equal(second.migrated, 0)
   assert.equal(second.normalized, 0)
   assert.deepEqual(rowsOf(path), after, '第二遍计数不变、行不变')

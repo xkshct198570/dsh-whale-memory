@@ -361,6 +361,14 @@ test('设置项元数据单处定义：70 叶子默认值对齐 config.js', () =
   }
 })
 
+test('三层叶子设置卡 id 与元数据映射对齐（wrap.ingest.*）', () => {
+  assert.ok(CLIENT.includes("out['wm-' + key.split('.').join('-')] = meta"),
+    '元数据 id 必须把全部分段用 - 连接（否则三层叶子查不到默认值/徽标）')
+  for (const key of ['ingest-mode', 'ingest-minConfidence', 'ingest-dropTaskInstructions']) {
+    assert.ok(CLIENT.includes(`idOf('wrap', '${key}')`), `设置卡 id 缺少 ${key}`)
+  }
+})
+
 test('生效徽标按 config.js 的 .volatile() 快照对齐（含 7 处纠错）', () => {
   const meta = settingsMeta()
   const schema = configSchema()

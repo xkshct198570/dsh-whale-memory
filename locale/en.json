@@ -861,7 +861,7 @@
   "overview.wrapLoadFailed": "Failed to load wrap status",
   "overview.wrapCandidates": "Pending review",
   "overview.wrapIngested": "Ingested",
-  "overview.wrapSkipped": "Skipped",
+  "overview.wrapSkippedCount": "Skipped",
   "overview.wrapProposals": "Rule proposals",
   "overview.wrapOpenLoops": "Open loops",
   "overview.wrapSwitchReady": "Ready to switch",

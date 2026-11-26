@@ -139,10 +139,14 @@ function normalizeIngestPolicy(raw) {
  *
  * @returns {object|null} decision；null 表示放行到 decideWrite（mode=auto + reviewToCandidate）
  */
-function ingestGate(event, policy, options) {
+function identityGate(event) {
   const ident = normalizeIdentity(event?.identity)
   // 缺身份不落任何分区（含共享 ''）：否则收尾/工具写入会静默洗白成共享事实。
-  if (!ident.userId || !ident.workspace) return rejectDecision('identity_required')
+  // 这是安全闸：auto/review 两种 ingest 模式都必须过（review 只跳价值闸，不跳身份）。
+  return !ident.userId || !ident.workspace ? rejectDecision('identity_required') : null
+}
+
+function ingestGate(event, policy, options) {
   const raw = normalize(String(event?.text ?? ''))
   const kind = classifyDurability(raw)
   if (kind === DURABILITY.STALE) return rejectDecision('gate:stale')
@@ -203,9 +207,11 @@ function processEventInTx(db, event, config = {}) {
   const ingest = normalizeIngestPolicy(event?.__ingest)
   if (event?.__forceShadow === true || ingest?.mode === 'review') options.mode = 'shadow'
   else if (ingest) options.mode = 'auto'
-  const gated = ingest && ingest.mode === 'auto' && event?.__forceShadow !== true
+  // 身份闸先于模式：`mode=review` 只回退“价值闸”，不得让空 workspace 静默写共享分区。
+  const identReject = ingest ? identityGate(event) : null
+  const gated = identReject ?? (ingest && ingest.mode === 'auto' && event?.__forceShadow !== true
     ? ingestGate(event, ingest, options)
-    : null
+    : null)
   const decision = gated ?? decideWrite(db, event, {
     ...options,
     reviewToCandidate: ingest?.mode === 'auto' && event?.__forceShadow !== true,

@@ -861,7 +861,7 @@
   "overview.wrapLoadFailed": "締め状態を読み込めませんでした",
   "overview.wrapCandidates": "審査待ち",
   "overview.wrapIngested": "保存済み",
-  "overview.wrapSkipped": "スキップ",
+  "overview.wrapSkippedCount": "スキップ",
   "overview.wrapProposals": "ルール提案",
   "overview.wrapOpenLoops": "未完了の用事",
   "overview.wrapSwitchReady": "切り替え可能",

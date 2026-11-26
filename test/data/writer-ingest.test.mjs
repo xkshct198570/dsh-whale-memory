@@ -152,6 +152,14 @@ test('回退：ingest.mode=review 与 __forceShadow 都只产影候选，不落 
   const forced = processEvent(db, event('发布前必须跑全量门禁', { __forceShadow: true, __ingest: AUTO }), { write: { reviewMode: 'auto' } })
   assert.equal(forced.action, 'CANDIDATE')
   assert.equal(nodes(db).length, 0, '回退路径不得落节点')
+
+  // review 只回退价值闸，不跳身份闸：空 workspace 不得静默写共享分区。
+  const denied = processEvent(db, event('发布前必须跑全量门禁', {
+    identity: { userId: 'u1', roleId: '', workspace: '' }, __ingest: { ...AUTO, mode: 'review' },
+  }), { write: { reviewMode: 'auto' } })
+  assert.equal(denied.action, 'REJECT')
+  assert.equal(denied.reason, 'identity_required')
+  assert.equal(nodes(db).length, 0)
 })
 
 test('判重：同文 NOOP；字符袋相同（语序/极性）→ CANDIDATE word_order_ambiguous', (t) => {
@@ -237,4 +245,14 @@ test('非 ingest 调用（面板/导入）不受价值闸影响，行为与既�
   const res = processEvent(db, event('先备份再改代码', { __ingest: undefined }), { write: { reviewMode: 'auto' } })
   assert.equal(res.action, 'ADD', '没有 ingestPolicy 时不得套用价值闸')
   assert.ok(db.prepare('SELECT 1 FROM nodes WHERE text_hash=?').get(contentHash('先备份再改代码')))
+})
+
+test('normalize 小写后 stale 仍命中：PID 句必须 REJECT（不是审核候选）', (t) => {
+  const db = freshDb(t)
+  const res = ingest(db, 'PID 530716 是当前 dsh 进程')
+  assert.equal(res.action, 'REJECT')
+  assert.equal(res.reason, 'gate:stale')
+  const row = writeOf(db, 'REJECT')
+  assert.equal(row.before_text, null)
+  assert.equal(row.after_text, null)
 })

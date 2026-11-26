@@ -861,7 +861,7 @@
   "overview.wrapLoadFailed": "收尾状态读取失败",
   "overview.wrapCandidates": "待审",
   "overview.wrapIngested": "入库",
-  "overview.wrapSkipped": "跳过",
+  "overview.wrapSkippedCount": "跳过",
   "overview.wrapProposals": "规则提案",
   "overview.wrapOpenLoops": "待办",
   "overview.wrapSwitchReady": "可切会话",

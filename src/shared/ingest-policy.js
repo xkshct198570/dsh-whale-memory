@@ -14,7 +14,8 @@ export const DURABILITY = Object.freeze({
  * 一次性状态/版本计数事实：只能证明"当时"，不能进长期库。
  * 命中即 stale，优先级最高（先于任务句与 durable 词）。
  */
-export const STALE_RE = /0\.\d+\.\d+|schema v\d+|PID \d+|(测试|用例)\s*\d+|active\s*\d+|候选\s*\d+|已装|已生效|待重启|重启后|当前 live|交接件已就位/
+// 大小写不敏感：写入入口先 normalize（ASCII 小写）再分类，大写 PID 必须仍能命中。
+export const STALE_RE = /0\.\d+\.\d+|schema v\d+|PID \d+|(测试|用例)\s*\d+|active\s*\d+|候选\s*\d+|已装|已生效|待重启|重启后|当前 live|交接件已就位/i
 
 /**
  * 句首命令/计划句：任务指令不入长期记忆。

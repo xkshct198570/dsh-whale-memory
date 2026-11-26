@@ -141,7 +141,10 @@ export async function applyReconcile({
     const kind = String(item?.kind || '')
     if (!KINDS_WRITTEN.has(kind)) continue
     // S4：已被并进前一条的候选不再各自落库（否则 3 同主题仍会有 3 条候选）。
-    if (String(item?.status || '').startsWith('merged_into:')) continue
+    const status = String(item?.status || 'pending')
+    // 续跑幂等与 dispatch 同口径：终态（ingested/review/noop/skipped/merged_into）不得重放；
+    // 只有 pending 与可重试的 write_failed 才进入本轮（否则已入库条目会被重写成 NOOP，计数丢失）。
+    if (status !== 'pending' && !status.startsWith('write_failed:')) continue
     const decision = byItem.get(i) || {
       item: i, op: 'ADD', targetId: '', afterText: String(item.text || '').slice(0, 200), reason: 'no_decision', evidence: '',
     }
