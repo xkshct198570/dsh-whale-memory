@@ -4,7 +4,7 @@
 
 Local-first long-term memory for DeepSeek Harness sessions: recall relevant memories before each turn, review and edit them in a six-tab panel, and keep rules in a local git Markdown repository where the database is only a search mirror.
 
-> Current version **0.7.3** (Session Wrap v2): local SQLite memory store, automatic recall, six-tab panel, write auditing and adoption signals, optional two-way sync/outbox, metrics and daily reports, and legacy migration auditing. Rule source of truth: `~/.dsh/rules` (proposals, plan/apply, tombstone numbering, health check). Session wrap distils lessons, decisions and open loops when a session ends, producing shadow candidates, rule proposals and a report without raw conversation. v2 adds session selection, click-to-queue (202 + progress), an auto-wrap switch with per-session skip, and an optional Reconcile pass (default off) that compares candidates with existing memories and only produces shadow decisions.
+> Current version **0.8.0**: local SQLite memory store, automatic recall, six-tab panel, write auditing and adoption signals, optional two-way sync/outbox, metrics and daily reports, and legacy migration auditing. Rule source of truth: `~/.dsh/rules` (proposals, plan/apply, tombstone numbering, health check). Session wrap distils lessons, decisions and open loops when a session ends, producing candidates, rule proposals and a report without raw conversation; v2 adds session selection, click-to-queue (202 + progress), an auto-wrap switch with per-session skip, and an optional Reconcile pass (default off). 0.8.0 adds automatic ingestion for durable memories, five model-side `memory_*` tools, layered memories (`fact`/`lesson`/`user`) with a first-turn profile, and reflection that triggers after ≥7 tool steps in a turn or when idle (off by default; peak windows can suppress it).
 > Requirements: DSH `>=0.2.2-rc.5 <0.3.0`, Node `>=22.13.0` (built-in SQLite).
 
 ## Why it is useful
@@ -48,6 +48,25 @@ Overview / Memories / **Rules** / Recall / Writes & relations / Settings.
 - Global rules render into the managed block in `AGENTS.md`. A clean install creates a minimal block (`rules.createAgentsIfMissing=true`); an existing file without markers is never appended to.
 - Scoped rules (`role:` / `workspace:`) inject only in matching sessions, under `injectChars` (0 = off).
 
+### Model-side memory tools
+
+The model can call five tools: `memory_remember`, `memory_search`, `memory_read`, `memory_update`, `memory_forget`.
+
+- Identity is always the current session (userId/roleId from the plugin identity rules + host login, workspace from the session cwd). Missing identity raises `IDENTITY_REQUIRED`; ids from another partition behave as `NODE_NOT_FOUND`.
+- `remember` passes the same value gate as automatic ingestion (durable → active, task/one-off → `NOT_MEMORY`, ambiguous → review candidate). `update` supports CAS (`NODE_CHANGED`) and refuses protected targets; `forget` archives only.
+- At most `tools.maxWritesPerTurn` (default 5) write attempts per turn; subagents are refused (`SUBAGENT_FORBIDDEN`); `tools.enabled=false` disables the toolset at call time.
+
+### Layers and the first-turn profile
+
+- Every memory carries a layer: `fact` (facts/decisions), `lesson` (procedural lessons), `user` (preferences). Legacy rows keep `NULL`; rules have no layer.
+- On the first turn of a session the plugin renders a ≤800-character profile from the same identity's `user`/`lesson`/`fact` nodes (top 5/5/3) and injects it once via `systemPrompt.context`. It never repeats on later turns, is skipped for subagents or undetermined identity, and fails open with a log line.
+
+### Reflection (off by default)
+
+- When enabled, reflection runs after a turn that used distinct non-memory tools in ≥7 steps, or when the session goes idle. It writes lessons/facts with `source=self`, `origin=reflect`, under the same ingest policy as wrap.
+- Automatic runs obey `reflect.maxRunsPerDay` (local calendar day) and `maintenance.suppressWindows` (`HH:MM-HH:MM`, local time, `23:00-07:00` spans midnight; unparseable entries are skipped and logged once).
+- The manual `/reflect` route and the panel action bypass peak windows and the daily cap, but still require an identity. The switch is off by default; enabling it spends model tokens.
+
 ## Configuration
 
 Rules group (9 visible in the panel, 3 config-only):
@@ -84,6 +103,24 @@ Session wrap group:
 | `wrap.retentionDays` | `180` | Delete finished runs and unreferenced reports older than this; `0` keeps forever |
 | `wrap.report` | `true` | Write a Markdown report without raw conversation |
 | `wrap.model` | `''` | Override the model id; provider still comes from the default selection |
+
+Reflection and peak windows:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `reflect.enabled` | `false` | Automatic reflection (turn-end ≥7 tool steps or idle); manual `/reflect` is not gated by it |
+| `reflect.model` | `''` | Model override for reflection |
+| `reflect.idleMinutes` | `30` | Idle minutes before an idle reflection run |
+| `reflect.maxItems` | `8` | Items per run |
+| `reflect.maxRunsPerDay` | `24` | Automatic runs per local calendar day (manual bypasses) |
+| `maintenance.suppressWindows` | `[]` | Local-time `HH:MM-HH:MM` windows; automatic reflection is skipped inside them (`23:00-07:00` spans midnight; bad entries fail open with one log) |
+
+Model tools:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `tools.enabled` | `true` | Expose the five `memory_*` tools to the model |
+| `tools.maxWritesPerTurn` | `5` | Write attempts (`remember`/`update`/`forget`) per turn |
 
 The backend defaults to `local` (`$DSH_HOME/whale-memory/memory.db`). `http`/`hybrid` can point at an external memory service; failures fall back locally or show "not connected". Session wrap requires local or hybrid storage.
 

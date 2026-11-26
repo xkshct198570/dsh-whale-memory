@@ -4,7 +4,7 @@
 
 给 DeepSeek Harness 会话加一层**可查、可审、可迁移的本地长期记忆**：对话前自动召回相关记忆并注入上下文，平时在面板里查看、编辑、导入导出。
 
-> 当前版本 **0.7.3**（Session Wrap v2）：本地 SQLite 记忆库、对话自动召回、六页签面板、写入审计与采纳信号、双轨同步与 outbox、观测指标与日报、旧库迁移审计；规则真源在 `~/.dsh/rules`（提案制、plan/apply、墓碑编号、健康检查）；收尾时一次有界提炼，产出 shadow 候选/规则提案/无原文报告；v2 增加会话选择、点击即排队（202+进度）、自动收尾开关与逐会话跳过，以及默认关闭的整合（Reconcile）复核。
+> 当前版本 **0.8.0**：本地 SQLite 记忆库、对话自动召回、六页签面板、写入审计与采纳信号、双轨同步与 outbox、观测指标与日报、旧库迁移审计；规则真源在 `~/.dsh/rules`（提案制、plan/apply、墓碑编号、健康检查）；收尾时一次有界提炼，产出候选/规则提案/无原文报告；v2 增加会话选择、点击即排队（202+进度）、自动收尾开关与逐会话跳过，以及默认关闭的整合（Reconcile）复核。0.8.0 增加普通记忆自动入库、模型侧五个 `memory_*` 工具、记忆分层（`fact`/`lesson`/`user`）与首轮画像，以及「回合工具步 ≥7 或空闲」的自动反思（默认关，可用峰时窗口抑制）。
 > 运行要求：DSH `>=0.2.2-rc.5 <0.3.0`、Node `>=22.13.0`（内置 SQLite）。
 
 ## 亮点
@@ -54,6 +54,25 @@
 - 空机安装不需要 git/网络；设置页会显示 Git 三态（已安装/未安装/损坏）与按平台的安装指引。
 - **首次安装自带默认铁律**：插件自带上架默认规则（通用 19 条带号 + 1 条安全铁律；不含空号 6；本机专用铁律 13 不参与默认播种）。它们在首启写入 `~/.dsh/rules/` 并成为可编辑的规则文件：小白可在「规则」页直接**新建、修改、停用/删除**，编号保留、历史可回滚；停用后用同编号可随时重新启用。
 
+### 模型侧记忆工具
+
+模型可以直接调用五个工具：`memory_remember`、`memory_search`、`memory_read`、`memory_update`、`memory_forget`。
+
+- 身份固定为当前会话（userId/roleId 按插件身份规则与宿主登录态推导，workspace 由会话工作目录派生）；缺身份报 `IDENTITY_REQUIRED`，跨分区 id 一律按 `NODE_NOT_FOUND` 处理。
+- `remember` 与自动入库同一道价值闸（长期规则入库、任务/一次性状态报 `NOT_MEMORY`、歧义转待审）；`update` 支持 CAS（`NODE_CHANGED`）并拒改受保护目标；`forget` 只归档。
+- 每回合写尝试上限 `tools.maxWritesPerTurn`（默认 5）；子代理调用被拒（`SUBAGENT_FORBIDDEN`）；`tools.enabled=false` 时调用即被拒。
+
+### 记忆分层与首轮画像
+
+- 每条记忆带分层：`fact`（事实/决策）、`lesson`（可复用的教训）、`user`（偏好）。旧行保持 `NULL`；规则没有分层。
+- 会话首轮会把同身份的 `user` top5 / `lesson` top5 / `fact` top3 渲染成 ≤800 字符的「长期画像」，经 `systemPrompt.context` 注入一次；第二轮不再出现，子代理或身份不可判定时跳过，失败只记日志不阻断对话。
+
+### 自动反思（默认关）
+
+- 开启后，回合一里 distinct 非记忆工具步数 ≥7 或会话空闲到点时自动跑；产出教训/事实，落库 `source=self`、`origin=reflect`，走与收尾同一套入库判据。
+- 自动运行受 `reflect.maxRunsPerDay`（本地自然日）与 `maintenance.suppressWindows`（本地时区 `HH:MM-HH:MM`，`23:00-07:00` 表示跨午夜；无法解析的项跳过并记一次日志）约束。
+- 手动 `/reflect` 与面板「立即反思」绕过峰时与日限，但仍要求身份；开关默认关，打开会花模型 token。
+
 ## 配置
 
 空配置就是默认行为。设置页每组都有场景说明；大多数开关保存后即时生效，少数（接入方式、数据目录等）在插件重新加载后生效。
@@ -65,7 +84,8 @@
 | 身份 | 记忆按谁分区 | `identity.mode='auto'`（DSH 登录 userId + 会话工作目录）；固定分区用 `fixed` + `userId/roleId/workspace` |
 | 注入 | 召回与注入 | `enabled=true`、`maxHits=5`、`charBudget=1500`（**0 = 关闭注入**）、`intentBudget=true`、`minRel=0.34`、`timeoutMs=2000` |
 | 写入 | 记不记、怎么审 | `enabled=true`、`reviewMode='shadow'`（候选需在面板接受才入库；`auto` 直接落库）、`maxChars=500`、`dailyCap=200`、`judge='rules'`、`searchFeed=false`、`searchTtlHours=24` |
-| 反思 | 后台提炼 | `enabled=false`、`idleMinutes=30`、`maxItems=8`、`maxRunsPerDay=24`、`model=''` |
+| 反思 | 后台提炼 + 峰时 | `enabled=false`、`idleMinutes=30`、`maxItems=8`、`maxRunsPerDay=24`、`model=''`、`maintenance.suppressWindows=[]`（本地时区 `HH:MM-HH:MM`，跨午夜，坏值 fail-open 跳过；只抑制自动反思） |
+| 模型工具 | 对话里直接读写记忆 | `tools.enabled=true`、`tools.maxWritesPerTurn=5`（remember/update/forget 每回合尝试上限） |
 | 收尾 | 会话结束沉淀 | `enabled=true`、`explicit=true`、`idle=false`、`disposed=false`（后台两路默认关）、`idleMinutes=10`、`maxItems=8`、`ingest.mode=auto`（durable 自动入库 / review 全部先审）、`ingest.minConfidence=0.55`、`ingest.dropTaskInstructions=true`、`maxRunsPerDay=6`（只限自动）、`retentionDays=180`、`report=true`、`model=''`、`maxMaterialChars=12000` |
 | 巩固 | 定期合并 | `enabled=true`、`intervalHours=6` |
 | 向量 | 语义检索 | `enabled=false`、`endpoint=''`、`model=''`、`batch=16`（当前版本未接外部嵌入服务） |
