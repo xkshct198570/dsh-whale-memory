@@ -262,6 +262,18 @@ test('手动收尾：跳过最近但有进行中 turn 的会话，改取较旧�
   assert.equal(triggers[0].sessionId, 'A', '最近但 open 的 B 不得挡住可收尾的 A')
 })
 
+test('手动收尾：只有进行中会话时也允许快照入队（不再 turn_in_progress 拒绝点击）', async () => {
+  const { handlers, triggers, capture } = install()
+  const only = session('only-open')
+  handlers.get('session/event')(only, ev(1, 'turn/start', { turn: 1 }))
+  handlers.get('session/event')(only, ev(2, 'user/message', userMsg('正在进行的这一轮也要能点收尾')))
+  const out = await capture.triggerRecent('manual')
+  assert.equal(out.ok, true, JSON.stringify(out))
+  assert.equal(triggers.length, 1)
+  assert.equal(triggers[0].sessionId, 'only-open')
+  assert.ok(triggers[0].material.turns.length > 0, '快照必须带当前已有材料')
+})
+
 test('显式入队失败：保留 pendingIntent 并在下一回合重试；status 可见 lastTriggerError', async () => {
   let fail = true
   const { handlers, capture } = install({

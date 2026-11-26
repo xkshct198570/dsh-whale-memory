@@ -978,7 +978,8 @@
     "err.invalid_session": "会话 id 不合法",
     "overview.wrapPhaseReconcile": "整合",
     "overview.wrapCopyReport": "复制报告",
-    "overview.wrapDownloadReport": "下载 .md"
+    "overview.wrapDownloadReport": "下载 .md",
+    "overview.wrapSessionLoadFailed": "会话列表读取失败"
   },
   "en": {
     "meta.title": "Whale Memory",
@@ -1959,7 +1960,8 @@
     "err.invalid_session": "Invalid session id",
     "overview.wrapPhaseReconcile": "Reconcile",
     "overview.wrapCopyReport": "Copy report",
-    "overview.wrapDownloadReport": "Download .md"
+    "overview.wrapDownloadReport": "Download .md",
+    "overview.wrapSessionLoadFailed": "Failed to load session list"
   },
   "ja": {
     "meta.title": "ホエールメモリ",
@@ -2940,6 +2942,7 @@
     "err.invalid_session": "セッション ID が不正です",
     "overview.wrapPhaseReconcile": "整合",
     "overview.wrapCopyReport": "レポートをコピー",
-    "overview.wrapDownloadReport": ".md をダウンロード"
+    "overview.wrapDownloadReport": ".md をダウンロード",
+    "overview.wrapSessionLoadFailed": "セッション一覧の取得に失敗しました"
   }
 }

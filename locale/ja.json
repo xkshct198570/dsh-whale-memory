@@ -981,5 +981,6 @@
   "err.invalid_session": "セッション ID が不正です",
   "overview.wrapPhaseReconcile": "整合",
   "overview.wrapCopyReport": "レポートをコピー",
-  "overview.wrapDownloadReport": ".md をダウンロード"
+  "overview.wrapDownloadReport": ".md をダウンロード",
+  "overview.wrapSessionLoadFailed": "セッション一覧の取得に失敗しました"
 }

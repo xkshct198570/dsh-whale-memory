@@ -981,5 +981,6 @@
   "err.invalid_session": "Invalid session id",
   "overview.wrapPhaseReconcile": "Reconcile",
   "overview.wrapCopyReport": "Copy report",
-  "overview.wrapDownloadReport": "Download .md"
+  "overview.wrapDownloadReport": "Download .md",
+  "overview.wrapSessionLoadFailed": "Failed to load session list"
 }

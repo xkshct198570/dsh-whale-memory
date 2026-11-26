@@ -981,5 +981,6 @@
   "err.invalid_session": "会话 id 不合法",
   "overview.wrapPhaseReconcile": "整合",
   "overview.wrapCopyReport": "复制报告",
-  "overview.wrapDownloadReport": "下载 .md"
+  "overview.wrapDownloadReport": "下载 .md",
+  "overview.wrapSessionLoadFailed": "会话列表读取失败"
 }

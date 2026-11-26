@@ -361,8 +361,8 @@ export function installSessionCapture(ctx, {
     if (!rec) return { ok: false, reason: 'no_session' }
     const cfg = cfgNow()
     if (!cfg.enabled) return { ok: false, reason: 'wrap_disabled' }
-    // 指定会话手动收尾不得踩进行中的回合（S1 判据）：明确 409，而不是静默拿半轮材料。
-    if (trigger === 'manual' && rec.openTurns.size > 0) return { ok: false, reason: 'turn_in_progress' }
+    // 手动收尾允许在回合进行中排队：材料是“此刻快照”（含已提交的 user/assistant 文本），
+    // 由队列稍后执行；不再用 turn_in_progress 拒绝点击（S1b 后置语义，2026-11-26 厂长反馈）。
     return flushSnapshot(rec, trigger, opts)
   }
 
@@ -374,10 +374,13 @@ export function installSessionCapture(ctx, {
     if (candidates.length === 0) return { ok: false, reason: 'no_material' }
     // 取“最近且已结束回合”的会话；最近那个正好在跑工具不应挡住别的可收尾会话（审查 P2）。
     const closed = candidates.filter((rec) => rec.openTurns.size === 0)
-    if (closed.length === 0) return { ok: false, reason: 'turn_in_progress' }
+    // 手动：没有“已结束回合”的会话时，允许取最近一条进行中的会话做快照入队；
+    // 自动触发不走这里（tick 自己跳过 open turn），所以不会在空闲时误收半轮。
+    const pick = closed[0] || (trigger === 'manual' ? candidates[0] : null)
+    if (!pick) return { ok: false, reason: 'turn_in_progress' }
     const cfg = cfgNow()
     if (!cfg.enabled) return { ok: false, reason: 'wrap_disabled' }
-    return flushSnapshot(closed[0], trigger, { force: true })
+    return flushSnapshot(pick, trigger, { force: true })
   }
 
   /**

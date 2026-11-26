@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-11-25T19:24:08.136Z",
+  "generatedAt": "2026-11-26T05:31:54.102Z",
   "thresholds": {
     "plan": 800,
     "freeze": 1200,
@@ -173,7 +173,7 @@
     "test/hook/proposal-scheduler.test.mjs": 96,
     "test/hook/rules-inject.test.mjs": 453,
     "test/hook/search-feed.test.mjs": 84,
-    "test/hook/session-capture.test.mjs": 262,
+    "test/hook/session-capture.test.mjs": 273,
     "test/hook/session-wrap.test.mjs": 667,
     "test/integration/plugin-load.test.mjs": 71,
     "test/integration/session-wrap-host.test.mjs": 105,
