@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-11-26T06:39:09.150Z",
+  "generatedAt": "2026-11-26T07:08:50.928Z",
   "thresholds": {
     "plan": 800,
     "freeze": 1200,
@@ -124,7 +124,7 @@
   },
   "tests": {
     "test/client/client.test.mjs": 599,
-    "test/client/render-smoke.test.mjs": 366,
+    "test/client/render-smoke.test.mjs": 383,
     "test/client/rules-defaults.test.mjs": 395,
     "test/client/rules-edit.test.mjs": 518,
     "test/client/rules-proposals.test.mjs": 430,

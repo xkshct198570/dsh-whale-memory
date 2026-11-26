@@ -402,3 +402,21 @@ test('S3 阶段投影：reconcile 关闭绝不出现整合阶段；开启且 pha
   assert.ok(current)
   assert.match(treeText(current), /overview\.wrapPhaseReconcile/)
 })
+
+test('页签不可被压缩：nav flexShrink=0/minHeight、tab 显式 28px 盒高（真机 0 高回归）', async () => {
+  const { slots, mount } = loadSlots({ panel: { ...DEFAULT_CONFIG.panel, tab: 'overview' } })
+  const tree = await mount(slots.main, { t: (key) => key, locale: 'zh' }, 1)
+  let nav = null
+  walkTree(tree, (node) => { if (node.type === 'nav' && node.props && node.props.role === 'tablist') nav = node })
+  assert.ok(nav, '必须渲染 tablist nav')
+  assert.equal(nav.props.style.flexShrink, 0, 'nav 在 flex column 面板里不得被压缩')
+  assert.equal(nav.props.style.minHeight, '36px')
+  const tabs = []
+  walkTree(nav, (node) => { if (node.type === 'button' && node.props && node.props.role === 'tab') tabs.push(node) })
+  assert.equal(tabs.length, 6, '六页签必须全部渲染')
+  for (const tab of tabs) {
+    assert.equal(tab.props.style.height, '28px', '页签盒高必须显式，否则内容高塌陷')
+    assert.equal(tab.props.style.display, 'inline-flex')
+    assert.equal(tab.props.style.boxSizing, 'border-box')
+  }
+})

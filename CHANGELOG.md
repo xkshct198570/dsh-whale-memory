@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.3 — 2026-11-26（面板页签不可见修复）
+
+- 修复：面板六个页签在 0.7.x 后整行不可见（只剩 8px 空白）——S1 把 `tabs` 改为横向滚动（`overflowX:auto`）后，作为 flex-column 面板的 flex 子项，其自动最小高度变为 0，被固定高度父容器压成 0 高；`overflowY:hidden` 再把文字裁掉。表现为记忆库/规则/召回/写入与关系/设置全部“消失”。
+- 修复：`tabs` 显式 `flexShrink:0` + `minHeight:36px`；`tab/tabActive` 显式 `display:inline-flex`、`height:28px`、`box-sizing:border-box`、`lineHeight:18px`，不再依赖宿主 button 重置。选中页签加 `fontWeight:600`。
+- 回归：渲染测试断言 nav 不可压缩、六页签齐全且盒高 28px；真机 1280×800 复核六页签可见可点。
+- 测试：全量 1103（1102 pass / 1 skip / 0 fail）。
+
 ## 0.7.2 — 2026-11-26（反思产出修复）
 
 - 修复：反思（reflect）输出同时累加 `text-delta` 与 `block-end.text`，JSON 被拼两遍 → `parseReflectOutput` 解析为空 → 真机 47/47 次 `items=0`。改为“有增量用增量，无增量用整块”，与收尾蒸馏同口径。
