@@ -44,13 +44,25 @@ async function post(base, path, body) {
   return { status: res.status, body: await res.json() }
 }
 
-test('POST /reflect：reflect service 可用 → 200 started；缺服务 → 501；busy → 409', async () => {
-  const ok = await startRoutes({ reflect: { trigger: async () => ({ ok: true }) } })
+/** 最近会话身份：手动反思必须落会话分区（workspace 非空），不能拿控制面 workspace='' 冒充。 */
+const sessionState = {
+  lastRecall: { sessionId: 's1', userId: 'u1', roleId: '', workspace: '/work/ws', workspaceSource: 'session', at: 1 },
+}
+
+test('POST /reflect：手动传最近会话身份 → 200 started；缺服务 → 501；busy → 409；无 workspace → 400', async () => {
+  const calls = []
+  const ok = await startRoutes({
+    identityState: sessionState,
+    reflect: { trigger: async (opts) => { calls.push(opts); return { ok: true, added: 1 } } },
+  })
   try {
     const got = await post(ok.base, '/whale-memory/api/reflect', {})
     assert.equal(got.status, 200)
     assert.equal(got.body.ok, true)
     assert.equal(got.body.started, true)
+    assert.deepEqual(calls[0].identity, { userId: 'u1', roleId: '', workspace: '/work/ws' })
+    assert.equal(calls[0].sessionId, 's1')
+    assert.equal(calls[0].reason, 'manual')
   } finally { await ok.close() }
 
   const missing = await startRoutes()
@@ -60,12 +72,23 @@ test('POST /reflect：reflect service 可用 → 200 started；缺服务 → 501
     assert.equal(got.body.error, 'reflect_unavailable')
   } finally { await missing.close() }
 
-  const busy = await startRoutes({ reflect: { trigger: async () => ({ ok: false, reason: 'busy' }) } })
+  const busy = await startRoutes({
+    identityState: sessionState,
+    reflect: { trigger: async () => ({ ok: false, reason: 'busy' }) },
+  })
   try {
     const got = await post(busy.base, '/whale-memory/api/reflect', {})
     assert.equal(got.status, 409)
     assert.equal(got.body.error, 'busy')
   } finally { await busy.close() }
+
+  // 无最近会话身份时，控制面 workspace='' 不得被当成共享分区去反思。
+  const noWs = await startRoutes({ reflect: { trigger: async () => ({ ok: true }) } })
+  try {
+    const got = await post(noWs.base, '/whale-memory/api/reflect', {})
+    assert.equal(got.status, 400)
+    assert.equal(got.body.error, 'identity_required')
+  } finally { await noWs.close() }
 })
 
 test('POST /sync：dryRun pull 可达且 trace_id 回显；非 dryRun 缺 confirm 拒绝', async () => {

@@ -81,7 +81,7 @@ export function renderProfile(groups, budget = PROFILE_CHAR_BUDGET) {
  * @returns {{ size: () => number, textOf: (context:any) => string, dispose: () => void }}
  */
 export function installProfileContext({
-  ctx, backend, getIdentityCfg, getIdentityHint, getHostUserId, log = () => {},
+  ctx, backend, getIdentityCfg, getIdentityHint, getHostUserId, getHostIdentityState, log = () => {},
 }) {
   // 后端没有画像读能力（http/纯远端）：画像无处取数，直接不装——不查、不刷失败日志。
   if (typeof backend?.profileLayers !== 'function') {
@@ -137,7 +137,7 @@ export function installProfileContext({
     if (isDelegatedHeader(agent?.session?.header)) return
     if (payload?.signal?.aborted) return
     const ident = sessionIdentityOf({
-      header: agent?.session?.header, getIdentityCfg, getIdentityHint, getHostUserId,
+      header: agent?.session?.header, getIdentityCfg, getIdentityHint, getHostUserId, getHostIdentityState,
     })
     if (!ident.ok) return
     let text = ''

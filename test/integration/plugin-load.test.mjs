@@ -75,7 +75,7 @@ for (const timer of [false, true]) {
 
     // 提案链路：真实 waterfall（listener 的最后参数是 next）。一条标准规则陈述必须产出候选文件。
     const decision = await ctx.waterfall('agent/pre-step', {
-      agent: { session: { id: 's-host-load', header: {} } },
+      agent: { session: { id: 's-host-load', header: { cwd: '/work/ws' } } },
       messages: [{ source: { kind: 'user' }, content: [{ type: 'text', text: '以后都别删源文件' }] }],
       signal: new AbortController().signal,
     }, async () => ({ kind: 'enter' }))

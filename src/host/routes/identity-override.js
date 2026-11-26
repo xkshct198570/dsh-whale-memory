@@ -13,6 +13,8 @@ export function runtimeIdentityOf(identityState) {
     userId: String(last.userId ?? ''),
     roleId: String(last.roleId ?? ''),
     workspace: String(last.workspace ?? ''),
+    // 反思空闲/手动触发要把会话 id 一起带给 job payload（分区身份仍由三元组决定）。
+    sessionId: String(last.sessionId ?? ''),
   }
 }
 

@@ -14,7 +14,8 @@ import {
 } from './config-util.js'
 
 export async function handleConfigSync({
-  req, res, path, method, config, backend, identity, identityView, identityOverride, ctx, log, traceId, reflect, sendJson, sendMethodNotAllowed,
+  req, res, path, method, config, backend, identity, identityView, identityOverride, runtimeIdentity,
+  ctx, log, traceId, reflect, sendJson, sendMethodNotAllowed,
 }) {
     if (path === `${PREFIX}/sync`) {
       if (req.method !== 'POST') return sendMethodNotAllowed(res, 'POST')
@@ -41,8 +42,26 @@ export async function handleConfigSync({
       if (!reflect || typeof reflect.trigger !== 'function') {
         return sendJson(res, 501, { ok: false, error: 'reflect_unavailable' })
       }
-      const result = await reflect.trigger()
+      // 手动反思是显式动作：用最近会话身份（有 workspace），其次当前控制面身份；
+      // 都没有 workspace 就拒——绝不写 workspace='' 的共享分区（架构书 §5.5.1）。
+      const runtime = runtimeIdentity && typeof runtimeIdentity === 'object' ? runtimeIdentity : null
+      const chosen = runtime?.workspace ? runtime : identity
+      if (!chosen?.userId || !chosen?.workspace) {
+        return sendJson(res, 400, { ok: false, error: 'identity_required' })
+      }
+      const result = await reflect.trigger({
+        identity: {
+          userId: String(chosen.userId),
+          roleId: String(chosen.roleId || ''),
+          workspace: String(chosen.workspace),
+        },
+        sessionId: String(runtime?.sessionId || ''),
+        reason: 'manual',
+      })
       if (result?.ok === false && result.reason === 'busy') return sendJson(res, 409, { ok: false, error: 'busy' })
+      if (result?.ok === false && result.reason === 'identity_required') {
+        return sendJson(res, 400, { ok: false, error: 'identity_required' })
+      }
       return sendJson(res, 200, { ok: true, started: true, result })
     }
 

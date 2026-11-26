@@ -41,7 +41,7 @@ function cfg(rulesDir) {
 
 function preStepPayload(text) {
   return {
-    agent: { session: { id: 's1', header: {} } },
+    agent: { session: { id: 's1', header: { cwd: '/work/ws' } } },
     messages: [{ source: { kind: 'user' }, content: [{ type: 'text', text }] }],
   }
 }

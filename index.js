@@ -13,9 +13,10 @@ import { Config } from './src/host/config.js'
 import { installSearchFeed } from './src/host/search-feed.js'
 import { installMemoryTools } from './src/host/tools.js'
 import { installIdentitySource } from './src/host/identity-source.js'
-import { deriveWorkspace, resolveIdentity } from './src/host/identity.js'
+import { sessionIdentityOf } from './src/host/identity.js'
 import { installConfigMigration } from './src/host/config-migration.js'
 import { installReflectScheduler } from './src/core/reflect.js'
+import { installReflectTrigger } from './src/host/reflect-trigger.js'
 import { installKeeper } from './src/core/keeper.js'
 import { installSessionCapture } from './src/host/session-capture.js'
 import { installSessionWrap } from './src/host/session-wrap.js'
@@ -292,6 +293,8 @@ export function apply(ctx, config) {
   // 身份 auto：宿主登录态 userId（5min TTL，getter 同步返回，永不阻塞召回）。
   const identitySource = installIdentitySource(ctx, { log })
   const getHostUserId = () => identitySource.getUserId()
+  // 四态（absent/pending/empty/ready）：auto 只在 absent 允许回落（架构书 §5.5.1）。
+  const getHostIdentityState = () => identitySource.getState()
 
   // 首启旧配置迁移（架构书 §10.3）：后台跑，失败只记日志；状态给 /stats 只读展示。
   const migration = installConfigMigration(ctx, { backend: backendProxy, log })
@@ -326,14 +329,30 @@ export function apply(ctx, config) {
     return out
   })
 
+  /** 最近会话身份（hook 在 pre-step 落 identityState.lastRecall）：空闲反思只落这个分区。 */
+  const getSessionIdentity = () => {
+    const last = identityState.lastRecall
+    if (!last || !last.userId || !last.workspace) return null
+    return {
+      identity: { userId: String(last.userId), roleId: String(last.roleId || ''), workspace: String(last.workspace) },
+      sessionId: String(last.sessionId || ''),
+    }
+  }
   const reflect = installReflectScheduler(ctx, {
     backend: backendProxy, config, keeper,
     getLlm: () => ctx.get('llm'),
     getSelection: () => ctx.get('agentDefaultModel')?.currentSelection?.(),
-    // 后台反思没有会话 cwd；用当前登录/角色 hint 的分区，绝不写回共享 '' 洗白私有事实。
-    getIdentity: () => resolveIdentity(getIdentityCfg(), getIdentityHint(), getHostUserId(), ''),
+    // S4：身份由调度/触发显式给出；空闲只认最近会话身份，绝不现取 Config 写共享 '' 分区。
+    getSessionIdentity,
     log,
   })
+  // S4 turn 触发：一个 turn 内 ≥7 个有非 memory 工具活动的 distinct step → scheduleAuto（每 turn 一次）。
+  ctx.effect(() => {
+    const trigger = installReflectTrigger({
+      ctx, getIdentityCfg, getIdentityHint, getHostUserId, getHostIdentityState, reflect, log,
+    })
+    return () => trigger.dispose()
+  }, 'whale-memory: reflect trigger')
 
   // 定时入队（真实执行仍由 keeper 的 10min tick + 水位闸门决定，不在这抢并发）。
   const nowSec = () => Date.now() / 1000
@@ -355,7 +374,7 @@ export function apply(ctx, config) {
 
   installSearchFeed(ctx, {
     backend: backendProxy, config, log,
-    getIdentityCfg, getIdentityHint, getHostUserId,
+    getIdentityCfg, getIdentityHint, getHostUserId, getHostIdentityState,
   })
 
   // 模型侧记忆工具面（S2）：五工具注册 + 每回合写限次；身份与收尾/召回同一套 getter。
@@ -363,7 +382,7 @@ export function apply(ctx, config) {
   ctx.effect(() => {
     const tools = installMemoryTools({
       ctx, backend: backendProxy, config, log,
-      getIdentityCfg, getIdentityHint, getHostUserId,
+      getIdentityCfg, getIdentityHint, getHostUserId, getHostIdentityState,
     })
     return () => tools.dispose()
   }, 'whale-memory: memory tools')
@@ -380,9 +399,9 @@ export function apply(ctx, config) {
   if (wrap.supported) {
     captureRef.current = installSessionCapture(ctx, {
       config, log,
-      getIdentity: (header) => resolveIdentity(
-        getIdentityCfg(), getIdentityHint(), getHostUserId(), deriveWorkspace(header),
-      ),
+      getIdentity: (header) => sessionIdentityOf({
+        header, getIdentityCfg, getIdentityHint, getHostUserId, getHostIdentityState,
+      }),
       onTrigger: wrap.onTrigger,
       canTriggerAuto: wrap.canAutoTrigger,
     })
@@ -399,13 +418,18 @@ export function apply(ctx, config) {
   ctx.effect(() => () => { reflect.dispose(); backend.dispose?.() }, 'whale-memory: backend')
 
   ctx.effect(() => {
-    hook = installHook(ctx, { backend: backendProxy, config, getIdentityCfg, getIdentityHint, getHostUserId, identityState, log })
+    hook = installHook(ctx, {
+      backend: backendProxy, config, getIdentityCfg, getIdentityHint, getHostUserId,
+      getHostIdentityState, identityState, log,
+    })
     return () => hook?.dispose()
   }, 'whale-memory: recall hook')
 
   // 首轮画像（S3）：每会话一次、装配零 IO；与召回各用各的 context 名（129 < 130）。
   ctx.effect(() => {
-    const profile = installProfileContext({ ctx, backend: backendProxy, getIdentityCfg, getIdentityHint, getHostUserId, log })
+    const profile = installProfileContext({
+      ctx, backend: backendProxy, getIdentityCfg, getIdentityHint, getHostUserId, getHostIdentityState, log,
+    })
     return () => profile.dispose()
   }, 'whale-memory: profile context')
 

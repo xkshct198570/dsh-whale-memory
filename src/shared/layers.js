@@ -6,6 +6,22 @@
 /** 合法分层标签（顺序即枚举顺序；NULL=未分层由调用方表达）。 */
 export const LAYERS = Object.freeze(['fact', 'lesson', 'user'])
 
+/**
+ * memory_type → layer（S4 reflect 用）：procedural≈lesson、semantic≈fact。
+ * 与收尾的 `LAYER_OF_KIND`（kind→layer）同口径：lesson 的 memory_type 恒 procedural；
+ * 反思只产出 semantic/procedural（不产 preference），所以这里不映射 user。
+ */
+export const LAYER_OF_TYPE = Object.freeze({ procedural: 'lesson', semantic: 'fact' })
+
+/**
+ * @param {unknown} type
+ * @returns {'fact'|'lesson'|null}
+ */
+export function layerOfMemoryType(type) {
+  const key = String(type ?? '')
+  return LAYER_OF_TYPE[key] || null
+}
+
 const LAYER_SET = new Set(LAYERS)
 
 /**

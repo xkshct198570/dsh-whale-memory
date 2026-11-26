@@ -29,7 +29,7 @@ const REASON_LIMIT = 200
  *   getHostUserId: () => string, limiter: ReturnType<typeof createWriteRateLimiter> }} deps
  */
 function makeContext(deps) {
-  const { backend, config, getIdentityCfg, getIdentityHint, getHostUserId, limiter, log = () => {} } = deps
+  const { backend, config, getIdentityCfg, getIdentityHint, getHostUserId, getHostIdentityState, limiter, log = () => {} } = deps
 
   const maxWrites = () => {
     const raw = num(value(config?.tools?.maxWritesPerTurn), DEFAULT_LIMIT)
@@ -50,7 +50,9 @@ function makeContext(deps) {
     // 关掉开关后工具仍被列出/可调；这里保证“关闭”一定是真关闭，而不是目录级假开关）。
     if (value(config?.tools?.enabled) === false) throw toolError(TOOL_ERROR.TOOLS_DISABLED)
     // 会话身份判据与首轮画像共用 identity.sessionIdentityOf（同一判据一处实现）。
-    const got = sessionIdentityOf({ header, getIdentityCfg, getIdentityHint, getHostUserId })
+    const got = sessionIdentityOf({
+      header, getIdentityCfg, getIdentityHint, getHostUserId, getHostIdentityState,
+    })
     if (!got.ok) throw toolError(TOOL_ERROR.IDENTITY_REQUIRED)
     return got.identity
   }
@@ -301,7 +303,9 @@ export function createMemoryToolDefinitions(deps) {
  *   getHostUserId: () => string, log?: (line: string) => void }} args
  * @returns {{ dispose: () => void, definitions: Array<object> }}
  */
-export function installMemoryTools({ ctx, backend, config, getIdentityCfg, getIdentityHint, getHostUserId, log = () => {} }) {
+export function installMemoryTools({
+  ctx, backend, config, getIdentityCfg, getIdentityHint, getHostUserId, getHostIdentityState, log = () => {},
+}) {
   const registry = typeof ctx?.get === 'function' ? ctx.get('tools') : ctx?.tools
   if (!registry || typeof registry.register !== 'function') {
     // 直接 apply 的测试/嵌入场景可达；inject 生效的宿主里由 cordis 保证 tools 已就位。

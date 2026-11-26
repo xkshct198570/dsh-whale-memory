@@ -10,7 +10,7 @@
 import { isAllowedHostName, isLoopback, isWriteMethod, sendJson, writeRequestProblem } from '../http-kit.js'
 import { bool } from '../../shared/config-values.js'
 import { resolveIdentity } from '../identity.js'
-import { createValidatedIdentityOverride } from './identity-override.js'
+import { createValidatedIdentityOverride, runtimeIdentityOf } from './identity-override.js'
 import { handleRules } from '../rules-routes.js'
 import { createHostAdapter } from '../ctx-adapter.js'
 import { PREFIX } from './prefix.js'
@@ -197,6 +197,7 @@ export function createRoutes({
       req, res, path, method: req.method, config, backend, identity, traceId, log, ctx, wrap, reflect,
       identityView, requestIdentity, identityParams, withRequestWorkspace,
       identityOverride: canOverrideIdentity, validatedIdentityOverride,
+      runtimeIdentity: runtimeIdentityOf(identityState),
       backendView, backendOutbox, migrationView,
       sendJson: (r, status, payload) => { sendJson(r, status, payload); return true },
       sendMethodNotAllowed: (r, allow) => { sendMethodNotAllowed(r, allow); return true },

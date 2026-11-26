@@ -83,7 +83,7 @@ test('hook → backend 全链路：引用注入节点的回复让 recalls.used �
       config: { identity: { mode: 'fixed', userId: 'u1', roleId: '', workspace: 'web' }, recall: { enabled: true, maxHits: 3, timeoutMs: 1000 } },
     })
     await state.pre({
-      agent: { session: { id: 'sess-1' } },
+      agent: { session: { id: 'sess-1', header: { cwd: '/work/ws' } } },
       messages: [{ source: { kind: 'user' }, content: [{ type: 'text', text: '网关端口 3982 怎么起' }] }],
       turn: 1, step: 1,
     }, async () => ({ kind: 'enter' }))

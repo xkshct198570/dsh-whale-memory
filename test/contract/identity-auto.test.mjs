@@ -76,7 +76,7 @@ test('identity source：dispose 后不再返回值，也不触发刷新', async 
   assert.equal(await source.refresh(), '')
 })
 
-test('resolveIdentity auto：userId 优先级 hint > 宿主 > Config > local', () => {
+test('resolveIdentity auto：userId 优先级 hint > 宿主 > Config > local（hostState 缺省=旧链）', () => {
   const cfg = Config({ identity: { mode: 'auto', userId: 'cfg-user', roleId: 'cfg-role', workspace: 'web' } }).identity
   assert.equal(resolveIdentity(cfg, null, 'host-user').identity.userId, 'host-user')
   assert.equal(resolveIdentity(cfg, null, 'host-user').source, 'host')
@@ -91,6 +91,45 @@ test('resolveIdentity auto：userId 优先级 hint > 宿主 > Config > local', (
   assert.equal(hostOnly.identity.roleId, 'cfg-role')
   assert.equal(hostOnly.identity.workspace, 'web')
   assert.deepEqual(hostOnly.sources, { userId: 'host', roleId: 'config', workspace: 'config' })
+})
+
+test('resolveIdentity auto 四态（S4 §5.5.1）：absent 才回落；pending/empty 拒；ready 用宿主', () => {
+  const cfg = Config({ identity: { mode: 'auto', userId: 'cfg-user', workspace: 'web' } }).identity
+  // absent（无账号服务）：Config 是稳定身份，允许回落。
+  assert.equal(resolveIdentity(cfg, null, '', 'ws', 'absent').identity.userId, 'cfg-user')
+  // pending/empty：身份未知，不回落出临时分区。
+  assert.deepEqual(resolveIdentity(cfg, null, '', 'ws', 'pending'), { ok: false, error: 'identity_required' })
+  assert.deepEqual(resolveIdentity(cfg, null, '', 'ws', 'empty'), { ok: false, error: 'identity_required' })
+  // 对象形态（identity-source getState 可返回 { phase }）同样识别。
+  assert.deepEqual(resolveIdentity(cfg, null, '', 'ws', { phase: 'pending' }), { ok: false, error: 'identity_required' })
+  // ready：宿主 id 优先于 Config。
+  assert.equal(resolveIdentity(cfg, null, 'host-user', 'ws', 'ready').identity.userId, 'host-user')
+  // ready 但没有 id 是状态机不一致：按未就绪拒，不得回落。
+  assert.deepEqual(resolveIdentity(cfg, null, '', 'ws', 'ready'), { ok: false, error: 'identity_required' })
+  // hint.userId 是显式身份声明，即使宿主 pending 也生效（不是回落）。
+  assert.equal(
+    resolveIdentity(cfg, { userId: 'hint-user' }, '', 'ws', 'pending').identity.userId,
+    'hint-user',
+  )
+})
+
+test('identity source getState 四态：ready/empty/absent；读取异常保持 pending', async () => {
+  const ready = installIdentitySource(fakeCtx({ async getDeviceIdentity() { return { userId: 'u1' } } }).ctx, { log: () => {} })
+  assert.equal(ready.getState(), 'pending')
+  assert.equal(await ready.refresh(), 'u1')
+  assert.equal(ready.getState(), 'ready')
+
+  const empty = installIdentitySource(fakeCtx({ async getDeviceIdentity() { return { osVersion: 'linux' } } }).ctx, { log: () => {} })
+  assert.equal(await empty.refresh(), '')
+  assert.equal(empty.getState(), 'empty')
+
+  const absent = installIdentitySource(fakeCtx(undefined).ctx, { log: () => {} })
+  assert.equal(absent.getState(), 'absent')
+  assert.equal(await absent.refresh(), '')
+
+  const broken = installIdentitySource(fakeCtx({ async getDeviceIdentity() { throw new Error('boom') } }).ctx, { log: () => {} })
+  assert.equal(await broken.refresh(), '')
+  assert.equal(broken.getState(), 'pending', '读取异常是未落定，不得冒充 empty（否则会被回落出临时分区）')
 })
 
 test('resolveIdentity fixed：行为不变，宿主 userId 不参与；缺 userId 仍报 identity_required', () => {
@@ -183,4 +222,19 @@ test('会话身份唯一判据：header 矩阵与 identity_required（工具/画
   assert.equal(got.identity.workspace, '/tmp/ws')
   assert.equal(got.sources.userId, 'host')
   assert.equal(got.sources.workspace, 'session')
+
+  // S4：宿主身份 pending/empty 时会话身份不可判定，即使 Config 有 userId 也不回落。
+  const cfgWithUser = { getIdentityCfg: () => ({ mode: 'auto', userId: 'cfg-user' }), getIdentityHint: () => null, getHostUserId: () => '' }
+  for (const phase of ['pending', 'empty']) {
+    assert.deepEqual(
+      sessionIdentityOf({ header: { cwd: '/tmp/ws' }, ...cfgWithUser, getHostIdentityState: () => phase }),
+      { ok: false, error: 'identity_required' },
+      `${phase} 不得回落 Config 分区`,
+    )
+  }
+  // absent（老宿主无账号服务）按原链落 Config，且 workspace 仍是会话 cwd。
+  const absent = sessionIdentityOf({ header: { cwd: '/tmp/ws' }, ...cfgWithUser, getHostIdentityState: () => 'absent' })
+  assert.equal(absent.ok, true)
+  assert.equal(absent.identity.userId, 'cfg-user')
+  assert.equal(absent.identity.workspace, '/tmp/ws')
 })

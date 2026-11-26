@@ -34,14 +34,14 @@ test('hook：pre-step 写缓存，context 本轮可读到；dispose 后清空', 
   })
   const decision = { kind: 'enter' }
   const ret = await state.pre({
-    agent: { session: { id: 's1' } },
+    agent: { session: { id: 's1', header: { cwd: '/work/ws' } } },
     messages: [{ source: { kind: 'user' }, content: [{ type: 'text', text: '问' }] }],
   }, async () => decision)
   assert.equal(ret, decision)
   assert.equal(state.context.order, 130)
-  assert.match(state.context.text({ scope: { session: { id: 's1' } } }), /旧事/)
+  assert.match(state.context.text({ scope: { session: { id: 's1', header: { cwd: '/work/ws' } } } }), /旧事/)
   hook.dispose()
-  assert.equal(state.context.text({ scope: { session: { id: 's1' } } }), '')
+  assert.equal(state.context.text({ scope: { session: { id: 's1', header: { cwd: '/work/ws' } } } }), '')
 })
 
 test('hook：recall+rules 双关时仍在早退前更新 lastRecall（面板身份闸依赖）', async () => {
@@ -94,7 +94,7 @@ test('hook：recall 传入非空 traceId 且含 session id', async () => {
     config,
   })
   await state.pre({
-    agent: { session: { id: 'session-42' } },
+    agent: { session: { id: 'session-42', header: { cwd: '/work/ws' } } },
     messages: [{ source: { kind: 'user' }, content: [{ type: 'text', text: '问' }] }],
   }, async () => ({ kind: 'enter' }))
   assert.equal(seen.length, 1)
@@ -123,14 +123,14 @@ test('hook：回复引用注入节点 → turn-stopping 回写 used=1（真实 r
     config,
   })
   await state.pre({
-    agent: { session: { id: 's3' } },
+    agent: { session: { id: 's3', header: { cwd: '/work/ws' } } },
     messages: [{ source: { kind: 'user' }, content: [{ type: 'text', text: '网关端口怎么起' }] }],
     turn: 1, step: 1,
   }, async () => ({ kind: 'enter' }))
   assert.equal(calls.length, 0, '未收到回复前不许判定')
 
   state.handlers['agent/assistant-stream'](streamFrame(1, 1, `按记忆：${INJECTED_TEXT}，所以用 start-gateway.sh。`))
-  state.handlers['agent/turn-stopping']({ agent: { session: { id: 's3' } } })
+  state.handlers['agent/turn-stopping']({ agent: { session: { id: 's3', header: { cwd: '/work/ws' } } } })
   assert.deepEqual(calls, [[7, true]])
 })
 
@@ -147,12 +147,12 @@ test('hook：回复没有引用 → 不回写（used 保持未判定 0）', asyn
     config,
   })
   await state.pre({
-    agent: { session: { id: 's4' } },
+    agent: { session: { id: 's4', header: { cwd: '/work/ws' } } },
     messages: [{ source: { kind: 'user' }, content: [{ type: 'text', text: '面板配色' }] }],
     turn: 1, step: 1,
   }, async () => ({ kind: 'enter' }))
   state.handlers['agent/assistant-stream'](streamFrame(1, 1, '今天下午三点开会，先改面板配色。', 's4'))
-  state.handlers['agent/turn-stopping']({ agent: { session: { id: 's4' } } })
+  state.handlers['agent/turn-stopping']({ agent: { session: { id: 's4', header: { cwd: '/work/ws' } } } })
   assert.deepEqual(calls, [])
 })
 
@@ -169,7 +169,7 @@ test('hook：下一条 pre-step 结算上一步（不必等 turn-stopping）', a
     config,
   })
   const pre = (step) => state.pre({
-    agent: { session: { id: 's5' } },
+    agent: { session: { id: 's5', header: { cwd: '/work/ws' } } },
     messages: [{ source: { kind: 'user' }, content: [{ type: 'text', text: '问' }] }],
     turn: 1, step,
   }, async () => ({ kind: 'enter' }))
@@ -177,7 +177,7 @@ test('hook：下一条 pre-step 结算上一步（不必等 turn-stopping）', a
   state.handlers['agent/assistant-stream'](streamFrame(1, 1, INJECTED_TEXT, 's5'))
   await pre(2)
   assert.deepEqual(calls, [[21, true]], '第二步开始时第一步的证据必须已结算')
-  state.handlers['agent/turn-stopping']({ agent: { session: { id: 's5' } } })
+  state.handlers['agent/turn-stopping']({ agent: { session: { id: 's5', header: { cwd: '/work/ws' } } } })
   assert.equal(calls.length, 1, '已结算的条目不许重复回写')
 })
 
@@ -192,12 +192,12 @@ test('hook：backend 没有 markRecallUsed（旧实现）也不影响回复链�
     config,
   })
   await state.pre({
-    agent: { session: { id: 's6' } },
+    agent: { session: { id: 's6', header: { cwd: '/work/ws' } } },
     messages: [{ source: { kind: 'user' }, content: [{ type: 'text', text: '问' }] }],
     turn: 1, step: 1,
   }, async () => ({ kind: 'enter' }))
   state.handlers['agent/assistant-stream'](streamFrame(1, 1, INJECTED_TEXT, 's6'))
-  assert.doesNotThrow(() => state.handlers['agent/turn-stopping']({ agent: { session: { id: 's6' } } }))
+  assert.doesNotThrow(() => state.handlers['agent/turn-stopping']({ agent: { session: { id: 's6', header: { cwd: '/work/ws' } } } }))
 })
 
 test('hook：dispose 清空待判条目，不再回写', async () => {
@@ -213,14 +213,14 @@ test('hook：dispose 清空待判条目，不再回写', async () => {
     config,
   })
   await state.pre({
-    agent: { session: { id: 's7' } },
+    agent: { session: { id: 's7', header: { cwd: '/work/ws' } } },
     messages: [{ source: { kind: 'user' }, content: [{ type: 'text', text: '问' }] }],
     turn: 1, step: 1,
   }, async () => ({ kind: 'enter' }))
   hook.dispose()
   assert.equal(hook.cache.size, 0)
   state.handlers['agent/assistant-stream'](streamFrame(1, 1, INJECTED_TEXT, 's7'))
-  state.handlers['agent/turn-stopping']({ agent: { session: { id: 's7' } } })
+  state.handlers['agent/turn-stopping']({ agent: { session: { id: 's7', header: { cwd: '/work/ws' } } } })
   assert.deepEqual(calls, [])
 })
 
@@ -236,7 +236,7 @@ test('hook：injectLevels/showSources 真切到 backend.recall（P1-1 假开关�
     config: cfg,
   })
   await state.pre({
-    agent: { session: { id: 's-inject' } },
+    agent: { session: { id: 's-inject', header: { cwd: '/work/ws' } } },
     messages: [{ source: { kind: 'user' }, content: [{ type: 'text', text: '端口是多少' }] }],
   }, async () => ({ kind: 'enter' }))
 
@@ -253,7 +253,7 @@ test('hook：配置里没有 injectLevels 时不伪造过滤（旧配置兼容�
     config, // 该夹具的 recall 段没有 injectLevels/showSources
   })
   await state.pre({
-    agent: { session: { id: 's-inject-default' } },
+    agent: { session: { id: 's-inject-default', header: { cwd: '/work/ws' } } },
     messages: [{ source: { kind: 'user' }, content: [{ type: 'text', text: '问' }] }],
   }, async () => ({ kind: 'enter' }))
   assert.equal(seen[0].injectLevels, undefined, '缺失即不过滤，交给 backend 保持旧行为')
@@ -288,7 +288,7 @@ test('D1：规则文件外部变更导致摘要块陈旧 → pre-step 自动补�
     config: { ...config, recall: { enabled: false }, rules: { enabled: true, dir: rulesDir, summaryBudgetChars: 6000 } },
   })
   await state.pre({
-    agent: { session: { id: 's-stale' } },
+    agent: { session: { id: 's-stale', header: { cwd: '/work/ws' } } },
     messages: [{ source: { kind: 'user' }, content: [{ type: 'text', text: '问' }] }],
   }, async () => ({ kind: 'enter' }))
   // 补渲染在 setImmediate：等它落地（最多 1s）。

@@ -56,8 +56,10 @@ test('盲区②：搜索反哺落库→可召回→到期被巩固降 stale', as
   const ctx = { on(ev, fn) { handlers[ev] = fn; return () => {} }, effect(fn) { return fn() } }
   try {
     installSearchFeed(ctx, { backend, config })
-    handlers['tools/result']({ name: 'free_search', callId: 'c9', arguments: { query: '潮州天气' } },
-      { value: { answer: '多云 26 度', sources: [{ title: '天气网', snippet: '潮州今天多云' }] } })
+    handlers['tools/result']({
+      name: 'free_search', callId: 'c9', arguments: { query: '潮州天气' },
+      agent: { session: { id: 's1', header: { cwd: '/work/ws' } } },
+    }, { value: { answer: '多云 26 度', sources: [{ title: '天气网', snippet: '潮州今天多云' }] } })
     // 等写队列异步落库
     for (let i = 0; i < 50; i += 1) {
       const page = await backend.nodes({ limit: 10, offset: 0 })

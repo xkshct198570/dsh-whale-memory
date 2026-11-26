@@ -19,7 +19,7 @@
  */
 import { readdirSync, realpathSync, statSync } from 'node:fs'
 import { join } from 'node:path'
-import { deriveWorkspace, isDelegatedHeader, resolveIdentity } from './identity.js'
+import { isDelegatedHeader, sessionIdentityOf } from './identity.js'
 import { bool, num, value } from '../shared/config-values.js'
 import { judgeReply } from '../core/adoption.js'
 import { listRules } from '../core/rule-store.js'
@@ -291,7 +291,7 @@ function withTimeout(promise, ms) {
 /**
  * @param {any} ctx
  * @param {{ backend: any, config: any, getIdentityCfg?: () => any, getIdentityHint?: () => any,
- *   getHostUserId?: () => string, log?: (s:string)=>void }} deps
+ *   getHostUserId?: () => string, getHostIdentityState?: () => string, log?: (s:string)=>void }} deps
  * @returns {{ cache: Map<string,{text:string,exp:number}>, dispose: () => void,
  *   invalidateRulesCache: () => number }}
  */
@@ -300,6 +300,7 @@ export function installHook(ctx, {
   getIdentityCfg = () => config?.identity,
   getIdentityHint = () => null,
   getHostUserId = () => '',
+  getHostIdentityState = undefined,
   identityState = null,
   log = () => {},
 }) {
@@ -623,15 +624,24 @@ export function installHook(ctx, {
       if (payload?.signal?.aborted) return decision
 
       const sid = String(sessionId)
-      const hostUserId = typeof getHostUserId === 'function' ? String(getHostUserId() || '') : ''
-      const sessionWorkspace = deriveWorkspace(agent?.session?.header)
-      const ident = resolveIdentity(getIdentityCfg(), getIdentityHint(), hostUserId, sessionWorkspace)
-      if (!ident.ok) return decision
+      // 会话身份唯一判据（架构书 §5.5.1）：缺 cwd / 宿主身份 pending·empty / 子代理 → 跳过。
+      const ident = sessionIdentityOf({
+        header: agent?.session?.header, getIdentityCfg, getIdentityHint, getHostUserId, getHostIdentityState,
+      })
+      if (!ident.ok) {
+        // 不静默：身份未定是状态而非"没有记忆"，每会话只打一次（防止每步刷屏）。
+        if (identityState && identityState.identitySkipLogged !== sid) {
+          identityState.identitySkipLogged = sid
+          log('[whale-memory] identity unavailable: recall/rules skipped (identity_required)')
+        }
+        return decision
+      }
       // 面板/routes 没有会话 header；这里把“最近一次进入的会话身份”记到共享 state，
-      // /stats 与 /config 只读展示。必须在 recall/rules 双关早退之前更新：
+      // /stats 与 /config 只读展示、反思空闲也用它。必须在 recall/rules 双关早退之前更新：
       // 否则双关配置下面板永远显示旧 workspace，S0 的写/审身份闸会误判。
       if (identityState && typeof identityState === 'object') {
         identityState.lastRecall = {
+          sessionId: sid,
           workspace: ident.identity.workspace,
           roleId: ident.identity.roleId,
           userId: ident.identity.userId,

@@ -8,7 +8,7 @@
  */
 import { createHash } from 'node:crypto'
 import { bool, num } from '../shared/config-values.js'
-import { resolveIdentity } from './identity.js'
+import { isDelegatedHeader, sessionIdentityOf } from './identity.js'
 import { memoryPressure } from '../shared/memory-guard.js'
 
 // 工具名白名单覆盖 DSH 常见检索工具；只认"词边界在开头/下划线"且整体收尾的写法。
@@ -76,17 +76,20 @@ function summaryOf(value) {
 /**
  * @param {any} ctx
  * @param {{ backend:any, config:any, getIdentityCfg?:Function, getIdentityHint?:Function,
- *   getHostUserId?:Function, log?:Function }} deps
- *   身份三分量必须与 hook/routes 同源：只传 Config 时 auto 模式会落成 userId='local'，
- *   召回侧却按宿主登录 id 读，两条链路永不命中同一分区。
+ *   getHostUserId?:Function, getHostIdentityState?:Function, log?:Function }} deps
+ *   身份只走 `sessionIdentityOf`（架构书 §5.5.1）：搜索反哺是写路径，必须落会话分区；
+ *   无 agent/header、子代理或身份不可判定一律跳过并留一次可见日志，绝不写 `workspace=''`。
  */
 export function installSearchFeed(ctx, {
   backend, config,
   getIdentityCfg = () => config?.identity,
   getIdentityHint = () => null,
   getHostUserId = () => '',
+  getHostIdentityState = undefined,
   log = () => {},
 }) {
+  /** 身份跳过只记一次：每个搜索事件都打会刷屏，但静默跳过不可观测。 */
+  let skippedIdentity = false
   const handler = (exec, result) => {
     try {
       if (!bool(config?.write?.enabled, true) || !bool(config?.write?.searchFeed, false)) return
@@ -99,13 +102,16 @@ export function installSearchFeed(ctx, {
       let text = `搜索「${query}」：${summary}`
       if (text.length > MAX_CHARS) text = text.slice(0, MAX_CHARS - 1) + '…'
       const ttl = num(config?.write?.searchTtlHours, 24)
-      const ident = resolveIdentity(
-        getIdentityCfg(),
-        typeof getIdentityHint === 'function' ? getIdentityHint() : null,
-        typeof getHostUserId === 'function' ? String(getHostUserId() || '') : '',
-        '',
-      )
-      if (!ident.ok) return
+      const header = exec?.agent?.session?.header
+      if (isDelegatedHeader(header)) return
+      const ident = sessionIdentityOf({ header, getIdentityCfg, getIdentityHint, getHostUserId, getHostIdentityState })
+      if (!ident.ok) {
+        if (!skippedIdentity) {
+          skippedIdentity = true
+          log('[whale-memory] searchFeed skip identity_required (no session partition)')
+        }
+        return
+      }
       // 同查询 + 本地日期 → 同一个带 #key 的 origin（跨进程稳定）。
       // 去重依赖后端契约（backend/writer 侧，不在本文件）：同身份已有相同 origin 的 active 节点时
       // 走 MERGE 更新摘要，而不是新增一条记忆。本文件只保证 key 稳定、重复事件撞同一个 origin。

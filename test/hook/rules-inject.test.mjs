@@ -86,7 +86,7 @@ function userMsg(text) {
   return [{ source: { kind: 'user' }, content: [{ type: 'text', text }] }]
 }
 
-function preStepPayload(sessionId, text, header = {}) {
+function preStepPayload(sessionId, text, header = { cwd: '/work/ws' }) {
   return { agent: { session: { id: sessionId, header } }, messages: userMsg(text) }
 }
 
@@ -316,7 +316,8 @@ test('hook：确认短语 → 下一轮自动收录，context 给【规则已收
 test('hook：需要改写且无模型 → 【规则待人工处理】并转面板（不阻断）', async (t) => {
   resetSessionPending()
   const { rulesDir } = freshHome(t)
-  seed(rulesDir, { key: 'rule-src-keep', number: 1, modality: 'must', object: '源文件', exceptions: ['正在被引用的文件'] }, '源文件必须保留。')
+  // S4 后会话身份工作区非空：要让新提案命中同作用域规则，种子规则必须同 scope（否则 relation=new）。
+  seed(rulesDir, { key: 'rule-src-keep', number: 1, scope: 'workspace:/work/ws', modality: 'must', object: '源文件', exceptions: ['正在被引用的文件'] }, '源文件必须保留。')
   const { ctx, state } = fakeCtx()
   const hook = installHook(ctx, { backend: quietBackend(), config: cfgOf(rulesDir) })
   t.after(() => hook.dispose())
