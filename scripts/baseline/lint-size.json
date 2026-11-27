@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-11-27T15:01:04.086Z",
+  "generatedAt": "2026-11-27T18:33:37.120Z",
   "thresholds": {
     "plan": 800,
     "freeze": 1200,
@@ -200,6 +200,7 @@
     "test/data/search.test.mjs": 287,
     "test/data/wrap-runs.test.mjs": 143,
     "test/data/writer-audit.test.mjs": 174,
+    "test/data/writer-candidates.test.mjs": 103,
     "test/data/writer-decide.test.mjs": 238,
     "test/data/writer-harness.mjs": 55,
     "test/data/writer-ingest.test.mjs": 220,
