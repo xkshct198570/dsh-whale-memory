@@ -62,3 +62,15 @@ export function localDayKey(date = new Date()) {
   const p = (n) => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
 }
+
+/**
+ * 本地自然日零点（秒级时间戳，与 jobs.created_at 同单位）。
+ * 日限落库查询（0.8.1-09）按它切日：用 UTC 零点会在夜间把预算错切到前一天。
+ *
+ * @param {Date} [date]
+ * @returns {number} 当天 00:00:00.000 的 epoch 秒
+ */
+export function localDayStart(date = new Date()) {
+  const d = date instanceof Date ? date : new Date(date)
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0).getTime() / 1000
+}

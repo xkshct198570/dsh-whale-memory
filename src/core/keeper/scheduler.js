@@ -303,6 +303,31 @@ export function createKeeper({
       ).get(key)?.n || 0))
     },
 
+    /**
+     * 某 kind 在指定时间窗内、按 payload.reason 过滤的历史行数（0.8.1-09 反思日限用）。
+     *
+     * 为什么在 keeper 而不在调用方：jobs 表 owner 是 keeper；reflect 不直接读库，
+     * 判据（按 reason 区分自动/手动）只在这里实现一次。reason 落在 payload 白名单里，
+     * 终态脱敏后仍可查（见 job-payload.js）。
+     *
+     * @param {string} kind
+     * @param {{ sinceSec?: number, reasons?: string[] }} [opts] sinceSec 缺省=全时段；reasons 空=不按 reason 过滤
+     * @returns {number}
+     */
+    countRuns(kind, { sinceSec = 0, reasons = [] } = {}) {
+      const key = String(kind || '')
+      const since = Number(sinceSec) || 0
+      const list = Array.isArray(reasons) ? reasons.map((item) => String(item)) : []
+      return Number(store.withDb((db) => {
+        if (list.length === 0) {
+          return db.prepare('SELECT count(*) AS n FROM jobs WHERE kind=? AND created_at>=?').get(key, since)
+        }
+        const marks = list.map(() => '?').join(',')
+        return db.prepare(`SELECT count(*) AS n FROM jobs WHERE kind=? AND created_at>=?
+          AND json_extract(payload,'$.reason') IN (${marks})`).get(key, since, ...list)
+      })?.n || 0)
+    },
+
     /** 队列快照（面板用）：running/queued/failed 为**计数**，不是布尔。 */
     status() {
       const rows = store.withDb((db) => db.prepare(`SELECT id, kind, state, attempts, next_at, last_error

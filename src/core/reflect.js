@@ -10,7 +10,7 @@
 import { bool, num, value } from '../shared/config-values.js'
 import { ingestPolicyOf } from '../shared/ingest-policy.js'
 import { layerOfMemoryType } from '../shared/layers.js'
-import { compileSuppressWindows, inSuppressWindow, localDayKey } from '../shared/maintenance-window.js'
+import { compileSuppressWindows, inSuppressWindow, localDayKey, localDayStart } from '../shared/maintenance-window.js'
 import { memoryPressure } from '../shared/memory-guard.js'
 import { buildReflectPrompt, parseReflectOutput } from './reflect-prompt.js'
 
@@ -19,6 +19,9 @@ import { buildReflectPrompt, parseReflectOutput } from './reflect-prompt.js'
  * 解析出 []（真机 47/47 次 `items=0`，2026-11-26 实核）。给足“思考+JSON”，并只收一种文本通道。
  */
 const REFLECT_MAX_TOKENS = 8192
+
+/** 计入自动日限的触发来源（手动 manual 是显式动作，不计入、也不受限）。 */
+const AUTO_REASONS = Object.freeze(['turn_steps', 'idle'])
 
 async function collectLlmText(llm, selection, prompt, modelOverride) {
   const provider = selection?.provider
@@ -181,6 +184,7 @@ export function installReflectScheduler(ctx, {
   const clock = typeof now === 'function' ? now : () => Date.now()
   let lastActivity = clock()
   let running = false
+  /** 日限：真源是 jobs 表（当日 reason∈AUTO_REASONS 的 reflect 行）；内存计数只做查询失败回落。 */
   let autoDay = ''
   let autoRuns = 0
   /** 坏窗口值只记一次（按原文签名去重；配置改了再记新值）。 */
@@ -249,6 +253,33 @@ export function installReflectScheduler(ctx, {
   }
 
   /**
+   * 当日自动反思次数（0.8.1-09）：按本地自然日从 jobs 表汇总 reason∈{turn_steps,idle}，
+   * 重启后同日不超限；进程内计数只作查询失败回落（fail-open 必须能看见）。
+   *
+   * @param {number} dayStartSec localDayStart() 的秒级零点
+   * @returns {number}
+   */
+  const countAutoRunsToday = (dayStartSec) => {
+    if (keeper && typeof keeper.countRuns === 'function') {
+      try {
+        return Number(keeper.countRuns('reflect', { sinceSec: dayStartSec, reasons: AUTO_REASONS })) || 0
+      } catch (err) {
+        log(`[whale-memory] reflect daily count fallback to memory: ${err?.message || err}`)
+      }
+    }
+    const day = localDayKey(new Date(clock()))
+    if (day !== autoDay) { autoDay = day; autoRuns = 0 }
+    return autoRuns
+  }
+
+  /** 内存回落计数随入队递增（无论走 DB 还是直跑，都保持回落路径可判）。 */
+  const bumpAutoRuns = () => {
+    const day = localDayKey(new Date(clock()))
+    if (day !== autoDay) { autoDay = day; autoRuns = 0 }
+    autoRuns += 1
+  }
+
+  /**
    * 单一自动闸：enabled → 队列空 → 日限 → 峰时；通过后入队（带身份 payload）或直跑。
    * @param {{ identity: object, sessionId?: string, reason?: string }} opts
    * @returns {{ ok: boolean, reason?: string, scheduled?: boolean, ran?: boolean, jobId?: number }}
@@ -258,9 +289,8 @@ export function installReflectScheduler(ctx, {
     if (!ident) return { ok: false, reason: 'identity_required' }
     if (!bool(config?.reflect?.enabled, false)) return { ok: false, reason: 'disabled' }
     if (queueBusy()) return { ok: false, reason: 'queued' }
-    const day = localDayKey(new Date(clock()))
-    if (day !== autoDay) { autoDay = day; autoRuns = 0 }
-    if (autoRuns >= num(config?.reflect?.maxRunsPerDay, 24)) return { ok: false, reason: 'daily_limit' }
+    const maxRuns = num(config?.reflect?.maxRunsPerDay, 24)
+    if (countAutoRunsToday(localDayStart(new Date(clock()))) >= maxRuns) return { ok: false, reason: 'daily_limit' }
     const compiled = compileSuppressWindows(value(config?.maintenance?.suppressWindows, []))
     for (const bad of compiled.invalid) {
       if (warnedWindows.has(bad)) continue
@@ -274,7 +304,7 @@ export function installReflectScheduler(ctx, {
     if (keeper && typeof keeper.enqueue === 'function') {
       try {
         const jobId = keeper.enqueue('reflect', payload)
-        autoRuns += 1
+        bumpAutoRuns()
         lastActivity = clock()
         log(`[whale-memory] reflect scheduled source=${tag} job=${jobId}`)
         return { ok: true, scheduled: true, jobId }
@@ -284,7 +314,7 @@ export function installReflectScheduler(ctx, {
       }
     }
     running = true
-    autoRuns += 1
+    bumpAutoRuns()
     lastActivity = clock()
     // run 自身已收敛异常；这里再兜一层并保证 running 一定释放（否则直跑路径会永久 queued）。
     Promise.resolve(run(payload))
