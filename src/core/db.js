@@ -188,6 +188,22 @@ export function schemaStateOf(db) {
 }
 
 /**
+ * 解析库目录（`<dataDir>` 或 `$DSH_HOME/whale-memory` 兜底）——openDb 与 keeper 租约共用同一口径。
+ *
+ * 为什么要导出：keeper 在 backend 首次开库前就要落锁；再抄一份 `DSH_HOME` 兜底逻辑，
+ * 两处迟早分叉（租约会锁到另一个目录）。单一实现只此一处。
+ *
+ * @param {unknown} dataDir
+ * @returns {string} 绝对目录
+ */
+export function resolveDbDir(dataDir) {
+  const raw = String(dataDir ?? '').trim()
+  return raw ? resolve(raw) : join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'whale-memory')
+}
+
+/**
+ * 打开库（`<dataDir>/memory.db`；dataDir 为空落 `$DSH_HOME/whale-memory`）。
+ *
  * @param {string} dataDir 数据目录（不存在则创建）
  * @param {{ readOnly?: boolean, backupOnMigrate?: boolean }} [opts]
  *   backupOnMigrate=false：跳过快照与 v7 fail-closed 闸（**仅**单测/一次性脚本可用；
@@ -196,8 +212,7 @@ export function schemaStateOf(db) {
  * @throws {Error & { code?: string }} 迁移快照失败时 `code='migration_backup_failed'`，且**不执行迁移**
  */
 export function openDb(dataDir, { readOnly = false, backupOnMigrate: doBackup = true } = {}) {
-  const raw = String(dataDir ?? '').trim()
-  const dir = raw ? resolve(raw) : join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'whale-memory')
+  const dir = resolveDbDir(dataDir)
 
   if (!readOnly) mkdirSync(dir, { recursive: true })
 

@@ -4,13 +4,13 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { utimesSync } from 'node:fs'
 import {
   RULES_BEGIN, RULES_END,
-  agentsNeedsRepair, agentsPathOf, fileHasMarkers, inspectMarkers,
+  agentsBlockStale, agentsNeedsRepair, agentsPathOf, fileHasMarkers, inspectMarkers,
   renderAgentsDigest, rulesDigestContent, titleOfRule,
 } from '../../src/core/rule-render.js'
 
@@ -498,4 +498,27 @@ test('agentsBlockStale：内容已对齐时 render 必须解除陈旧（禁止�
   assert.equal(agentsNeedsRepair({ agentsPath: path, rulesDir, newest, freshUpTo: newest }), false)
   // 新的规则改动（更大的 mtime）仍要能触发一次修复。
   assert.equal(agentsNeedsRepair({ agentsPath: path, rulesDir, newest: newest + 1000, freshUpTo: newest }), true)
+})
+
+test('agentsBlockStale：给了期望摘要就按内容判（mtime 假黄灯不再误报）', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'whale-agents-stale-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const rulesDir = join(dir, 'rules')
+  mkdirSync(rulesDir)
+  const agents = join(dir, 'AGENTS.md')
+  writeFileSync(agents, `# hi\n<!-- whale-memory:rules:begin -->\n期望正文\n<!-- whale-memory:rules:end -->\n`)
+  writeFileSync(join(rulesDir, 'iron-rule-1.md'), 'newer rule file')
+  // 让规则文件明确新于 AGENTS（mtime 判据下会判陈旧）
+  utimesSync(join(rulesDir, 'iron-rule-1.md'), new Date(Date.now() + 5000), new Date(Date.now() + 5000))
+  assert.equal(agentsBlockStale({ agentsPath: agents, rulesDir }), true, '无期望摘要时仍按 mtime 判陈旧')
+  assert.equal(
+    agentsBlockStale({ agentsPath: agents, rulesDir, expectedContent: '期望正文' }),
+    false,
+    '内容一致（只是 mtime 旧）不得报陈旧',
+  )
+  assert.equal(
+    agentsBlockStale({ agentsPath: agents, rulesDir, expectedContent: '换了一份正文' }),
+    true,
+    '内容不一致必须报陈旧（不看 mtime）',
+  )
 })

@@ -409,14 +409,15 @@ export function recoverRunningJobs(store, log = () => {}) {
  * 装配：先回收崩溃残留，再 createKeeper（默认 handlers + unref 定时器）+ ctx.effect 生命周期。
  *
  * @param {{ effect?: (fn: () => () => void, label?: string) => any }} ctx
- * @param {Parameters<typeof createKeeper>[0]} deps
+ * @param {Parameters<typeof createKeeper>[0] & { dataDir?: string }} deps
+ *   dataDir：装配层解析好的库目录（backend 未开库时租约用它落锁）。
  */
 export function installKeeper(ctx, deps = {}) {
-  const { store, config = {}, log = () => {} } = deps
+  const { store, config = {}, log = () => {}, dataDir = '' } = deps
   // 单实例租约（0.8.1-07）：双进程共享同一 dataDir 时，第二个进程不得复位 running、
   // 也不得消费 jobs——否则同一 job 会被两个 keeper 各跑一遍（重复烧模型/重复写库）。
   // 锁策略（开关/dataDir/只读原因）在 keeper/lock.js；这里只做装配。
-  const lease = openKeeperLease({ store, config, log })
+  const lease = openKeeperLease({ store, config, log, dataDir })
   // 只有拿到租约的进程才做崩溃补偿：复位 running 正是"双实例重复执行"的源头。
   if (lease.ok) recoverRunningJobs(store, log)
   const keeper = createKeeper({

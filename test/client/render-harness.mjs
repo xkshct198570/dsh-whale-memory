@@ -86,7 +86,7 @@ export function loadSlots(configOverride = null, extra = {}) {
         return { ok: spec.status >= 200 && spec.status < 300, status: spec.status, json: async () => spec.body }
       }
       const body = path.endsWith('/config')
-        ? { ok: true, config }
+        ? (extra.configBody || { ok: true, config })
         : path.endsWith('/wrap/status') && extra.wrapStatus
           ? extra.wrapStatus
           : path.includes('/wrap/sessions')

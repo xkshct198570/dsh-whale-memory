@@ -217,8 +217,9 @@ export function rulesHealthPayload({ root = '', config = {}, detect = detectGit 
 
   // 黄灯（非红）：不影响 ok，但必须让面板/交接看得到——这些是「规则静默消失」的预兆。
   const warnings = []
+  let digest = null
   try {
-    const digest = rulesDigestContent(list.rules, { dir, budgetChars: summaryBudgetOf(config) })
+    digest = rulesDigestContent(list.rules, { dir, budgetChars: summaryBudgetOf(config) })
     if (digest.skipped?.length) {
       warnings.push({
         code: 'summary_budget_skipped',
@@ -239,7 +240,8 @@ export function rulesHealthPayload({ root = '', config = {}, detect = detectGit 
   } catch { /* 注入统计缺失=没有事实 */ }
   try {
     const agentsPath = agentsPathOf(dir)
-    if (agentsBlockStale({ agentsPath, rulesDir: dir })) {
+    // 传期望摘要：内容一致即不陈旧（mtime 假黄灯的根因是 mtime，不是内容）。
+    if (agentsBlockStale({ agentsPath, rulesDir: dir, expectedContent: digest ? digest.content : null })) {
       warnings.push({
         code: 'agents_block_stale',
         file: agentsPath,

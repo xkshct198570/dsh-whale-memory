@@ -270,16 +270,26 @@ export function rulesDigestContent(rules, opts = {}) {
  * 为什么需要：`renderAgents=false` 时摘要不重渲染，旧块里的全局规则会"零次出现"；
  * hook 必须能判定块陈旧并降级注入 global（宁可在旧块仍在时双份，也不能一条都看不见）。
  *
- * @param {{agentsPath?:string, rulesDir?:string}} [args]
+ * @param {{agentsPath?:string, rulesDir?:string, newest?:number, expectedContent?:string|null}} [args]
+ *   expectedContent：期望的摘要块正文（给了就按内容判陈旧，不再看 mtime）。
  * @returns {boolean}
  */
-export function agentsBlockStale({ agentsPath = '', rulesDir = '', newest = undefined } = {}) {
+export function agentsBlockStale({ agentsPath = '', rulesDir = '', newest = undefined, expectedContent = null } = {}) {
   const file = trimmed(agentsPath)
   const dir = trimmed(rulesDir)
   if (!file || !dir) return false
   let agentsMtime
   try { agentsMtime = statSync(file).mtimeMs } catch { return false }
-  if (!fileHasMarkers(file)) return false
+  let content = ''
+  try { content = readFileSync(file, 'utf8') } catch { return false }
+  const markers = inspectMarkers(content)
+  if (!markers.ok) return false
+  // 内容优先判据（0.8.3）：mtime 会被 git checkout/编辑器保存/复制刷新，
+  // 而块内容没变时「旧于规则文件」只是一条假黄灯（live 实测常驻 agents_block_stale）。
+  // 调用方给了期望摘要就逐字比块体：一致即不陈旧；不一致就是真的旧（不看 mtime）。
+  if (typeof expectedContent === 'string' && expectedContent.length > 0) {
+    return managedBlockBody(content, markers) !== expectedContent.trim()
+  }
   // newest 由调用方（hook）复用同一步已算好的规则最大 mtime：避免每步两遍 readdir+22×stat
   // （审计 P1-11：0.352 ms/步纯 fs）。未提供时才自己扫。
   let newestMtime = Number(newest)
@@ -356,6 +366,17 @@ export function inspectMarkers(content, begin = RULES_BEGIN, end = RULES_END) {
   const stop = text.indexOf(end)
   if (stop < start) return { beginCount, endCount, start, stop, ok: false, code: 'markers_out_of_order' }
   return { beginCount, endCount, start, stop, ok: true, code: '' }
+}
+
+/**
+ * 取管理块正文（begin 标记后到 end 标记前），CRLF 归一为 LF 并去掉首尾空行。
+ * @param {string} content 文件全文
+ * @param {{start:number, stop:number}} markers inspectMarkers 的结果
+ * @returns {string}
+ */
+function managedBlockBody(content, markers) {
+  const raw = String(content ?? '').slice(markers.start + RULES_BEGIN.length, markers.stop)
+  return raw.replace(/\r\n/g, '\n').replace(/^\n+/, '').replace(/\n+$/, '')
 }
 
 /** 文件是否含完整单例标记块；读不到/没有都算 false（hook 的降级注入判据）。 */

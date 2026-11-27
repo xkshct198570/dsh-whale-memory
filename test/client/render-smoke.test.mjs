@@ -269,3 +269,24 @@ test('手动反思按钮不受 reflect.enabled 约束（S4 契约：显式动作
   assert.ok(calls.some((call) => call.method === 'POST' && call.path.endsWith('/reflect')),
     '点击必须真的 POST /reflect（不是假按钮）')
 })
+
+test('概览：身份就绪后立即重取 /recalls（修「Latest 3 recalls 恒空」的时序 bug）', async () => {
+  const calls = []
+  const config = { ...DEFAULT_CONFIG, panel: { ...DEFAULT_CONFIG.panel, tab: 'overview' } }
+  const { slots, mount } = loadSlots(config, {
+    calls,
+    configBody: {
+      ok: true,
+      config,
+      runtimeIdentity: { userId: 'u1', roleId: '', runtimeWorkspace: '/ws' },
+      identityOverride: true,
+    },
+  })
+  await mount(slots.main, { t: (key) => key, locale: 'zh' }, 8)
+  const recallCalls = calls.filter((entry) => entry.path.includes('/recalls'))
+  assert.ok(recallCalls.length >= 2, '身份到达后必须再取一次 /recalls，不能等 60s 轮询')
+  assert.ok(
+    recallCalls.some((entry) => entry.path.includes('userId=u1') && entry.path.includes('workspace=%2Fws')),
+    '重取必须带身份参数（否则只命中共享分区）',
+  )
+})

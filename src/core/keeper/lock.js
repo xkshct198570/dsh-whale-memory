@@ -109,16 +109,20 @@ export function acquireKeeperLock({ dir, log = () => {}, now = () => Date.now() 
  * 取 keeper 租约（装配层唯一入口）：把「开关 / dataDir 解析 / 只读原因」全部收敛在这里，
  * scheduler 只关心结果（consume 与否）。
  *
- * @param {{ store?: any, config?: any, log?: (line: string) => void }} [opts]
+ * @param {{ store?: any, config?: any, log?: (line: string) => void, dataDir?: string }} [opts]
+ *   dataDir：装配层用 db.js 的 resolveDbDir 解析好的绝对目录（backend 未开库时的兜底）。
  * @returns {{ ok: boolean, reason?: string, owner?: object, release: () => void }}
  *   ok=true 表示本进程是 owner（可消费 jobs，可做崩溃补偿）。
  */
-export function openKeeperLease({ store, config = {}, log = () => {} } = {}) {
+export function openKeeperLease({ store, config = {}, log = () => {}, dataDir = '' } = {}) {
   if (!bool(config?.advanced?.singleInstanceLock, true)) {
     return { ok: true, reason: 'disabled', release: () => {} }
   }
   const dbFile = String(store?.dbFile || '')
-  const dir = dbFile ? dirname(dbFile) : String(config?.dataDir || '')
+  // 取值顺序：已开库的真实路径 → 装配层解析出的 dataDir → config.dataDir。
+  // 为什么需要第二项：live 的 keeper 在 backend 首次开库之前装配，store.dbFile 还是空串；
+  // 只靠 dbFile/config 会退化成 nokdir 的「单进程假设」，双开时锁形同虚设。
+  const dir = dbFile ? dirname(dbFile) : String(dataDir || config?.dataDir || '')
   const lease = acquireKeeperLock({ dir, log })
   if (lease.ok) return lease
   if (lease.reason === 'no_dir') {

@@ -175,3 +175,26 @@ test('超时上限可关闭（0=不限）且终态失败在 attempts 到上限�
   const failed = backend.withDb((db) => db.prepare('SELECT state,attempts FROM jobs WHERE id=?').get(seed))
   assert.equal(failed.state, 'failed', 'attempts 到上限的失败不得被再次重排')
 })
+
+test('installKeeper：backend 未开库时用装配层 dataDir 落租约（live 装配顺序回归）', (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'whale-keeper-live-order-'))
+  // 关键：不先调 withDb/ready——live 的 installKeeper 就发生在 backend 首次开库之前。
+  const backend = createBackend({ mode: 'local' }, { dataDir: home, useWorker: false, config: {}, log: () => {} })
+  t.after(() => { backend.dispose(); rmSync(home, { recursive: true, force: true }) })
+  assert.equal(backend.dbFile, '', '前置条件：backend 尚未开库（live 的真实装配顺序）')
+
+  const logs = []
+  const disposers = []
+  const ctx = { effect: (fn) => { disposers.push(fn()) } }
+  const config = { advanced: { singleInstanceLock: true } }
+  const first = installKeeper(ctx, { store: backend, config, log: (line) => logs.push(line), dataDir: home })
+  assert.equal(first.consuming, true, '有 dataDir 就必须拿到租约，而不是退化成单进程假设')
+  assert.ok(existsSync(lockFile(home)), '锁文件必须真的落在库目录')
+  assert.equal(logs.some((line) => line.includes('keeper lock skipped')), false, '不得再回退 no_dir')
+
+  const second = installKeeper(ctx, { store: backend, config, log: (line) => logs.push(line), dataDir: home })
+  assert.equal(second.consuming, false, '同目录第二个实例必须只读')
+  assert.ok(logs.some((line) => line.includes('keeper read-only: reason=held')))
+  for (const dispose of disposers) dispose()
+  assert.equal(existsSync(lockFile(home)), false, '释放后锁文件消失')
+})

@@ -18,6 +18,7 @@ import { installConfigMigration } from './src/host/config-migration.js'
 import { installReflectScheduler } from './src/core/reflect.js'
 import { installReflectTrigger } from './src/host/reflect-trigger.js'
 import { installKeeper } from './src/core/keeper.js'
+import { resolveDbDir } from './src/core/db.js'
 import { installSessionCapture } from './src/host/session-capture.js'
 import { installSessionWrap } from './src/host/session-wrap.js'
 import { installOutboxWatchdog } from './src/core/hybrid.js'
@@ -303,7 +304,9 @@ export function apply(ctx, config) {
   createWhaleMemoryService({ ctx, backendRef, getHook: () => hook, identityState, log })
 
   // S4 后台调度：jobs 状态机 + 单飞 + 启动补偿 + 水位闸门；反思/巩固/日报都走它。
-  const keeper = installKeeper(ctx, { store: backendProxy, config, log })
+  // 租约要在 backend 首次开库前落锁：这里给出与 openDb 同源的绝对目录，
+  // 否则 live 会走 no_dir 的「单进程假设」（双开时锁不生效）。
+  const keeper = installKeeper(ctx, { store: backendProxy, config, log, dataDir: resolveDbDir(config?.dataDir) })
   // write job 的唯一消费者是写队列（构造/重试都在 writer 内）；keeper 只做启动补偿：
   // 进程重启后遗留的 queued 写 job 要被续跑，不能等下一次用户写入才处理。
   ctx.effect(() => {
