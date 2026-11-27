@@ -39,6 +39,18 @@
       },
       "versions": [
         {
+          "version": "0.8.2",
+          "publishTimestamp": 1795805848,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/xkshct198570/dsh-whale-memory.git",
+            "commit": "b390219a5a3d74d74c97387c97e446c15f77f94a"
+          },
+          "engines": {
+            "dsh": ">=0.2.2-rc.5 <0.3.0-0"
+          }
+        },
+        {
           "version": "0.8.1",
           "publishTimestamp": 1795740055,
           "source": {
@@ -199,6 +211,18 @@
         "sortKeys": {}
       },
       "versions": [
+        {
+          "version": "0.5.4",
+          "publishTimestamp": 1795805848,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/xkshct198570/dsh-persona-hub.git",
+            "commit": "752681eb8e9d8241b52e750b0f0eba0ea6fdf329"
+          },
+          "engines": {
+            "dsh": ">=0.2.2-rc.5 <0.3.0-0"
+          }
+        },
         {
           "version": "0.5.3",
           "publishTimestamp": 1795622067,
