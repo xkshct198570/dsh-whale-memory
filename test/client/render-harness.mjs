@@ -76,6 +76,11 @@ export function loadSlots(configOverride = null, extra = {}) {
       }
       const isPost = Boolean(opts && String(opts.method || '').toUpperCase() === 'POST')
       // 写接口用 extra.wrapPost 提供状态码/体；读接口按路径分发，未知路径回空壳（与旧行为一致）。
+      // 手动反思（0.8.1-10）：400/200 形状由用例给，默认成功。
+      if (isPost && path.endsWith('/reflect')) {
+        const spec = extra.reflectPost || { status: 200, body: { ok: true, started: true, result: { added: 1, material: 2 } } }
+        return { ok: spec.status >= 200 && spec.status < 300, status: spec.status, json: async () => spec.body }
+      }
       if (isPost && path.endsWith('/wrap')) {
         const spec = extra.wrapPost || { status: 200, body: { ok: true, runId: 9, state: 'queued' } }
         return { ok: spec.status >= 200 && spec.status < 300, status: spec.status, json: async () => spec.body }

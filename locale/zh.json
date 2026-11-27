@@ -210,6 +210,7 @@
   "reflect.button": "反思",
   "reflect.done": "反思完成：新增 {added} 条（素材 {material}）",
   "reflect.busy": "反思中…",
+  "reflect.needIdentity": "先在任意会话里发一句话再点「反思」；或到「设置 → 身份」把模式设为 fixed 并填 workspace。",
   "import.export": "导出",
   "import.accept": ".jsonl,.txt,text/plain",
   "status.active": "活跃",

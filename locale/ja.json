@@ -211,6 +211,7 @@
   "reflect.button": "内省を実行",
   "reflect.done": "内省しました：+{added}（素材 {material}）",
   "reflect.busy": "内省しています…",
+  "reflect.needIdentity": "任意のセッションで一度発言してから「内省を実行」を押してください。または「設定 → アイデンティティ」でモードを fixed にし、workspace を入力してください。",
   "import.export": "エクスポート",
   "import.accept": ".jsonl,.txt,text/plain",
   "status.active": "アクティブ",

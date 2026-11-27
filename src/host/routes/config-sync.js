@@ -48,7 +48,12 @@ export async function handleConfigSync({
       const mode = String(value(config?.identity?.mode, 'auto'))
       const chosen = runtime?.workspace ? runtime : (mode === 'fixed' ? identity : null)
       if (!chosen?.userId || !chosen?.workspace) {
-        return sendJson(res, 400, { ok: false, error: 'identity_required' })
+        // 机器可读原因（0.8.1-10）：面板据此渲染可行动文案，而不是只看到 identity_required。
+        // 路由仍拒写未知 workspace（§5.5.1 不回退）；这里只多给 reason，不放开任何写入。
+        const reason = runtime?.workspace
+          ? 'identity_incomplete'
+          : mode === 'fixed' ? 'fixed_identity_incomplete' : 'no_session_identity'
+        return sendJson(res, 400, { ok: false, error: 'identity_required', reason })
       }
       const result = await reflect.trigger({
         identity: {
@@ -61,7 +66,7 @@ export async function handleConfigSync({
       })
       if (result?.ok === false && result.reason === 'busy') return sendJson(res, 409, { ok: false, error: 'busy' })
       if (result?.ok === false && result.reason === 'identity_required') {
-        return sendJson(res, 400, { ok: false, error: 'identity_required' })
+        return sendJson(res, 400, { ok: false, error: 'identity_required', reason: 'identity_required' })
       }
       return sendJson(res, 200, { ok: true, started: true, result })
     }

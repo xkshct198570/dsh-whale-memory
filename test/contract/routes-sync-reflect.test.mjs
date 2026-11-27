@@ -49,7 +49,7 @@ const sessionState = {
   lastRecall: { sessionId: 's1', userId: 'u1', roleId: '', workspace: '/work/ws', workspaceSource: 'session', at: 1 },
 }
 
-test('POST /reflect：手动传最近会话身份 → 200 started；缺服务 → 501；busy → 409；无 workspace → 400', async () => {
+test('POST /reflect：手动传最近会话身份 → 200 started；缺服务 → 501；busy → 409；无 workspace → 400（带机器可读 reason）', async () => {
   const calls = []
   const ok = await startRoutes({
     identityState: sessionState,
@@ -83,11 +83,13 @@ test('POST /reflect：手动传最近会话身份 → 200 started；缺服务 �
   } finally { await busy.close() }
 
   // 无最近会话身份时，控制面 workspace='' 不得被当成共享分区去反思。
+  // 基础 config 是 fixed 且 workspace 为空 → 原因是「fixed 配置不全」（0.8.1-10）。
   const noWs = await startRoutes({ reflect: { trigger: async () => ({ ok: true }) } })
   try {
     const got = await post(noWs.base, '/whale-memory/api/reflect', {})
     assert.equal(got.status, 400)
     assert.equal(got.body.error, 'identity_required')
+    assert.equal(got.body.reason, 'fixed_identity_incomplete')
   } finally { await noWs.close() }
 
   // auto 模式即使控制面有 workspace，也不能在无会话身份时触发（可能是 local 兜底分区）。
@@ -100,8 +102,22 @@ test('POST /reflect：手动传最近会话身份 → 200 started；缺服务 �
     const got = await post(auto.base, '/whale-memory/api/reflect', {})
     assert.equal(got.status, 400)
     assert.equal(got.body.error, 'identity_required')
+    assert.equal(got.body.reason, 'no_session_identity', 'auto 且无会话身份 → 让用户先去说话')
     assert.equal(autoCalls.length, 0)
   } finally { await auto.close() }
+
+  // 有最近会话身份但缺 userId（宿主 identity 未就绪）：仍拒绝，原因与「完全没有会话」区分开。
+  const partialCalls = []
+  const partial = await startRoutes({
+    identityState: { lastRecall: { sessionId: 's2', userId: '', roleId: '', workspace: '/work/ws', at: 1 } },
+    reflect: { trigger: async (opts) => { partialCalls.push(opts); return { ok: true } } },
+  })
+  try {
+    const got = await post(partial.base, '/whale-memory/api/reflect', {})
+    assert.equal(got.status, 400)
+    assert.equal(got.body.reason, 'identity_incomplete')
+    assert.equal(partialCalls.length, 0)
+  } finally { await partial.close() }
 
   // fixed 模式的显式固定身份是稳定分区：无会话也可手动反思，且身份原样下传。
   const fixedCalls = []

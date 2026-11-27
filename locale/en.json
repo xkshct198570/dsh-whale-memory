@@ -211,6 +211,7 @@
   "reflect.button": "Reflect",
   "reflect.done": "Reflected: +{added} (material {material})",
   "reflect.busy": "Reflecting…",
+  "reflect.needIdentity": "Say something in any session first, then press Reflect again; or set Identity mode to fixed and fill in a workspace under Settings → Identity.",
   "import.export": "Export",
   "import.accept": ".jsonl,.txt,text/plain",
   "status.active": "Active",
