@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-11-27T18:37:00.568Z",
+  "generatedAt": "2026-11-27T18:40:04.004Z",
   "thresholds": {
     "plan": 800,
     "freeze": 1200,
@@ -75,7 +75,7 @@
     "src/core/wrap-runs.js": 142,
     "src/core/writer.js": 15,
     "src/core/writer/audit.js": 87,
-    "src/core/writer/decide.js": 502,
+    "src/core/writer/decide.js": 499,
     "src/core/writer/privacy.js": 47,
     "src/core/writer/process.js": 264,
     "src/core/writer/queue.js": 315,

@@ -13,6 +13,7 @@
 7. **记忆分层与首轮画像**：收尾/反思写入带 `fact/lesson/user` 分层（面板直接写入与旧行保持 NULL，`memory_*` 工具写入按类型分层）；会话首轮把同身份 `user` top5 / `lesson` top5 / `fact` top3 渲染成 ≤800 字符画像注入一次，第二轮不再出现，子代理或身份未定跳过（失败只记日志）。
 8. **模型侧工具与自动反思**：模型可直接调 `memory_remember/search/read/update/forget`（身份固定当前会话、每回合写尝试限次、跨分区 id 按不存在）；自动反思在回合工具步 ≥7 或空闲时触发，默认关，受每日上限与 `maintenance.suppressWindows` 峰时窗口约束（手动绕过，仍要身份）。
 9. **旧库可迁移**：附 `migrate-audit` 脚本，只读对账、备份后迁移关系边，操作见 `docs/MIGRATION.md`。
+10. **判重候选并集（0.8.2）**：判重除同身份最近 300 条外，再用全文检索补回最多 12 条旧事实（并集上限 312，触顶次数进 `/stats` 健康位），滑出窗口的旧事实重新参与比对；字面六分支都没命中、但相似度 ≥0.35 且共享检索词 ≥2 时只产 `paraphrase_suspect` 候选，不自动合并、不改正文、不丢数据。
 
 ## 安装
 
@@ -30,4 +31,4 @@
 
 ## 隐私与限制
 
-默认数据只在本机；仅当手动把后端配成 http/hybrid 时，才向所填 url 发 stats/recent/search/recall/write/version 请求；不写遥测、不外传。收尾原始材料只进 0600 临时 spool（默认 24h 自删、不进灾备），报告/日志/状态不含原文。召回失败 fail-open；全局规则依赖 AGENTS 摘要；`rules.llm=false` 时合并/冲突候选需面板改写。
+默认数据只在本机；仅当手动把后端配成 http/hybrid 时，才向所填 url 发 stats/recent/search/recall/write/version 请求；不写遥测、不外传。收尾原始材料只进 0600 临时 spool（默认 24h 自删、不进灾备），报告/日志/状态不含原文。召回失败 fail-open；全局规则依赖 AGENTS 摘要；`rules.llm=false` 时合并/冲突候选需面板改写。判重只认词法证据：零字面交集的真同义句仍按新增处理（需模型/embedding，属延后项）。
