@@ -116,9 +116,11 @@ export function installIdentitySource(ctx, {
     if (!(ms > 0)) return promise
     /** @type {ReturnType<typeof setTimeout>} */
     let timer
+    // 定时器必须保持引用：超时是这个 race 唯一的结算者，unref 会让「宿主 promise 永不 resolve」
+    // 时事件循环直接排空（Node 22 的 test runner 会判 cancelledByParent，生产里退出阶段也可能
+    // 让 pending 永远不结算）。代价只是进程退出时最多多等一个 probeTimeout（4s），且仅在探测在途时。
     const timeout = new Promise((_, reject) => {
       timer = setTimeout(() => reject(Object.assign(new Error('identity_probe_timeout'), { name: 'TimeoutError' })), ms)
-      if (typeof timer.unref === 'function') timer.unref()
     })
     try {
       return await Promise.race([promise, timeout])

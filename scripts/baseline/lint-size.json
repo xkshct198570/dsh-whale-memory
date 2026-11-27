@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-11-27T18:41:32.330Z",
+  "generatedAt": "2026-11-27T18:53:03.193Z",
   "thresholds": {
     "plan": 800,
     "freeze": 1200,
@@ -86,7 +86,7 @@
     "src/host/git-detector.js": 94,
     "src/host/hook.js": 596,
     "src/host/http-kit.js": 124,
-    "src/host/identity-source.js": 159,
+    "src/host/identity-source.js": 158,
     "src/host/identity.js": 90,
     "src/host/inject-stats.js": 17,
     "src/host/profile-context.js": 154,
