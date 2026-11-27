@@ -3,7 +3,11 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { findCandidates, processEvent } from '../../src/core/writer.js'
-import { similarity } from '../../src/core/tokenize.js'
+import { CANDIDATE_UNION_MAX, findCandidatesWithFts } from '../../src/core/writer/decide.js'
+import { insertNodeRow } from '../../src/core/writer/process.js'
+import { ftsCandidateRows } from '../../src/core/search.js'
+import { CANDIDATE_COLUMNS } from '../../src/shared/candidate-fields.js'
+import { normalize, similarity } from '../../src/core/tokenize.js'
 import { buildPlan } from '../../src/core/queryplan.js'
 import { event, freshDb } from './writer-harness.mjs'
 
@@ -126,4 +130,72 @@ test('findCandidates 是判定器入口：同身份最近窗口、created_at DES
       '候选字段集必须含双时态（并集沿用同字段集）',
     )
   }
+})
+
+test('正例：sim 0.68 且共享 3 词 → 只产 paraphrase_suspect 候选（不新增节点、不改正文）', (t) => {
+  const db = freshDb(t)
+  const seedText = '发布前必须跑全量门禁并检查退出码，基线只在全绿后刷新'
+  seed(db, seedText)
+  const text = '发布前跑全量门禁并检查退出码这个流程，基线只在全绿后刷新'
+  assert.ok(similarity(text, seedText) >= 0.35 && similarity(text, seedText) < 0.7, '正例落在 ADD 与疑似改写之间')
+  assert.ok(sharedTerms(text, seedText).length >= 2)
+  const r = write(db, text)
+  assert.equal(r.action, 'CANDIDATE')
+  assert.equal(r.reason, 'paraphrase_suspect')
+  assert.equal(Number(db.prepare('SELECT count(*) AS n FROM nodes').get().n), 1, '候选不落 nodes')
+  assert.equal(db.prepare('SELECT text FROM nodes').get().text, normalize(seedText), '旧节点正文不得被改写')
+  const audit = db.prepare('SELECT action,reason,mode FROM writes ORDER BY id DESC LIMIT 1').get()
+  assert.equal(audit.action, 'CANDIDATE')
+  assert.equal(audit.mode, 'auto', 'auto 模式下也必须是候选而不是自动合并')
+  assert.match(audit.reason, /paraphrase_suspect/)
+})
+
+test('正例二：sim 0.36 但共享「跑全量门/必须/发布前」3 词 → 候选（闸门不是只看相似度）', (t) => {
+  const db = freshDb(t)
+  const seedText = '发布前必须跑全量门禁并检查退出码，基线只在全绿后刷新'
+  seed(db, seedText)
+  const text = '跑全量门禁并看退出码，基线全绿才刷新，这必须在发布前'
+  const sim = similarity(text, seedText)
+  assert.ok(sim >= 0.35 && sim < 0.7)
+  const r = write(db, text)
+  assert.equal(r.action, 'CANDIDATE')
+  assert.equal(r.reason, 'paraphrase_suspect')
+})
+
+test('03 并集：FTS 补回最近窗口外的旧候选（双时态同字段集），judge 入口仍只吃最近窗口', (t) => {
+  const db = freshDb(t)
+  const targetText = '灾备包恢复演练每季度一次，演练记录归档到备份目录'
+  const target = insertNodeRow(db, event(targetText), targetText, {
+    ts: 1, validAt: 1, source: 'self', origin: 'unit', level: 'normal', memoryType: 'semantic', layer: 'semantic', expiredAt: null,
+  })
+  db.prepare('UPDATE nodes SET invalid_at=1 WHERE id=?').run(target)
+  for (let i = 0; i < 305; i += 1) {
+    const text = `填充样本 ${i} 号：值班表的轮换顺序与交接清单`
+    insertNodeRow(db, event(text), text, {
+      ts: 1000 + i, validAt: 1000 + i, source: 'self', origin: 'unit', level: 'normal', memoryType: 'semantic', layer: 'semantic', expiredAt: null,
+    })
+  }
+
+  const recent = findCandidates(db, event(targetText))
+  assert.equal(recent.length, 300, '判定器入口固定最近 300')
+  assert.ok(!recent.some((row) => row.id === target), '目标已滑出最近窗口：judge 不该看见它')
+
+  const union = findCandidatesWithFts(db, event(targetText))
+  assert.ok(union.length <= CANDIDATE_UNION_MAX, `并集不得超过 ${CANDIDATE_UNION_MAX}`)
+  assert.equal(new Set(union.map((row) => row.id)).size, union.length, '按 id 去重')
+  assert.deepEqual(union.slice(0, recent.length).map((row) => row.id), recent.map((row) => row.id), '最近在前、顺序不变')
+  const hit = union.find((row) => row.id === target)
+  assert.ok(hit, 'FTS 必须把窗口外的同文候选补回并集')
+  assert.deepEqual(Object.keys(hit).sort(), [...CANDIDATE_COLUMNS].sort(), 'FTS 候选必须是同一字段集')
+  assert.equal(hit.invalid_at, 1, '并集必须带双时态（否则已失效旧事实会被当恒重叠）')
+})
+
+test('03 FTS 候选：身份分区过滤生效，跨身份旧文不进并集', (t) => {
+  const db = freshDb(t)
+  const text = '灾备包恢复演练每季度一次，演练记录归档到备份目录'
+  insertNodeRow(db, event(text, { identity: { userId: 'other', roleId: '', workspace: 'web' } }), text, {
+    ts: 1, validAt: 1, source: 'self', origin: 'unit', level: 'normal', memoryType: 'semantic', layer: 'semantic', expiredAt: null,
+  })
+  const rows = ftsCandidateRows(db, { query: text, identity: event(text).identity, limit: 12 })
+  assert.equal(rows.length, 0, '跨身份候选不得出现在并集')
 })

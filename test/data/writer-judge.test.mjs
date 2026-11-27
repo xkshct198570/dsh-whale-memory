@@ -38,7 +38,8 @@ test('judge=llm：候选重复 → NOOP（规则会 ADD，裁决优先）', asyn
   const old = processEvent(db, event('网关回调端口是 3982'), auto())
   assert.equal(old.action, 'ADD')
   const rules = decideWrite(db, event('网关回调端口 3982'), { mode: 'auto' })
-  assert.equal(rules.action, 'ADD', '基线必须是 ADD，否则证明不了裁决生效')
+  // 03 起规则层对「词面重叠的改写句」产候选；这里只要基线不是 NOOP，就能证明裁决生效。
+  assert.notEqual(rules.action, 'NOOP', '基线不得已是 NOOP，否则证明不了裁决生效')
 
   const calls = []
   const logs = []
@@ -122,7 +123,7 @@ test('judge=llm：模型缺失/抛错/坏 JSON → 回落规则（结果与 rule
   for (const [text, opts, expectedError, why] of cases) {
     const base = rulesOf(text)
     // 用例正文包含既有旧文（旧文≥8 字）→ §5.3 第 4 条会把基线判成 MERGE；这里只锁“回落与规则一致”。
-    assert.ok(['ADD', 'MERGE', 'SUPERSEDE'].includes(base.action), `${why}：基线动作非法 ${base.action}`)
+    assert.ok(['ADD', 'MERGE', 'SUPERSEDE', 'CANDIDATE'].includes(base.action), `${why}：基线动作非法 ${base.action}`)
     const q = judgeQueue(t, db, opts)
     const result = await q.enqueue(event(text))
     assert.equal(result.action, base.action, `${why}：回落规则后动作与 rules 一致`)
@@ -146,8 +147,8 @@ test('judge=llm：受保护 owner 目标 → 回落规则并记 judge_fallback:p
   const result = await q.enqueue(event('网关回调端口 3982'))
   assert.equal(result.judge?.used, false)
   assert.equal(result.judge?.error, 'judge_fallback:protected_target')
-  // 规则口径不变：弱相似 → ADD，owner 正文一行不动
-  assert.equal(result.action, 'ADD')
+  // 规则口径（03 起）：词面重叠的改写句 → 候选；owner 正文一行不动
+  assert.equal(result.action, 'CANDIDATE')
   assert.equal(db.prepare('SELECT text FROM nodes WHERE id=?').get(owner.id).text, '网关回调端口是 3982')
   assert.ok(logs.some((line) => line.includes('judge fallback reason=judge_fallback:protected_target')), '回落日志口径')
 })
@@ -189,10 +190,11 @@ test('judge=rules 零模型调用；judge=llm 无候选直接 ADD 也不调模�
     getSelection: () => ({ provider: 'p', model: 'm' }),
   })
   t.after(() => rulesQ.dispose())
+  const rulesBaseline = decideWrite(db, event('网关回调端口 3982'), { mode: 'auto' })
   const r = await rulesQ.enqueue(event('网关回调端口 3982'))
   assert.equal(calls, 0, 'judge=rules 时零 llm 调用')
   assert.equal(r.judge, undefined, 'rules 路径结果不带 judge 字段（旧契约不变）')
-  assert.equal(r.action, 'ADD')
+  assert.equal(r.action, rulesBaseline.action)
 
   // judge=llm 但库为空：无候选不花模型钱，直接按规则 ADD
   const emptyDb = freshDb(t)

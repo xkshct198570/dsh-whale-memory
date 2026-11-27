@@ -1,11 +1,12 @@
 # Changelog
 
-## 0.8.2 — 未发布（单实例租约 + keeper handler 超时）
+## 0.8.2 — 未发布（单实例租约 / handler 超时 / 判重候选并集）
 
 - **单实例租约（0.8.1-07）**：新增 `src/core/keeper/lock.js`——`<dataDir>/keeper.lock`（0600）`wx` 独占；存活判据 `kill(pid,0)` + `/proc/<pid>/stat` starttime 挡 PID 复用；死进程/坏文件接管并留日志；`release()` 只删自己的 `instanceId`。`installKeeper` 只在持锁时做 `recoverRunningJobs`；只读进程不复位 `running`、不建定时器、`tick/runNow` 返回可判定的 `locked`，仍可入队由 owner 消费。`advanced.singleInstanceLock`（默认开）关掉即回现状。
 - **handler 硬超时**：`advanced.keeperHandlerTimeoutMs`（默认 900000，0=不限）——到点按失败收尾（`handler_timeout:<kind>:<id>:<ms>`、attempts+1 退避、日志），一个卡死的 kind 不再堵住整个队列；迟到结算被吞，不产生未处理拒绝。
 - 面板高级组新增两卡（三语）；回归 `test/data/keeper-lock.test.mjs` 6 例。全量 **1252（1251/1/0）**。
 - **语义召回（embed）代码层封存**：面板组与概览「待处理」位不再渲染，`vector` job 变零算力 stub（恒 `skipped:'shelved'`），`/stats` 不再全表扫 `vector_pending`；`embed` 配置与 `embedding`/`vector_state` 两列保留免迁移，各处留 `[SHELVED 封存]` 注释指向恢复步骤；三语文案保留。以后可能重启，按延后文档 §1.1 接线。
+- **判重候选并集（03 免费半）**：判重候选从「同身份最近 300」扩为「最近 300 ∪ FTS 12」（按 id 去重、上限 312，并集触顶计数进 `/stats` health 的 `fts_union_capped`），滑出最近窗口的旧事实重新参与判重；并集与最近窗口**同字段集**（`src/shared/candidate-fields.js` 唯一真源，含 `valid_at/invalid_at`），避免已失效旧事实被当恒重叠。六分支之外新增闸门：并集里相似度最高者且 `sim ≥ 0.35`、共享检索词 `≥ 2` 时只产 `paraphrase_suspect` 候选（不自动 MERGE、不改正文、不丢数据）。`judge=llm` 输入不变（仍取最近窗口，FTS 并集不进提示词）。**限制**：零字面交集的真同义句仍会 ADD（无词法证据，需模型/embedding；见 `docs/双插件-延后问题与再启动条件` §1.2）。
 
 ## 0.8.1 — 2026-11-27（jobs 正文治理 + 日限落库 + 反思身份原因 + 工具分层 + 测试拆分）
 

@@ -4,9 +4,20 @@ import { value } from '../../shared/config-values.js'
 import { now } from '../db.js'
 import { bagKey, contentHash, normalize, similarity } from '../tokenize.js'
 import { insideSpans, privacyCheck, sentenceHasPortHint, spansOf } from './privacy.js'
+import { candidateSelect } from '../../shared/candidate-fields.js'
+import { buildPlan } from '../queryplan.js'
+import { ftsCandidateRows, ftsStats } from '../search.js'
 
 /** 冲突/合并候选上限（单身份）。 */
 const CANDIDATE_LIMIT = 300
+/** FTS 判重候选上限（03）：只给并集补充「词面相交但不在最近窗口」的旧事实。 */
+const FTS_CANDIDATE_LIMIT = 12
+/** 判重并集上限：最近窗口 300 + FTS 12；触顶必须计数（不许静默丢候选）。 */
+export const CANDIDATE_UNION_MAX = CANDIDATE_LIMIT + FTS_CANDIDATE_LIMIT
+/** 疑似改写降级的相似度下限（低于它只是巧合词面重叠，不是改写）。 */
+export const PARAPHRASE_SIM = 0.35
+/** 疑似改写降级要求的最少共享检索词（单靠相似度会把「全量门禁这套流程太慢了」误降级）。 */
+export const PARAPHRASE_MIN_SHARED = 2
 /** MERGE 相似度下限（信息只增不减的“近文”合并）。 */
 const MERGE_SIM = 0.85
 /** 近文合并的信息增益：新文本比旧文本至少多这么多字。 */
@@ -312,11 +323,14 @@ export function isProtectedTarget(row, options) {
 }
 
 /**
- * 同身份分区的 active 候选（相似合并/冲突判定的同一份口径）。
+ * 同身份分区的 active 候选（**判定器入口**，最近窗口口径）。
  *
  * 为什么抽成导出函数：判定器（judge=llm）必须在 DB 事务外先拿到候选去问模型，
  * 再让 decideWrite 按裁决落库；两处各写一条 SELECT 迟早口径漂移（一处分区/状态写错，
  * 判定器就会对另一批节点裁决）。顺序固定 created_at DESC（最新优先，判定器编号也用这个顺序）。
+ *
+ * 判定器只吃「最近 N」这一份：03 的 FTS 并集若混进 judge prompt，会静默改变模型看到的候选集，
+ * 判定结果随库龄漂移。规则判重走 findCandidatesWithFts，两者**不得合并**。
  *
  * @param {import('node:sqlite').DatabaseSync} db
  * @param {{ identity?: object }} event
@@ -326,10 +340,67 @@ export function isProtectedTarget(row, options) {
 export function findCandidates(db, event) {
   const ident = normalizeIdentity(event?.identity)
   return db.prepare(
-    `SELECT id,text,level,memory_type,source,valid_at,invalid_at FROM nodes
+    `SELECT ${candidateSelect()} FROM nodes
      WHERE status='active' AND user_id=? AND role_id=? AND workspace=?
      ORDER BY created_at DESC LIMIT ?`,
   ).all(ident.userId, ident.roleId, ident.workspace, CANDIDATE_LIMIT)
+}
+
+/**
+ * 判重候选并集（03 免费半）：最近 300（顺序不变）∪ FTS 12，按 id 去重、最近在前。
+ *
+ * 为什么要并集：最近窗口只认 created_at，超过 300 条的旧事实永远不会参与判重，
+ * 于是同一事实几个月后重写会被当成新事实（重复堆积）。FTS 按词面召回旧候选，
+ * 把「不在最近窗口但正文相交」的那一小撮补回来（硬上限 12，查询成本可控）。
+ * FTS 候选沿用同一字段集（含双时态）：缺 valid_at/invalid_at 会把已失效旧事实当恒重叠。
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {{ text?: string, identity?: object }} event
+ * @returns {Array<{ id: string, text: string, level: string, memory_type: string,
+ *   source: string, valid_at: number|null, invalid_at: number|null }>} 最近在前、FTS 按 rank 追加
+ */
+export function findCandidatesWithFts(db, event) {
+  const recent = findCandidates(db, event)
+  const seen = new Set(recent.map((row) => String(row.id)))
+  const out = recent.slice()
+  for (const row of ftsCandidateRows(db, {
+    query: event?.text, identity: event?.identity, limit: FTS_CANDIDATE_LIMIT,
+  })) {
+    const id = String(row?.id ?? '')
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    out.push(row)
+  }
+  // 并集由构造决定不会超过上限；「正好触顶」才是可观测信号（FTS 补充的 12 条全被用上，
+  // 更多旧候选可能没进并集）。计数进 /stats health，避免「候选被截却全绿」。
+  if (out.length >= CANDIDATE_UNION_MAX) ftsStats.capped += 1
+  return out
+}
+
+/**
+ * 疑似改写（03）：并集里相似度最高的那条候选，过了「相似度 + 共享检索词」双闸才降级。
+ *
+ * 只认最高相似度那一条（契约）：如果最高分候选都过不了共享词闸，说明这批候选只有零星同词，
+ * 换个低分候选降级就是拿弱证据造候选。零字面交集的真同义句没有词法证据，仍会 ADD。
+ *
+ * @param {string} text 已归一的新文本
+ * @param {Array<{ id?: unknown, text?: unknown }>} candidates 候选并集
+ * @returns {{ row: object, sim: number } | null} 命中的候选与相似度
+ */
+function paraphraseSuspectOf(text, candidates) {
+  let top = null
+  for (const row of candidates) {
+    const oldText = normalize(String(row?.text ?? ''))
+    if (!oldText) continue
+    const sim = similarity(text, oldText)
+    if (!top || sim > top.sim) top = { row, sim }
+  }
+  if (!top || top.sim < PARAPHRASE_SIM) return null
+  const plan = buildPlan(text)
+  const terms = [...plan.cjkTerms, ...plan.asciiTerms, ...plan.idents, ...plan.ips]
+  const oldText = normalize(String(top.row?.text ?? ''))
+  const shared = terms.filter((term) => oldText.includes(term)).length
+  return shared >= PARAPHRASE_MIN_SHARED ? top : null
 }
 
 /**
@@ -442,7 +513,7 @@ function decideByRules(db, event, opts = {}) {
     }
   }
 
-  const candidates = findCandidates(db, event)
+  const candidates = findCandidatesWithFts(db, event)
   const incomingBag = bagKey(text)
   const validAt = now()
 
@@ -562,7 +633,20 @@ function decideByRules(db, event, opts = {}) {
     }, options, { text, redacted })
   }
 
-  // 8. 其余 → ADD
+  // 9. 疑似改写（03 免费半）：六分支都没命中，但并集里有词面重叠的旧事实 → 只产候选，不自动合并。
+  //    限制：零字面交集的真同义句没有词法证据，仍会 ADD（需模型/embedding，见延后清单 §1.2）。
+  const suspect = paraphraseSuspectOf(text, candidates)
+  if (suspect) {
+    return settle({
+      action: 'CANDIDATE',
+      reason: 'paraphrase_suspect',
+      targetId: String(suspect.row.id),
+      beforeText: String(suspect.row.text ?? ''),
+      afterText: text,
+    }, options, { text, redacted })
+  }
+
+  // 10. 其余 → ADD
   return settle({ action: 'ADD', reason: 'new', afterText: text }, options, { text, redacted })
 }
 

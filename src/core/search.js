@@ -21,9 +21,10 @@ import { buildPlan } from './queryplan.js'
 import { normalize } from './tokenize.js'
 import { now } from './db.js'
 import { HOP_FACTOR, clamp01, expandOneHop } from './relations.js'
+import { candidateSelect } from '../shared/candidate-fields.js'
 
 /** FTS 失败观测：检索层 fail-open，但不能"零命中还全绿"——计数进 /stats health。 */
-export const ftsStats = { errors: 0, last_error: '', last_at: 0 }
+export const ftsStats = { errors: 0, last_error: '', last_at: 0, capped: 0 }
 
 const FTS_LIMIT = 50
 const MAX_CANDIDATES = 150
@@ -96,6 +97,43 @@ function collectFts(db, table, match, filter, candidates, path = 'L1') {
   for (const row of rows) {
     if (candidates.size >= MAX_CANDIDATES) return
     if (!candidates.has(row.id)) candidates.set(row.id, { ...row, _path: path })
+  }
+}
+
+/**
+ * 判重候选（03 免费半）：只取「同字段集」的行，不做检索打分、不做扩散。
+ *
+ * 为什么独立于 search()：判重只需要 id/正文/双时态；复用 search() 会带进 rel 阈值与 top-N 语义，
+ * 导致「词面有交集但 rel 低」的改写句被挡掉。字段集由 shared/candidate-fields.js 统一，
+ * 缺 valid_at/invalid_at 会把已失效旧事实当恒重叠（误 SUPERSEDE/REVIEW）。
+ * 失败一律 fail-open（返回 [] 并记 ftsStats.errors）——FTS 异常不能拖垮写入。
+ *
+ * @param {import('node:sqlite').DatabaseSync} db 已打开且 ensureSchema 过的连接
+ * @param {{ query?: unknown, identity?: object|null, limit?: number }} [opts]
+ * @returns {Array<{ id: string, text: string, level: string, memory_type: string,
+ *   source: string, valid_at: number|null, invalid_at: number|null }>} 按 rank 升序的行
+ */
+export function ftsCandidateRows(db, { query = '', identity = null, limit = 12 } = {}) {
+  if (!db || typeof db.prepare !== 'function') return []
+  const plan = buildPlan(query)
+  if (!plan.minLenOk) return []
+  const rawLimit = Number(limit)
+  const cap = Number.isFinite(rawLimit) ? Math.max(1, Math.min(FTS_LIMIT, Math.floor(rawLimit))) : 12
+  const terms = dedupe([...plan.cjkTerms, ...plan.asciiTerms, ...plan.idents, ...plan.ips])
+    .filter((term) => term.length >= 3)
+  if (terms.length === 0) return []
+  const filter = identityFilter(identity)
+  const sql =
+    `SELECT ${candidateSelect('n.')} FROM nodes_fts JOIN nodes n ON n.rowid = nodes_fts.rowid ` +
+    `WHERE nodes_fts MATCH ? AND n.status = 'active'${RECALL_ORIGIN_FILTER}${filter.sql ? ' AND ' + filter.sql : ''} ` +
+    `ORDER BY rank LIMIT ${cap}`
+  try {
+    return db.prepare(sql).all(orMatch(terms), ...filter.params)
+  } catch (err) {
+    ftsStats.errors += 1
+    ftsStats.last_error = String(err?.message || err).slice(0, 200)
+    ftsStats.last_at = Date.now() / 1000
+    return []
   }
 }
 

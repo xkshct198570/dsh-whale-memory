@@ -92,6 +92,8 @@ export const queryApi = {
         pressure: memoryPressure(),
         fts_errors: ftsStats.errors,
         fts_last_error: ftsStats.last_error || null,
+        // 03 判重并集触顶计数：候选并集打满 312 时必须可见，不许静默丢候选。
+        fts_union_capped: ftsStats.capped,
         schema: {
           version: getMeta(db, 'schema_version'),
           unique_hash_index: this.db?.schemaInfo?.uniqueIndex !== false,
