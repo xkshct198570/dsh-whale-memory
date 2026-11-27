@@ -17,6 +17,8 @@ const NODE_TYPES = new Set(['semantic', 'procedural', 'episodic', 'mixed'])
 
 const NODE_SOURCES = new Set(['owner', 'self', 'group', 'web', 'tool', 'import'])
 
+// [SHELVED 封存] vector_state 是语义召回预留列：导入/导出仍保真（旧 JSONL 有值也不丢），
+// 但当前没有消费者；不要把它当功能未完成去"修"。恢复见延后文档 §1.1。
 const VECTOR_STATES = new Set(['none', 'pending', 'ready', 'failed'])
 
 /** 文本硬顶（与 nodes.text CHECK 同值）。 */

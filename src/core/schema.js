@@ -75,6 +75,8 @@ CREATE TABLE IF NOT EXISTS nodes (
   pinned        INTEGER NOT NULL DEFAULT 0,          -- v3：规则置顶（每会话首次注入）
   layer         TEXT NULL,                           -- v7：分层标签 fact/lesson/user（NULL=未分层）
   last_hit_at   REAL,
+  -- [SHELVED 封存] 语义召回预留列：当前代码不写不读（写入恒 'none'），保留只为重启免迁移。
+  -- 恢复步骤见 docs/双插件-延后问题与再启动条件-v1-2026-11-27.md §1.1。
   vector_state  TEXT NOT NULL DEFAULT 'none'
                 CHECK (vector_state IN ('none','pending','ready','failed')),
   embedding     BLOB,

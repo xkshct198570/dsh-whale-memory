@@ -560,24 +560,21 @@ test('report：有 dbFile 写 reports/<日期>.md；无 dbFile 跳过', async ()
   } finally { keeper.dispose(); closeDb(db) }
 })
 
-test('vector：embed 关 → skipped；开但无实现 → skipped 不失败', async () => {
-  const off = fresh({ config: { embed: { enabled: false } } })
-  try {
-    const id = node(off.db, { text: '待向量节点' })
-    off.db.prepare("UPDATE nodes SET vector_state='pending' WHERE id=?").run(id)
-    const res = await off.keeper.runNow('vector', {})
-    assert.equal(res.result.skipped, 'embed_disabled')
-  } finally { off.close() }
-
-  const on = fresh({ config: { embed: { enabled: true } } })
-  try {
-    const id = node(on.db, { text: '待向量节点' })
-    on.db.prepare("UPDATE nodes SET vector_state='pending' WHERE id=?").run(id)
-    const res = await on.keeper.runNow('vector', {})
-    assert.equal(res.state, 'done', '无嵌入实现不得算失败')
-    assert.equal(res.result.skipped, 'embed_unavailable')
-    assert.equal(on.db.prepare('SELECT vector_state FROM nodes WHERE id=?').get(id).vector_state, 'pending')
-  } finally { on.close() }
+test('[SHELVED] vector：封存态恒 skipped=shelved，不依赖 embed.enabled、不改节点状态（零算力）', async () => {
+  // 语义召回封存（见审查 §4 T1-S / 延后文档 §1.1）：handler 只剩一个常量返回，
+  // 不再查 pending 行、不再读配置。这里同时锁「开/关配置都不影响」与「状态零变更」。
+  for (const enabled of [false, true]) {
+    const f = fresh({ config: { embed: { enabled } } })
+    try {
+      const id = node(f.db, { text: '待向量节点' })
+      f.db.prepare("UPDATE nodes SET vector_state='pending' WHERE id=?").run(id)
+      const res = await f.keeper.runNow('vector', {})
+      assert.equal(res.state, 'done')
+      assert.equal(res.result.skipped, 'shelved')
+      assert.equal(f.db.prepare('SELECT vector_state FROM nodes WHERE id=?').get(id).vector_state, 'pending',
+        '封存 handler 不得改状态（无消费者，改状态只会制造假进度）')
+    } finally { f.close() }
+  }
 })
 
 test('report：命中未注入/未采纳/失败 job 三段与指标落表（手算值）', async () => {

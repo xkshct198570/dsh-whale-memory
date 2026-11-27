@@ -83,7 +83,8 @@ export const queryApi = {
         fts_aligned: ftsRows !== null && ftsBiRows !== null && ftsRows === nodesTotal && ftsBiRows === nodesTotal,
         fts_rows: ftsRows,
         fts_bi_rows: ftsBiRows,
-        vector_pending: one("SELECT count(*) AS n FROM nodes WHERE vector_state='pending'"),
+        // [SHELVED 封存] 不再统计 vector_pending：语义召回无消费者，每次 /stats 全表扫是纯浪费。
+        // 恢复时连同面板「待处理」健康位一起加回（延后文档 §1.1）。
         jobs: {
           running: jobRow('running'), queued: jobRow('queued'), failed: jobRow('failed'),
           last_error: lastFailed, recent_failures: recentFailures,

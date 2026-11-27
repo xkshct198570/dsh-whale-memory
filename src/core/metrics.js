@@ -192,6 +192,8 @@ function fileSize(path) {
  *
  * @param {import('node:sqlite').DatabaseSync} db 已打开的库连接（表由 schema 保证）
  * @param {{ day?: string, now?: number, dbFile?: string, embedEnabled?: boolean }} [opts]
+ *   embedEnabled 与 `nodes.vector_state` 同属 [SHELVED 封存] 的语义召回预留面：恒 false 时
+ *   pendingAgeMax 记 0（没有消费者，不该每天挂一个不可行动的 ✗）。恢复见延后文档 §1.1。
  *   day: 锚点日 YYYY-MM-DD（缺省取 now 的本地日期）；now: 秒级时间戳（缺省当前时间，
  *   注入固定时钟便于测试/日报对齐）；dbFile: 库文件绝对路径（缺省不统计体积）；
  *   embedEnabled: 嵌入管线是否开（§9.1：embed 关时 pendingAgeMax 记 0——没有 worker

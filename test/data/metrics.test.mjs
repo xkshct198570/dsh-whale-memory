@@ -294,7 +294,7 @@ test('stats：metrics/series/recent_failures 与既有 totals/health 键并存',
     assert.equal(st.totals.nodes_total, 1)
     assert.equal(typeof st.schema_version, 'string')
     assert.ok(st.generated_at)
-    for (const key of ['fts_aligned', 'fts_rows', 'fts_bi_rows', 'vector_pending', 'jobs', 'pressure']) {
+    for (const key of ['fts_aligned', 'fts_rows', 'fts_bi_rows', 'jobs', 'pressure']) {
       assert.ok(key in st.health, `health.${key} 不得丢`)
     }
     for (const key of ['running', 'queued', 'failed', 'last_error', 'recent_failures']) {
@@ -313,7 +313,7 @@ test('stats：metrics/series/recent_failures 与既有 totals/health 键并存',
     assert.equal(st.series.at(-1).day, today)
     assert.deepEqual(Object.keys(st.series[0]).sort(),
       ['adopted', 'avgChars', 'day', 'injected', 'recalls', 'withHits', 'zeroHit'])
-    assert.equal(st.health.vector_pending, 0)
+    assert.equal('vector_pending' in st.health, false, '语义召回封存后 /stats 不再全表扫 vector_state')
     assert.equal(st.metrics.values.pending_age_max_min, 0)
     assert.equal(st.metrics.values.fts_aligned, true)
     assert.ok(st.metrics.values.db_size_bytes > 0, 'stats 必须带上真实库文件路径')

@@ -5,6 +5,7 @@
 - **单实例租约（0.8.1-07）**：新增 `src/core/keeper/lock.js`——`<dataDir>/keeper.lock`（0600）`wx` 独占；存活判据 `kill(pid,0)` + `/proc/<pid>/stat` starttime 挡 PID 复用；死进程/坏文件接管并留日志；`release()` 只删自己的 `instanceId`。`installKeeper` 只在持锁时做 `recoverRunningJobs`；只读进程不复位 `running`、不建定时器、`tick/runNow` 返回可判定的 `locked`，仍可入队由 owner 消费。`advanced.singleInstanceLock`（默认开）关掉即回现状。
 - **handler 硬超时**：`advanced.keeperHandlerTimeoutMs`（默认 900000，0=不限）——到点按失败收尾（`handler_timeout:<kind>:<id>:<ms>`、attempts+1 退避、日志），一个卡死的 kind 不再堵住整个队列；迟到结算被吞，不产生未处理拒绝。
 - 面板高级组新增两卡（三语）；回归 `test/data/keeper-lock.test.mjs` 6 例。全量 **1252（1251/1/0）**。
+- **语义召回（embed）代码层封存**：面板组与概览「待处理」位不再渲染，`vector` job 变零算力 stub（恒 `skipped:'shelved'`），`/stats` 不再全表扫 `vector_pending`；`embed` 配置与 `embedding`/`vector_state` 两列保留免迁移，各处留 `[SHELVED 封存]` 注释指向恢复步骤；三语文案保留。以后可能重启，按延后文档 §1.1 接线。
 
 ## 0.8.1 — 2026-11-27（jobs 正文治理 + 日限落库 + 反思身份原因 + 工具分层 + 测试拆分）
 

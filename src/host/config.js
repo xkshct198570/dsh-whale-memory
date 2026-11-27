@@ -113,6 +113,10 @@ export const Config = z.object({
     intervalHours: z.natural().min(1).max(168).default(6),
   }).default({}),
 
+  // [SHELVED 封存] 语义召回（embedding）配置位：**面板已隐藏、无 provider、无读路径、零运行时成本**。
+  // 保留配置与 schema 列只为「以后可能重启语义召回」不用再动数据结构；
+  // 恢复步骤与文件清单见 `docs/双插件-延后问题与再启动条件-v1-2026-11-27.md` §1.1。
+  // 扫到这里的 agent：这是封存态，不是死代码/半成品，**不要顺手删、不要在这里花算力**。
   embed: z.object({
     enabled: z.boolean().default(false),
     endpoint: z.string().default(''),

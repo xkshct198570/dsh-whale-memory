@@ -441,9 +441,9 @@ test('SwitchCard/FieldCard 渲染默认值、通用/本机/需配置徽标与依
   assert.match(CLIENT, /disabled: Boolean\(opt\.disabled\) \|\| meta\.disabled/, '依赖未满足时控件未置灰')
 })
 
-test('14 组顶部场景句三语齐全且不与标题重复', () => {
+test('13 组顶部场景句三语齐全且不与标题重复（embed 已封存不渲染）', () => {
   for (const group of [
-    'Backend', 'Identity', 'Recall', 'Write', 'Reflect', 'Wrap', 'Consolidate', 'Embed',
+    'Backend', 'Identity', 'Recall', 'Write', 'Reflect', 'Wrap', 'Consolidate',
     'Privacy', 'Edges', 'Sync', 'Panel', 'Advanced', 'Danger',
   ]) {
     const descKey = `settings.group${group}Desc`
@@ -455,6 +455,11 @@ test('14 组顶部场景句三语齐全且不与标题重复', () => {
     }
     assert.ok(CLIENT.includes(`t('${descKey}')`), `设置页未渲染 ${descKey}`)
   }
+  // [SHELVED] embed 三语文案保留（恢复免重做），但面板必须不渲染。
+  for (const lang of LANGS) {
+    assert.equal(typeof dicts[lang]['settings.groupEmbedDesc'], 'string', `${lang} 缺封存组文案`)
+  }
+  assert.equal(CLIENT.includes("t('settings.groupEmbedDesc')"), false, '封存组不得渲染')
 })
 
 test('三个无控件字段补齐：backend.id / sync.bridgeUrl / sync.dryRun', () => {
@@ -686,11 +691,14 @@ test('WP1 推荐开启徽标：四个需外部条件的开关带 recommend，bad
 })
 
 test('WP2 设置信息架构：顺序固定、首屏四组展开、其余默认收起、布局根因修复', () => {
-  assert.match(CLIENT, /const SETTINGS_GROUP_ORDER = Object\.freeze\(\[\s*'recall', 'write', 'tools', 'identity', 'rules', 'backend', 'sync',\s*'reflect', 'wrap', 'consolidate', 'privacy', 'edges', 'panel', 'advanced', 'embed',\s*\]\)/)
+  // [SHELVED] embed（语义召回）已在 0.8.2 封存：配置/schema 保留，但**不进组顺序、不渲染**。
+  // 恢复时按延后文档 §1.1 把它加回本名单，并同步改回本断言。
+  assert.match(CLIENT, /const SETTINGS_GROUP_ORDER = Object\.freeze\(\[\s*'recall', 'write', 'tools', 'identity', 'rules', 'backend', 'sync',\s*'reflect', 'wrap', 'consolidate', 'privacy', 'edges', 'panel', 'advanced',\s*\]\)/)
   assert.match(CLIENT, /SETTINGS_GROUP_ORDER\.map\(\(key\) => \(groupNodes\[key\]/, '未按顺序渲染分组')
   assert.match(CLIENT, /h\(React\.Fragment, \{ key \}, groupNodes\[key\]\(\)\)/, '分组列表缺稳定 key')
   // 折叠卡自己取文案：调用方必须注入 t，否则首渲染就 ReferenceError。
-  assert.equal((CLIENT.match(/t, titleKey: 'settings\.group/g) || []).length, 16, '15 个网格分组 + 危险区都必须注入 t')
+  assert.equal((CLIENT.match(/t, titleKey: 'settings\.group/g) || []).length, 15,
+    '14 个网格分组（embed 封存后）+ 危险区都必须注入 t')
   assert.match(CLIENT, /t, titleKey: 'settings\.groupRecall'/)
   assert.match(CLIENT, /SETTINGS_CORE_GROUP_KEYS = new Set\(\[\s*'settings\.groupRecall', 'settings\.groupWrite', 'settings\.groupIdentity', 'settings\.groupRules',\s*\]\)/)
   assert.match(CLIENT, /function readGroupOpen\(/, '缺展开状态读取')

@@ -17,8 +17,8 @@ import { sweepJobPayloads } from '../job-payload.js'
 import { toSeconds } from './util.js'
 import { dayStamp } from '../../shared/day-stamp.js'
 
-/** vector 每次最多处理的 pending 条数。 */
-const VECTOR_BATCH = 32
+// [SHELVED 封存] 语义召回（embedding）handler：保留 kind 只为旧库里有历史 pending 行时
+// 不报 no_handler；实现已撤，**不查库、不写状态、零算力**。恢复步骤见延后文档 §1.1。
 
 /** text_hash 重复收敛每批最多归档条数（审计行同批上限，写连接保持短事务）。 */
 const DEDUPE_BATCH = 200
@@ -328,13 +328,9 @@ export function installDefaultHandlers(keeper, deps) {
     return out
   })
 
-  keeper.register('vector', async () => {    if (!config?.embed?.enabled) return { skipped: 'embed_disabled' }
-    const rows = store.withDb((db) => db.prepare(`SELECT id FROM nodes WHERE vector_state='pending' LIMIT ?`).all(VECTOR_BATCH))
-    if (rows.length === 0) return { processed: 0, skipped: 'vector_empty' }
-    // 本机没有嵌入实现（config.embed 只定义开关，未接 provider）：
-    // 不改 vector_state、不报失败，接上实现后同一批 pending 自然重跑。
-    return { pending: rows.length, skipped: 'embed_unavailable' }
-  })
+  // [SHELVED 封存] 语义召回（embedding）handler：代码层封存——不查库、不写状态、不依赖配置。
+  // 保留 kind 只为旧库若仍有 vector job 时不报 no_handler。恢复步骤见延后文档 §1.1。
+  keeper.register('vector', async () => ({ skipped: 'shelved' }))
 
   keeper.register('report', async () => {
     const dbFile = typeof store.dbFile === 'string' ? store.dbFile : ''
