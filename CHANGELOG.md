@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.3 — 2026-11-28（live 三个小问题修复）
+
+- **keeper 租约装配顺序（live 未生效修复）**：`installKeeper` 在 backend 首次开库前装配，旧实现拿到空 `store.dbFile` → 回退「单进程假设」，live 启动日志 `keeper lock skipped: no dataDir`、`keeper.lock` 不落盘。现在装配层用 `db.js` 的 `resolveDbDir(config.dataDir)` 解析目录并透传（`openKeeperLease` 取值 `dbFile → dataDir → config.dataDir`）；live 启动即落锁，同 dataDir 第二实例只读。回归：`test/data/keeper-lock.test.mjs` 新增「backend 未开库时仍落租约 + 第二实例只读」。
+- **概览召回列表时序**：概览挂载早于身份就绪，首次 `/recalls` 不带身份参数 → 只命中共享分区（0 条），要等 60s 轮询才补上。现在 Panel 把身份拼成 `identityKey` 传给概览，**身份一变立即重取** `/recent` 与 `/recalls`；回归 `test/client/render-smoke.test.mjs` 断言重取带 `userId`/`workspace`。
+- **AGENTS 摘要假黄灯**：`/rules/health` 的 `agents_block_stale` 旧实现只看 mtime，块内容没变也会常驻黄灯。现在 health 把期望摘要正文传给 `agentsBlockStale`，**内容一致即不陈旧**（只有拿不到期望摘要时才回落 mtime 判据）；回归 `test/unit/rule-render.test.mjs` 1 例。
+- 全量 **1266（1265 pass / 1 skip / 0 fail）**；三处都可在重启后真机复核：`keeper.lock` 存在、概览「Latest 3 recalls」有记录、`/rules/health` 无 `agents_block_stale`。
+
 ## 0.8.2 — 2026-11-28（单实例租约 / handler 超时 / 判重候选并集）
 
 - **单实例租约（0.8.1-07）**：新增 `src/core/keeper/lock.js`——`<dataDir>/keeper.lock`（0600）`wx` 独占；存活判据 `kill(pid,0)` + `/proc/<pid>/stat` starttime 挡 PID 复用；死进程/坏文件接管并留日志；`release()` 只删自己的 `instanceId`。`installKeeper` 只在持锁时做 `recoverRunningJobs`；只读进程不复位 `running`、不建定时器、`tick/runNow` 返回可判定的 `locked`，仍可入队由 owner 消费。`advanced.singleInstanceLock`（默认开）关掉即回现状。
