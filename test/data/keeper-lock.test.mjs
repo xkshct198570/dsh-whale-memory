@@ -198,3 +198,13 @@ test('installKeeper：backend 未开库时用装配层 dataDir 落租约（live 
   for (const dispose of disposers) dispose()
   assert.equal(existsSync(lockFile(home)), false, '释放后锁文件消失')
 })
+
+test('租约：dataDir 尚不存在时先建目录再落锁（干净安装不退化只读）', (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'whale-keeper-mkdir-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const dir = join(root, 'whale-memory') // 故意不存在
+  const lease = acquireKeeperLock({ dir })
+  assert.equal(lease.ok, true, '目录不存在不得把 keeper 判成只读')
+  assert.ok(existsSync(lockFile(dir)), '锁文件必须落在新建目录里')
+  lease.release()
+})

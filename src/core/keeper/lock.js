@@ -6,7 +6,7 @@
 // PID 复用是真实坑：只 kill(pid,0) 会把复用同一 PID 的无关进程当成持有者 → 额外比对
 // /proc/<pid>/stat 的 starttime（Linux）；读不到时保守判活（宁可只读，不重复消费）。
 
-import { readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { bool } from '../../shared/config-values.js'
 
@@ -64,6 +64,14 @@ export function ownerAlive(owner) {
 export function acquireKeeperLock({ dir, log = () => {}, now = () => Date.now() } = {}) {
   const noop = { ok: false, reason: 'no_dir', release: () => {} }
   if (!dir) return noop
+  // 锁要落在库里所在的目录：干净安装时 keeper 装配早于 backend 开库，目录还没建，
+  // 直接写锁会 ENOENT 并把 keeper 判成只读（后台任务永远不跑）。建目录与 openDb 同口径。
+  try {
+    mkdirSync(String(dir), { recursive: true, mode: 0o700 })
+  } catch (err) {
+    log(`[whale-memory] keeper lock dir unavailable (${err?.code || err?.message || err}) → read-only mode`)
+    return noop
+  }
   const path = join(String(dir), KEEPER_LOCK_FILE)
   const instanceId = `${process.pid}:${Math.random().toString(36).slice(2)}`
   const record = JSON.stringify({

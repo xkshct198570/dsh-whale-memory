@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-11-27T19:32:06.611Z",
+  "generatedAt": "2026-11-27T19:34:13.051Z",
   "thresholds": {
     "plan": 800,
     "freeze": 1200,
@@ -22,7 +22,7 @@
     "src/core/judge.js": 90,
     "src/core/keeper.js": 9,
     "src/core/keeper/handlers.js": 332,
-    "src/core/keeper/lock.js": 83,
+    "src/core/keeper/lock.js": 89,
     "src/core/keeper/scheduler.js": 302,
     "src/core/keeper/util.js": 19,
     "src/core/memory-hygiene.js": 165,
@@ -186,7 +186,7 @@
     "test/data/export-import-layer.test.mjs": 118,
     "test/data/import-export.test.mjs": 231,
     "test/data/job-payload.test.mjs": 144,
-    "test/data/keeper-lock.test.mjs": 159,
+    "test/data/keeper-lock.test.mjs": 168,
     "test/data/keeper.test.mjs": 592,
     "test/data/metrics.test.mjs": 269,
     "test/data/migrate-audit.test.mjs": 284,
