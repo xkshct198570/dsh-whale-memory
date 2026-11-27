@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.2 — 未发布（单实例租约 + keeper handler 超时）
+
+- **单实例租约（0.8.1-07）**：新增 `src/core/keeper/lock.js`——`<dataDir>/keeper.lock`（0600）`wx` 独占；存活判据 `kill(pid,0)` + `/proc/<pid>/stat` starttime 挡 PID 复用；死进程/坏文件接管并留日志；`release()` 只删自己的 `instanceId`。`installKeeper` 只在持锁时做 `recoverRunningJobs`；只读进程不复位 `running`、不建定时器、`tick/runNow` 返回可判定的 `locked`，仍可入队由 owner 消费。`advanced.singleInstanceLock`（默认开）关掉即回现状。
+- **handler 硬超时**：`advanced.keeperHandlerTimeoutMs`（默认 900000，0=不限）——到点按失败收尾（`handler_timeout:<kind>:<id>:<ms>`、attempts+1 退避、日志），一个卡死的 kind 不再堵住整个队列；迟到结算被吞，不产生未处理拒绝。
+- 面板高级组新增两卡（三语）；回归 `test/data/keeper-lock.test.mjs` 6 例。全量 **1252（1251/1/0）**。
+
 ## 0.8.1 — 2026-11-27（jobs 正文治理 + 日限落库 + 反思身份原因 + 工具分层 + 测试拆分）
 
 - **jobs.payload 正文治理（0.8.1-01）**：新增 `src/core/job-payload.js`——终态判据（`done`，或 `failed` 且 `attempts>=RETRY_MAX_ATTEMPTS`）与 payload 白名单（`reason/sessionId/identity/runId/spoolPath/materialHash/total/result`）唯一真源。终态转移同轮脱敏：keeper `finishDone`/终态 `finishFailed`、写队列 done/最终 failed 不再保留写入正文与 import 的 `jsonl`；`queued`/`running` 与可重排 `failed` 原样保留（续跑证据）。新增 `maintenance` job（启动 +120s、每日一次）修补式扫库清历史正文，并按 `privacy.jobPayloadTtlDays`（默认 0=不删）物理删除超期终态行；面板隐私组新增该开关（三语）。
