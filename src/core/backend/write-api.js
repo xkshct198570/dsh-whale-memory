@@ -113,7 +113,7 @@ export const writeApi = {
    * - 普通目标的每个字段改动写一条 writes（EDIT/ARCHIVE）+ 一条 evolution（旧值/新值）。
    *
    * @param {string} id
-   * @param {{ text?:string, status?:string, level?:string, tags?:string[], superseded_by?:string }} patch
+   * @param {{ text?:string, status?:string, level?:string, tags?:string[], superseded_by?:string, layer?:string }} patch
    * @param {{ identity?:Identity, traceId?:string, mode?:'manual'|'sync', origin?:string, reason?:string }} [opts]
    *   mode 只影响 writes.mode（面板人工 vs 同步冲突标记）；origin 落 writes.payload.origin（工具改写传 'tool'）；
    *   reason 覆盖归档审计原因（缺省 `<origin>_archive`）。
@@ -137,6 +137,7 @@ export const writeApi = {
     if (!['active', 'archived', 'stale', 'superseded'].includes(status)) return { ok: false, error: 'invalid_status' }
     const level = patch.level === undefined ? row.level : String(patch.level)
     if (!['core', 'important', 'normal'].includes(level)) return { ok: false, error: 'invalid_level' }
+    // v7 分层：显式给出才改（白名单收敛），缺省保留原值；不做全库回填（旧行 NULL 保持）。
     const tags = patch.tags === undefined ? row.tags : JSON.stringify(Array.isArray(patch.tags) ? patch.tags : [])
     const supersededBy = patch.superseded_by === undefined || patch.superseded_by === null
       ? row.superseded_by
@@ -145,8 +146,10 @@ export const writeApi = {
     // 离开 superseded 时指针必须清空：留下"谁是继任者"而状态是 active，就是半残数据。
     const nextPointer = status === 'superseded' ? supersededBy : null
 
+    const layer = patch.layer === undefined ? row.layer : validLayer(patch.layer)
     const textChanged = text !== row.text
     const levelChanged = level !== row.level
+    const layerChanged = String(layer ?? '') !== String(row.layer ?? '')
     // 保护面判据只认 decide.js 的 isProtectedTarget（同一判据一处；此前这里抄了一份）。
     if (isProtectedTarget(row, { protect: true }) && (textChanged || levelChanged)) {
       return { ok: false, error: 'protected_target' }
@@ -157,7 +160,7 @@ export const writeApi = {
     const pointerChanged = String(nextPointer ?? '') !== String(row.superseded_by ?? '')
     // 无变化时不发 UPDATE 也不产审计：返回“实际生效的 updated_at”，否则调用方拿到一个
     // 从未落库的新时间戳，下一次 CAS 必然误判 node_changed（幻影版本号）。
-    const changed = textChanged || statusChanged || levelChanged || tagsChanged || pointerChanged
+    const changed = textChanged || statusChanged || levelChanged || tagsChanged || pointerChanged || layerChanged
     // CAS 基线必须严格递增：同一毫秒内两次保存若返回相同 updated_at，客户端下一次提交仍带旧值
     // 会被误判 node_changed（A3 偶发红）。至少比旧值大 1 微秒。
     const ts = Math.max(now(), Number(row.updated_at || 0) + 0.000001)
@@ -171,6 +174,7 @@ export const writeApi = {
       level,
       memory_type: row.memory_type,
       tags: parseTags(tags),
+      layer,
       source: row.source,
       origin,
       expired_at: row.expired_at,
@@ -188,9 +192,9 @@ export const writeApi = {
         return { ok: false, error: 'node_changed' }
       }
       if (changed) {
-        db.prepare(`UPDATE nodes SET text=?,text_hash=?,text_bigrams=?,status=?,level=?,tags=?,superseded_by=?,updated_at=?
+        db.prepare(`UPDATE nodes SET text=?,text_hash=?,text_bigrams=?,status=?,level=?,tags=?,layer=?,superseded_by=?,updated_at=?
           WHERE id=?`).run(
-          text, contentHash(text), bigrams(text), status, level, tags, nextPointer, ts, target,
+          text, contentHash(text), bigrams(text), status, level, tags, layer, nextPointer, ts, target,
         )
       }
       /** 一个字段的改动 = 一条 writes + 一条 evolution（面板「写入」页与「演化」页同源）。 */
@@ -208,6 +212,7 @@ export const writeApi = {
       if (statusChanged) audit('ARCHIVE', 'status', row.status, status, reasonOf(`${verb}_archive`))
       if (levelChanged) audit('EDIT', 'level', row.level, level, `${verb}_level`)
       if (tagsChanged) audit('EDIT', 'tags', row.tags, tags, `${verb}_tags`)
+      if (layerChanged) audit('EDIT', 'layer', row.layer ?? '', layer ?? '', `${verb}_layer`)
       if (pointerChanged) audit('EDIT', 'superseded_by', row.superseded_by ?? '', nextPointer ?? '', `${verb}_supersede`)
         return { ok: true, id: target, updated_at: changed ? ts : Number(row.updated_at || 0) }
       })

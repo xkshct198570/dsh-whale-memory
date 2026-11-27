@@ -7,6 +7,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { isDelegatedHeader, sessionIdentityOf } from './identity.js'
 import { value } from '../shared/config-values.js'
 import { ingestPolicyOf } from '../shared/ingest-policy.js'
+import { layerOfMemoryType } from '../shared/layers.js'
 import { normalizeTags } from '../shared/tags.js'
 import { isProtectedTarget } from '../core/writer.js'
 import { createWriteRateLimiter } from './tool-rate-limit.js'
@@ -142,10 +143,13 @@ export function createMemoryToolDefinitions(deps) {
       }
       const identity = c.identityOf(exec)
       c.beforeWrite(exec)
+      // 0.8.1-04：工具写入落层（procedural→lesson、semantic→fact；episodic/mixed 不分层）。
+      const memoryType = args.memory_type || 'semantic'
       const res = await c.call('write', () => c.backend.write({
         text,
         level: args.level,
-        memory_type: args.memory_type,
+        memory_type: memoryType,
+        layer: layerOfMemoryType(memoryType),
         tags: normalizeTags(args.tags).slice(0, TAGS_LIMIT),
         source: 'tool',
         origin: 'tool',
@@ -248,6 +252,11 @@ export function createMemoryToolDefinitions(deps) {
       const identity = c.identityOf(exec)
       const current = await c.readNode(identity, id)
       if (isProtectedTarget(current.node, { protect: true })) throw toolError(TOOL_ERROR.PROTECTED_TARGET)
+      // 0.8.1-04：只在正文被改写时按目标节点的 memory_type 重算层（只改 level/tags 不动层）。
+      if (patch.text !== undefined) {
+        const derived = layerOfMemoryType(current.node.memory_type)
+        if (derived) patch.layer = derived
+      }
       c.beforeWrite(exec)
       const res = await c.call('updateNode', () => c.backend.updateNode(id, patch, {
         identity, expectedUpdatedAt: args.expectedUpdatedAt, origin: 'tool',

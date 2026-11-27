@@ -571,3 +571,63 @@ test('开关执行期兜底：tools.enabled=false 时任何工具调用 → TOOL
   await rejectsWith(run(defs, 'memory_search', { query: '门禁' }), TOOL_ERROR.TOOLS_DISABLED)
   assert.deepEqual(calls, [])
 })
+
+test('0.8.1-04 工具写入分层：remember/update 落 LAYER_OF_TYPE，只改等级/标签不动层，首轮画像能取到', async (t) => {
+  const backend = freshBackend(t)
+  const host = fakeHost({ config: { tools: { maxWritesPerTurn: 20 } } })
+  const { definitions } = host.install({ backend })
+  await host.preStep(agentOf(), 1)
+
+  const factish = await run(definitions, 'memory_remember', {
+    text: '默认语义记忆落 fact 层：本地 SQLite 是唯一写入源',
+  })
+  const factNode = backend.withDb((db) => db.prepare('SELECT layer,memory_type FROM nodes WHERE id=?').get(factish.id))
+  assert.equal(factNode.memory_type, 'semantic')
+  assert.equal(factNode.layer, 'fact', 'semantic → fact（LAYER_OF_TYPE 单一映射）')
+
+  const lessonish = await run(definitions, 'memory_remember', {
+    text: '程序性记忆落 lesson 层：门禁失败不得发布', memory_type: 'procedural',
+  })
+  assert.equal(backend.withDb((db) => db.prepare('SELECT layer FROM nodes WHERE id=?').get(lessonish.id)).layer, 'lesson')
+
+  // episodic/mixed 不在 LAYER_OF_TYPE：保持 NULL（不猜层，避免画像里出现噪声）。
+  // 这里用直写造一条 NULL 行（工具写 episodic 会走歧义闸转候选、不落 nodes）。
+  const { layerOfMemoryType } = await import('../../src/shared/layers.js')
+  assert.equal(layerOfMemoryType('episodic'), null)
+  assert.equal(layerOfMemoryType('mixed'), null)
+  const episodic = await backend.write({
+    text: '昨天网关卡在 3982，重启 gateway 后恢复', memory_type: 'episodic',
+    identity: { userId: 'u1', roleId: '', workspace: WORK_DIR },
+  })
+  assert.equal(episodic.ok, true)
+  const epiNode = backend.withDb((db) => db.prepare('SELECT layer FROM nodes WHERE id=?').get(episodic.id))
+  assert.equal(epiNode.layer, null)
+
+  // update 只在正文被改写时按节点 memory_type 重算层；审计行带 layer 同值。
+  const before = (await run(definitions, 'memory_read', { id: factish.id })).node
+  await run(definitions, 'memory_update', {
+    id: factish.id, text: '默认语义记忆落 fact 层：本地 SQLite 是唯一写入源（含 sync 只读）',
+    expectedUpdatedAt: Number(before.updated_at),
+  })
+  assert.equal(backend.withDb((db) => db.prepare('SELECT layer FROM nodes WHERE id=?').get(factish.id)).layer, 'fact')
+  const edit = backend.withDb((db) => db.prepare(
+    "SELECT reason,payload FROM writes WHERE action='EDIT' AND node_id=? ORDER BY id DESC LIMIT 1",
+  ).get(factish.id))
+  assert.equal(edit.reason, 'tool_edit')
+  assert.equal(JSON.parse(edit.payload).layer, 'fact', 'writes.payload.layer 与节点同值（候选转正可还原）')
+
+  // 只改等级：不动 layer（NULL 行保持 NULL，不做回填）。
+  const beforeEpi = (await run(definitions, 'memory_read', { id: episodic.id })).node
+  await run(definitions, 'memory_update', { id: episodic.id, level: 'important', expectedUpdatedAt: Number(beforeEpi.updated_at) })
+  assert.equal(backend.withDb((db) => db.prepare('SELECT layer FROM nodes WHERE id=?').get(episodic.id)).layer, null,
+    '只改等级不得顺手补层（旧行 NULL 不变）')
+
+  // 首轮画像取数：工具写入的层必须能被 profileLayers 读到。
+  const { identity } = await import('../../src/host/identity.js').then((m) => m.sessionIdentityOf({
+    header: { cwd: WORK_DIR }, getIdentityCfg: () => ({ mode: 'auto', userId: 'u1', roleId: '', workspace: '' }),
+    getIdentityHint: () => null, getHostUserId: () => 'u1', getHostIdentityState: () => 'absent',
+  }))
+  const groups = await backend.profileLayers({ user: 5, lesson: 5, fact: 3 }, { identity })
+  assert.ok(groups.fact.some((row) => row.id === factish.id), '首轮画像 fact 组必须能取到工具写入的节点')
+  assert.ok(groups.lesson.some((row) => row.id === lessonish.id), '首轮画像 lesson 组必须能取到工具写入的节点')
+})
