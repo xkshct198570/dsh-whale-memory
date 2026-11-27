@@ -28,7 +28,7 @@ const JUDGE_TIMEOUT_MS = 2000
  * 判定器模型调用：照 reflect.js 的 stream 收集口径（text-delta/block-end），
  * 外加 2s AbortController 硬超时（模型卡住不能拖住整批写入）。
  *
- * 非导出：只有队列用；测试通过 fake llm 端到端覆盖（见 writer.test.mjs）。
+ * 非导出：只有队列用；测试通过 fake llm 端到端覆盖（见 writer-judge.test.mjs）。
  *
  * @param {{ stream: Function }} llm
  * @param {{ provider?: string, model?: string } | null} selection

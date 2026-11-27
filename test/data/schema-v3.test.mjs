@@ -220,5 +220,5 @@ test('规则退役：被 SUPERSEDE 的置顶规则 pinned 自动清零（auto �
   const retired = db.prepare('SELECT status,pinned FROM nodes WHERE id=?').get(old.id)
   assert.equal(retired.status, 'superseded')
   assert.equal(Number(retired.pinned), 0, '退役规则必须撤顶，注入层不得再带它')
-  // shadow 路径改的是同一句 UPDATE（writer.js 两处同构），auto 覆盖即可；accept 流程见 writer.test.mjs。
+  // shadow 路径改的是同一句 UPDATE（writer.js 两处同构），auto 覆盖即可；accept 流程见 writer-shadow.test.mjs。
 })
