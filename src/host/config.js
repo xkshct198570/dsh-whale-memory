@@ -176,5 +176,9 @@ export const Config = z.object({
     traceId: z.string().max(64).default('').volatile(),
     logLevel: z.union(['error', 'warn', 'info', 'debug']).default('warn').volatile(),
     worker: z.boolean().default(true).volatile(),
+    // 单实例租约：同一 dataDir 只允许一个进程消费 jobs（0.8.1-07）；关掉＝回双消费现状。
+    singleInstanceLock: z.boolean().default(true).volatile(),
+    // keeper handler 硬超时（毫秒；0=不限）：永不 resolve 的 handler 不得堵住其它 kind。
+    keeperHandlerTimeoutMs: z.natural().min(0).max(3600000).default(900000).volatile(),
   }).default({}),
 })

@@ -50,7 +50,7 @@ export const DEFAULT_CONFIG = {
     bridgeUrl: '', dryRun: true,
   },
   panel: { allowRemote: false, pollMs: 60000, tab: 'overview' },
-  advanced: { traceId: '', logLevel: 'warn', worker: true },
+  advanced: { traceId: '', logLevel: 'warn', worker: true, singleInstanceLock: true, keeperHandlerTimeoutMs: 900000 },
 }
 
 export function loadSlots(configOverride = null, extra = {}) {

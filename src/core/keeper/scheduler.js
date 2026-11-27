@@ -9,9 +9,11 @@
  * 依赖方向：core → shared；keeper/scheduler → keeper/handlers、keeper/util。
  */
 import { memoryPressure } from '../../shared/memory-guard.js'
+import { num } from '../../shared/config-values.js'
 import { RETRY_MAX_ATTEMPTS, redactJobPayload } from '../job-payload.js'
+import { openKeeperLease } from './lock.js'
 import { installDefaultHandlers } from './handlers.js'
-import { safeJson, toSeconds, clampText } from './util.js'
+import { clampText, safeJson, toSeconds, withHandlerTimeout } from './util.js'
 
 /** 允许的作业类型（schema jobs.kind 语义；write 由写队列独占，keeper 不调度）。 */
 export const JOB_KINDS = ['consolidate', 'reflect', 'write', 'vector', 'archive', 'report', 'import', 'wrap', 'maintenance']
@@ -51,6 +53,10 @@ export function createKeeper({
   pressure = memoryPressure,
   nowFn = () => Date.now() / 1000,
   intervalMs = 600000,
+  // 单实例租约（0.8.1-07）：consume=false 时本进程只入队/只读，不消费 jobs（另一个进程是 owner）。
+  consume = true,
+  // handler 硬超时（0=不限）：一个永不 resolve 的 handler 不能把其它 kind 永久堵在队列里。
+  handlerTimeoutMs = 0,
 } = {}) {
   if (!store || typeof store.withDb !== 'function') throw new TypeError('createKeeper: store.withDb required')
 
@@ -149,6 +155,7 @@ export function createKeeper({
   async function runOnce() {
     lastFailed = false
     if (disposed) return { ran: [], skipped: 'disposed', failed: false }
+    if (!consume) return { ran: [], skipped: 'locked', failed: false }
     if (runningTick) return { ran: [], skipped: 'busy', failed: false }
 
     runningTick = true
@@ -181,7 +188,10 @@ export function createKeeper({
       }
 
       try {
-        const result = await handler(safeJson(job.payload), { log, now: nowSec, jobId: Number(job.id) })
+        const task = handler(safeJson(job.payload), { log, now: nowSec, jobId: Number(job.id) })
+        const result = handlerTimeoutMs > 0
+          ? await withHandlerTimeout(task, handlerTimeoutMs, `${job.kind}:${Number(job.id)}`)
+          : await task
         finishDone(job.id)
         lastRun = { id: Number(job.id), kind: job.kind, result }
         return { ran: [job.kind], result, failed: false }
@@ -263,6 +273,8 @@ export function createKeeper({
      */
     async runNow(kind, payload = {}) {
       const id = this.enqueue(kind, payload)
+      // 只读进程没有消费者：立刻返回可判定状态，绝不空等 50 轮（铁律 22）。
+      if (!consume) return { id, state: 'queued', attempts: 0, skipped: 'locked' }
       // 队列里可能还有别的 job，逐个 tick 直到这条到终态；上限防死循环（正常 ≤几条）。
       for (let i = 0; i < 50; i += 1) {
         const row = jobRow(id)
@@ -342,6 +354,7 @@ export function createKeeper({
       }
       return {
         running, queued, failed, lastError,
+        consuming: consume,
         jobs: rows.map((row) => ({
           id: Number(row.id), kind: row.kind, state: row.state, attempts: Number(row.attempts || 0),
           next_at: row.next_at === null || row.next_at === undefined ? null : Number(row.next_at),
@@ -363,8 +376,11 @@ export function createKeeper({
   installDefaultHandlers(keeper, { store, config, log, nowSec })
 
   // 定时器：unref 不拖住 Host 退出；tick 内部已兜底，这里再兜一层防 timer 回调炸。
-  timer = setInterval(() => { void keeper.tick().catch(() => {}) }, Math.max(1000, Math.floor(Number(intervalMs) || 600000)))
-  if (typeof timer.unref === 'function') timer.unref()
+  if (consume) {
+    timer = setInterval(() => { void keeper.tick().catch(() => {}) }, Math.max(1000, Math.floor(Number(intervalMs) || 600000)))
+    if (typeof timer.unref === 'function') timer.unref()
+  }
+  keeper.consuming = consume
   return keeper
 }
 
@@ -396,10 +412,20 @@ export function recoverRunningJobs(store, log = () => {}) {
  * @param {Parameters<typeof createKeeper>[0]} deps
  */
 export function installKeeper(ctx, deps = {}) {
-  recoverRunningJobs(deps.store, deps.log)
-  const keeper = createKeeper(deps)
+  const { store, config = {}, log = () => {} } = deps
+  // 单实例租约（0.8.1-07）：双进程共享同一 dataDir 时，第二个进程不得复位 running、
+  // 也不得消费 jobs——否则同一 job 会被两个 keeper 各跑一遍（重复烧模型/重复写库）。
+  // 锁策略（开关/dataDir/只读原因）在 keeper/lock.js；这里只做装配。
+  const lease = openKeeperLease({ store, config, log })
+  // 只有拿到租约的进程才做崩溃补偿：复位 running 正是"双实例重复执行"的源头。
+  if (lease.ok) recoverRunningJobs(store, log)
+  const keeper = createKeeper({
+    ...deps,
+    consume: lease.ok,
+    handlerTimeoutMs: Math.max(0, Math.trunc(num(config?.advanced?.keeperHandlerTimeoutMs, 0))),
+  })
   if (typeof ctx?.effect === 'function') {
-    ctx.effect(() => () => keeper.dispose(), 'whale-memory: keeper')
+    ctx.effect(() => () => { keeper.dispose(); lease.release() }, 'whale-memory: keeper')
   }
   return keeper
 }
