@@ -43,7 +43,7 @@ export const DEFAULT_CONFIG = {
   },
   consolidate: { enabled: true, intervalHours: 6 },
   embed: { enabled: false, endpoint: '', model: '', batch: 16 },
-  privacy: { redact: true, retentionDays: 0 },
+  privacy: { redact: true, retentionDays: 0, jobPayloadTtlDays: 0 },
   edges: { diffusion: true, minConf: 0.6 },
   sync: {
     enabled: false, mode: 'off', intervalMin: 15, httpTimeoutMs: 800, batch: 100,

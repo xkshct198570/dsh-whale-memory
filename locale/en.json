@@ -319,6 +319,8 @@
   "settings.privacyRedactDesc": "Sensitive fields are replaced before writing.",
   "settings.privacyRetention": "Archived retention days (0 = forever)",
   "settings.privacyRetentionDesc": "0 keeps archives forever.",
+  "settings.jobPayloadTtlDays": "Job payload retention days (0 = keep rows)",
+  "settings.jobPayloadTtlDaysDesc": "Applies to finished jobs only: the payload body is already redacted on completion; this only controls how long the row itself is kept.",
   "settings.privacyDanger": "retentionDays > 0 physically deletes expired archives.",
   "settings.edgesDiffusion": "Enable 1-hop edge diffusion",
   "settings.edgesDiffusionDesc": "Expands one hop along edges during recall.",

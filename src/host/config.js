@@ -123,6 +123,9 @@ export const Config = z.object({
   privacy: z.object({
     redact: z.boolean().default(true).volatile(),
     retentionDays: z.natural().min(0).max(3650).default(0),
+    // jobs.payload 终态行的保留天数（0=不删；脱敏始终执行，见架构书 §5.9.1）。
+    // 独立于 archive 的节点保留期：正文治理不能随 retentionDays=0 一起被关掉。
+    jobPayloadTtlDays: z.natural().min(0).max(3650).default(0),
   }).default({}),
 
   edges: z.object({

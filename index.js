@@ -366,7 +366,13 @@ export function apply(ctx, config) {
       timers.push(t)
     }
     keeper.enqueue('report', {}, { nextAt: nowSec() + 900 })
-    const daily = setInterval(() => { keeper.enqueue('report', {}); keeper.enqueue('archive', {}) }, 24 * 3600_000)
+    // 启动先跑一次 payload 治理：老库的终态正文不必等到下一轮日报/日切（0.8.1-01）。
+    keeper.enqueue('maintenance', {}, { nextAt: nowSec() + 120 })
+    const daily = setInterval(() => {
+      keeper.enqueue('report', {})
+      keeper.enqueue('archive', {})
+      keeper.enqueue('maintenance', {})
+    }, 24 * 3600_000)
     if (typeof daily.unref === 'function') daily.unref()
     timers.push(daily)
     return () => { for (const t of timers) clearInterval(t) }

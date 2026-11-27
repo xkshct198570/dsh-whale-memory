@@ -319,6 +319,8 @@
   "settings.privacyRedactDesc": "書き込み前に機密フィールドを置換します。",
   "settings.privacyRetention": "アーカイブの保持日数（0 = 無期限）",
   "settings.privacyRetentionDesc": "0 ならアーカイブを無期限に保持します。",
+  "settings.jobPayloadTtlDays": "ジョブ本文の保持日数（0 = 削除しない）",
+  "settings.jobPayloadTtlDaysDesc": "完了したジョブのみ対象。本文は完了時に既に伏字化され、ここは行の保持期間だけを決めます。",
   "settings.privacyDanger": "retentionDays > 0 のとき、期限切れのアーカイブを物理削除します。",
   "settings.edgesDiffusion": "1 ホップのエッジ拡散を有効化",
   "settings.edgesDiffusionDesc": "想起時にエッジを 1 ホップ辿って候補を広げます。",

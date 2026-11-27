@@ -9,11 +9,12 @@
  * 依赖方向：core → shared；keeper/scheduler → keeper/handlers、keeper/util。
  */
 import { memoryPressure } from '../../shared/memory-guard.js'
+import { RETRY_MAX_ATTEMPTS, redactJobPayload } from '../job-payload.js'
 import { installDefaultHandlers } from './handlers.js'
 import { safeJson, toSeconds, clampText } from './util.js'
 
 /** 允许的作业类型（schema jobs.kind 语义；write 由写队列独占，keeper 不调度）。 */
-export const JOB_KINDS = ['consolidate', 'reflect', 'write', 'vector', 'archive', 'report', 'import', 'wrap']
+export const JOB_KINDS = ['consolidate', 'reflect', 'write', 'vector', 'archive', 'report', 'import', 'wrap', 'maintenance']
 /** keeper 不得接管的 kind：write 的排队/重试/崩溃续跑全在 writer 的写队列里。 */
 export const KEEPER_RESERVED_KINDS = Object.freeze(['write'])
 
@@ -26,8 +27,9 @@ export function backoffSeconds(attempts) {
 
 /** 压力态下 job 回 queued 的延后秒数。 */
 const PRESSURE_DEFER_SECONDS = 600
-/** 最多 4 次失败后不再自动跑：1 次重排后按 60s/300s/1800s 再试三次（§8.1 1m→5m→30m）。 */
-const MAX_ATTEMPTS = 4
+/** 最多 4 次失败后不再自动跑：1 次重排后按 60s/300s/1800s 再试三次（§8.1 1m→5m→30m）。
+ *  与写队列同一个上限值（job-payload.RETRY_MAX_ATTEMPTS），「failed 是否终态」不得各写一份。 */
+const MAX_ATTEMPTS = RETRY_MAX_ATTEMPTS
 
 /** claim 时一次最多看多少候选（同 kind 被占用时继续找别的）。 */
 const CANDIDATE_LIMIT = 20
@@ -111,10 +113,13 @@ export function createKeeper({
     })
   }
 
-  /** 执行权回收 / 状态收尾。 */
+  /** 执行权回收 / 状态收尾。终态同轮脱敏：jobs.payload 不再保留正文（0.8.1-01）。 */
   function finishDone(id) {
-    store.withDb((db) => db.prepare("UPDATE jobs SET state='done', updated_at=?, last_error=NULL WHERE id=? AND state='running'")
-      .run(dbNow(), Number(id)))
+    store.withDb((db) => {
+      const row = db.prepare('SELECT payload FROM jobs WHERE id=?').get(Number(id))
+      db.prepare("UPDATE jobs SET state='done', payload=?, updated_at=?, last_error=NULL WHERE id=? AND state='running'")
+        .run(redactJobPayload(row?.payload), dbNow(), Number(id))
+    })
   }
 
   function finishFailed(job, err) {
@@ -123,9 +128,11 @@ export function createKeeper({
     lastError = `${job.kind}: ${message}`
     store.withDb((db) => {
       if (attempts >= MAX_ATTEMPTS) {
-        db.prepare(`UPDATE jobs SET state='failed', attempts=?, last_error=?, next_at=NULL, updated_at=?
-          WHERE id=? AND state='running'`).run(attempts, message, dbNow(), Number(job.id))
+        // 终态：脱敏正文（重跑不会再读 payload，留着只是长期隐私负担）。
+        db.prepare(`UPDATE jobs SET state='failed', attempts=?, last_error=?, next_at=NULL, payload=?, updated_at=?
+          WHERE id=? AND state='running'`).run(attempts, message, redactJobPayload(job.payload), dbNow(), Number(job.id))
       } else {
+        // 还能重排：payload 原样保留（重跑要读正文/游标），绝不在这里脱敏。
         const nextAt = dbNow() + backoffSeconds(attempts)
         db.prepare(`UPDATE jobs SET state='queued', attempts=?, last_error=?, next_at=?, updated_at=?
           WHERE id=? AND state='running'`).run(attempts, message, nextAt, dbNow(), Number(job.id))

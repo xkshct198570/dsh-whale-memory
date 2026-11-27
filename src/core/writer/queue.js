@@ -9,11 +9,13 @@ import {
 import { withTx } from './audit.js'
 import { processEvent } from './process.js'
 import { acceptCandidate } from './review.js'
+import { RETRY_MAX_ATTEMPTS, redactJobPayload } from '../job-payload.js'
 
 /** 每批任务数（写连接上保持短事务，避免长阻塞）。 */
 const BATCH = 20
-/** 写 job 自身重试上限与退避（与 keeper 的 1m→5m→30m 同口径；写队列是唯一 owner）。 */
-const WRITE_MAX_ATTEMPTS = 4
+/** 写 job 自身重试上限与退避（与 keeper 的 1m→5m→30m 同口径；写队列是唯一 owner）。
+ *  上限值取 job-payload.RETRY_MAX_ATTEMPTS：终态判定与 keeper 共用同一判据。 */
+const WRITE_MAX_ATTEMPTS = RETRY_MAX_ATTEMPTS
 const WRITE_BACKOFF_SECONDS = [0, 60, 300, 1800]
 /** 写队列只负责自己的 queued/到期重试，30s 扫一次足够，不抢 keeper 的 10min 语义。 */
 const WRITE_RETRY_TICK_MS = 30_000
@@ -251,7 +253,9 @@ export function createWriteQueue({ store, config, log = () => {}, getLlm = null,
           } else if (verdict) {
             log(`[whale-memory] judge fallback reason=${result?.judge?.error || verdict.error || 'unknown'}`)
           }
-          const payload = JSON.stringify({
+          // 终态同轮脱敏（0.8.1-01）：payload 只留白名单键（result/reason/追溯键），
+          // 写事件正文（text/tags/ingestPolicy…）不再长期留在 jobs 里。
+          const payload = redactJobPayload({
             ...event,
             result: {
               action: result.action, id: result.id ?? null, reason: result.reason ?? '',
@@ -270,8 +274,9 @@ export function createWriteQueue({ store, config, log = () => {}, getLlm = null,
               onDb((db) => db.prepare(`UPDATE jobs SET state='queued', attempts=?, last_error=?, next_at=?, updated_at=?
                 WHERE id=? AND state='running'`).run(attempts, reason, now() + delay, now(), jobId))
             } else {
-              onDb((db) => db.prepare(`UPDATE jobs SET state='failed', attempts=?, last_error=?, next_at=NULL, updated_at=?
-                WHERE id=? AND state='running'`).run(attempts, reason, now(), jobId))
+              // 终态失败：正文脱敏；attempts 未到上限时 payload 原样保留（重跑要读事件）。
+              onDb((db) => db.prepare(`UPDATE jobs SET state='failed', attempts=?, last_error=?, next_at=NULL, payload=?, updated_at=?
+                WHERE id=? AND state='running'`).run(attempts, reason, redactJobPayload(job.payload), now(), jobId))
             }
           } catch (inner) {
             log(`[whale-memory] write queue retry/fail update failed: ${inner?.message || inner}`)

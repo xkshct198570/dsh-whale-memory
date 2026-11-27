@@ -57,8 +57,8 @@ function node(db, {
 const jobRow = (db, id) => db.prepare('SELECT * FROM jobs WHERE id = ?').get(id)
 const jobCount = (db, where = '1=1', ...args) => Number(db.prepare(`SELECT count(*) AS n FROM jobs WHERE ${where}`).get(...args).n)
 
-test('契约：JOB_KINDS 八种（含 import/wrap）；backoffSeconds 0/60/300/1800', () => {
-  assert.deepEqual(JOB_KINDS, ['consolidate', 'reflect', 'write', 'vector', 'archive', 'report', 'import', 'wrap'])
+test('契约：JOB_KINDS 九种（含 import/wrap/maintenance）；backoffSeconds 0/60/300/1800', () => {
+  assert.deepEqual(JOB_KINDS, ['consolidate', 'reflect', 'write', 'vector', 'archive', 'report', 'import', 'wrap', 'maintenance'])
   assert.equal(backoffSeconds(0), 0)
   assert.equal(backoffSeconds(1), 60)
   assert.equal(backoffSeconds(2), 300)

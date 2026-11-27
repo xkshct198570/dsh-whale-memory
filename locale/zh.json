@@ -319,6 +319,8 @@
   "settings.privacyRedactDesc": "写入前替换敏感字段。",
   "settings.privacyRetention": "归档保留天数（0=永久）",
   "settings.privacyRetentionDesc": "0 表示永久保留。",
+  "settings.jobPayloadTtlDays": "任务正文保留天数（0=不删除）",
+  "settings.jobPayloadTtlDaysDesc": "只作用于已完成/终态任务：正文在任务结束时就已脱敏，这里只决定整行保留多久。",
   "settings.privacyDanger": "retentionDays>0 会物理删除过期归档。",
   "settings.edgesDiffusion": "开启 1 跳关系扩散",
   "settings.edgesDiffusionDesc": "召回时沿关系边扩一跳。",

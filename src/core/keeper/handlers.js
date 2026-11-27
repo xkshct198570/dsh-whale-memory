@@ -13,6 +13,7 @@ import { bool, num, value } from '../../shared/config-values.js'
 import { METRIC_DEFS, computeMetrics, writeMetricsRows } from '../metrics.js'
 import { compareQuality } from '../node-rank.js'
 import { parseTags, rebuildTagEdges, upsertEdge } from '../relations.js'
+import { sweepJobPayloads } from '../job-payload.js'
 import { toSeconds } from './util.js'
 import { dayStamp } from '../../shared/day-stamp.js'
 
@@ -318,8 +319,16 @@ export function installDefaultHandlers(keeper, deps) {
     })
   })
 
-  keeper.register('vector', async () => {
-    if (!config?.embed?.enabled) return { skipped: 'embed_disabled' }
+  // 维护 job（0.8.1-01）：jobs.payload 终态脱敏 + 超期清理。独立成 kind 而不塞进 archive：
+  // archive 在 privacy.retentionDays=0（默认）时整段早退，正文治理不能跟着节点保留期一起被关掉。
+  keeper.register('maintenance', async () => {
+    const ttlDays = num(config?.privacy?.jobPayloadTtlDays, 0)
+    const out = store.withDb((db) => sweepJobPayloads(db, { ttlDays, nowSec: nowSec() }))
+    log(`[whale-memory] maintenance payload redacted=${out.redacted} purged=${out.purged} ttlDays=${ttlDays}`)
+    return out
+  })
+
+  keeper.register('vector', async () => {    if (!config?.embed?.enabled) return { skipped: 'embed_disabled' }
     const rows = store.withDb((db) => db.prepare(`SELECT id FROM nodes WHERE vector_state='pending' LIMIT ?`).all(VECTOR_BATCH))
     if (rows.length === 0) return { processed: 0, skipped: 'vector_empty' }
     // 本机没有嵌入实现（config.embed 只定义开关，未接 provider）：
