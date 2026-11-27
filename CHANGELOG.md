@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.1 — 2026-11-27（jobs 正文治理 + 日限落库 + 反思身份原因 + 工具分层 + 测试拆分）
+
+- **jobs.payload 正文治理（0.8.1-01）**：新增 `src/core/job-payload.js`——终态判据（`done`，或 `failed` 且 `attempts>=RETRY_MAX_ATTEMPTS`）与 payload 白名单（`reason/sessionId/identity/runId/spoolPath/materialHash/total/result`）唯一真源。终态转移同轮脱敏：keeper `finishDone`/终态 `finishFailed`、写队列 done/最终 failed 不再保留写入正文与 import 的 `jsonl`；`queued`/`running` 与可重排 `failed` 原样保留（续跑证据）。新增 `maintenance` job（启动 +120s、每日一次）修补式扫库清历史正文，并按 `privacy.jobPayloadTtlDays`（默认 0=不删）物理删除超期终态行；面板隐私组新增该开关（三语）。
+- **反思自动日限落库（0.8.1-09）**：`keeper.countRuns(kind,{sinceSec,reasons})` 成为唯一计入口；`scheduleAuto` 按 `localDayStart`（本地自然日）统计当日 `reason∈{turn_steps,idle}` 的 `reflect` 行，重启后同日不超限；手动 `manual` 不计入且仍绕过日限；查询失败回落进程内计数并记可见日志。
+- **手动反思身份原因（0.8.1-10）**：`/reflect` 400 增机器可读 `reason`（`no_session_identity` / `fixed_identity_incomplete` / `identity_incomplete`）；面板把 `identity_required` 渲染成可行动文案（先发一句话 / 或 fixed+workspace），`reason` 落 `data-reason`；删除死字段 `caps.reflectEnabled` 与重复 `setIdentity`；路由仍拒写未知 workspace。
+- **工具写入分层（0.8.1-04）**：`memory_remember` 落 `layerOfMemoryType(memory_type)`（procedural→lesson、semantic→fact；episodic/mixed→NULL）；`memory_update` 仅在正文改写时按目标节点 `memory_type` 重算层，只改等级/标签不动层，不做 NULL 回填；`updateNode` 接受显式 `layer` 并写 `writes.payload.layer` + `evolution('layer')`。
+- **测试拆分（0.8.1-05）**：`rules-routes` 1157 / `writer` 974 / `rule-proposal` 849 按职责拆成 5/5/4 片 + 3 个夹具模块（非 `*.test.mjs`）；断言按 AST 逐字节搬移，三组 pass/fail/skip 拆分前后逐项相等（36/45/45）。
+- 测试：全量 **1246（1245 pass / 1 skip / 0 fail）**；新增 12 例（jobs payload 6、反思日限 3、反思面板 2、工具分层 1），拆分不增不减。
+
 ## 0.8.0 — 2026-11-27（普通记忆自动入库 + 模型记忆工具面 + 分层/首轮画像 + 反思触发与峰时）
 
 - **自动入库**：收尾普通记忆默认走 `process.js` 唯一闸——durable→active；task/stale→REJECT（before/after 均为 NULL，不存正文）；歧义/主观/低置信→审核候选。来源固定 `source=self`（owner 只留给用户手工/导入，避免保护面锁死后续 MERGE）。
